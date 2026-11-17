@@ -1,0 +1,19 @@
+#!/bin/bash
+# Stage the runtime files omarchy-mac-boot needs, copied unchanged from
+# omacom/omarchy (FILES, SOURCE), into DESTDIR. Enables nothing.
+set -euo pipefail
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")"
+destination=${1:?Usage: ./install DESTDIR}
+[[ $destination == /* && $destination != "/" ]] || { echo "Use an absolute staging directory" >&2; exit 1; }
+(cd files && sha256sum --quiet -c ../files.sha256) || { echo "files/ does not match files.sha256" >&2; exit 1; }
+while read -r source installed mode; do
+  install -Dm"$mode" "files/$source" "$destination/$installed"
+  # Like the omarchy package: every command also under /usr/share/omarchy/bin,
+  # the PATH omarchy-mac-first-boot.service and the dispatcher use.
+  if [[ $installed == usr/bin/* ]]; then
+    install -d "$destination/usr/share/omarchy/bin"
+    ln -sfn "/$installed" "$destination/usr/share/omarchy/bin/${installed##*/}"
+  fi
+done < <(awk 'NF && $1 !~ /^#/' FILES)
+install -Dm644 LICENSE "$destination/usr/share/licenses/smartroom-omarchy-helpers/LICENSE"
+install -Dm644 SOURCE "$destination/usr/share/smartroom-omarchy-helpers/SOURCE"

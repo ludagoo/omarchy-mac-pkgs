@@ -1,0 +1,17 @@
+#!/bin/bash
+# The copies are byte-identical to the recorded hashes, every listed file is
+# staged with its mode, and, with OMARCHY_TEST_RUNTIME (an omacom/omarchy
+# checkout at SOURCE's tag), byte-identical to upstream.
+set -euo pipefail
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
+(cd files && sha256sum --quiet -c ../files.sha256)
+stage=$(mktemp -d); trap 'rm -rf "$stage"' EXIT
+./install "$stage"
+while read -r source installed mode; do
+  [[ -f $stage/$installed && $(stat -c %a "$stage/$installed") == "$mode" ]] || { echo "not staged: $installed" >&2; exit 1; }
+  if [[ -n ${OMARCHY_TEST_RUNTIME:-} ]]; then
+    cmp -s "$OMARCHY_TEST_RUNTIME/$source" "files/$source" || { echo "differs from upstream: $source" >&2; exit 1; }
+  fi
+done < <(awk 'NF && $1 !~ /^#/' FILES)
+[[ -L $stage/usr/share/omarchy/bin/omarchy-hw-platform ]]
+echo "smartroom-omarchy-helpers: ok"

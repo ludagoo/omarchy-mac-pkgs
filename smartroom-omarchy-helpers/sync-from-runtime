@@ -1,0 +1,15 @@
+#!/bin/bash
+# Refresh files/ from an omacom/omarchy checkout at a release tag:
+#   ./sync-from-runtime ~/src/omarchy v4.6.0
+# then review `git diff` (every change here is upstream's) and bump version.
+set -euo pipefail
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")"
+runtime=${1:?Usage: ./sync-from-runtime OMARCHY_CHECKOUT TAG}
+tag=${2:?Usage: ./sync-from-runtime OMARCHY_CHECKOUT TAG}
+git -C "$runtime" -c advice.detachedHead=false checkout -q "$tag"
+rm -rf files
+while read -r source _ _; do
+  install -Dm644 "$runtime/$source" "files/$source"
+done < <(awk 'NF && $1 !~ /^#/' FILES)
+(cd files && find . -type f | sort | xargs sha256sum) >files.sha256
+printf 'repository=https://github.com/omacom/omarchy\ntag=%s\ncommit=%s\n' "$tag" "$(git -C "$runtime" rev-parse HEAD)" >SOURCE
