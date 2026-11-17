@@ -100,11 +100,15 @@ omarchy-hw-apple-silicon || return 0
     sudo "${OMARCHY_UPDATE_GRUB:-update-grub}" >/dev/null || limine_boot_fail "update-grub failed with its new target"
   fi
 
-  sudo tee "$limine_default" >/dev/null <<'CONF' || limine_boot_fail "cannot write Limine defaults"
+  # The menu entry's name: Omarchy, unless the image or an administrator set
+  # another TARGET_OS_NAME here before (a headless image names its own OS).
+  os_name=$(sudo sed -n 's/^TARGET_OS_NAME="\([A-Za-z0-9 ._()-]\{1,64\}\)"$/\1/p' "$limine_default" 2>/dev/null | tail -n 1 || true)
+  [[ -n $os_name ]] || os_name=Omarchy
+  sudo tee "$limine_default" >/dev/null <<CONF || limine_boot_fail "cannot write Limine defaults"
 # Written by Omarchy (install/hardware/apple/limine-boot.sh). KERNEL_CMDLINE
 # is derived from /etc/default/grub by omarchy-mac-limine-cmdline; edit GRUB's
 # defaults, not this line.
-TARGET_OS_NAME="Omarchy"
+TARGET_OS_NAME="$os_name"
 ENABLE_UKI=yes
 CUSTOM_UKI_NAME="omarchy"
 FIND_BOOTLOADERS=no
@@ -136,9 +140,9 @@ CONF
   # entry by name without keying it. Key it to this Mac, so the rebuild, owner
   # setup and factory reset all find it as this machine's own entry.
   if (( menu_is_ours )) && [[ -z $stale_ids && $machine_id =~ ^[0-9a-f]{32}$ ]]; then
-    sudo awk -v id="$machine_id" '
+    sudo awk -v id="$machine_id" -v name="$os_name" '
       { print }
-      !keyed && /^\/\+?Omarchy[[:space:]]*$/ { print "comment: machine-id=" id; keyed = 1 }
+      !keyed && ($0 == "/" name || $0 == "/+" name) { print "comment: machine-id=" id; keyed = 1 }
     ' "$esp/limine.conf" >"$limine_backup/keyed" || limine_boot_fail "cannot key the menu to this machine"
     sudo install -m600 "$limine_backup/keyed" "$esp/limine.conf" || limine_boot_fail "cannot write the keyed menu"
   fi
