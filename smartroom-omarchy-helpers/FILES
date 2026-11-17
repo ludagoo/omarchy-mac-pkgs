@@ -1,0 +1,31 @@
+# Files copied unchanged from omacom/omarchy (the tag in SOURCE).
+# <path in omacom/omarchy>  <installed path>  <mode>
+# omarchy runtime: the hardware detectors and helpers omarchy-mac-boot calls
+bin/omarchy-hw-platform                          usr/bin/omarchy-hw-platform                    755
+bin/omarchy-hw-aarch64-apple                     usr/bin/omarchy-hw-aarch64-apple               755
+bin/omarchy-hw-apple-silicon                     usr/bin/omarchy-hw-apple-silicon               755
+bin/omarchy-cmd-present                          usr/bin/omarchy-cmd-present                    755
+# omarchy runtime: the lifecycle dispatcher (image build: setup-boot) and the
+# deferred hardware setup that runs setup-boot again on the Mac's first boot
+bin/omarchy-lifecycle-dispatch                   usr/bin/omarchy-lifecycle-dispatch             755
+bin/omarchy-provision-hardware                   usr/bin/omarchy-provision-hardware             755
+install/helpers/logging.sh                       usr/share/omarchy/install/helpers/logging.sh   644
+install/helpers/image-target.sh                  usr/share/omarchy/install/helpers/image-target.sh 644
+install/hardware/platform-setup.sh               usr/share/omarchy/install/hardware/platform-setup.sh 644
+install/provisioning/omarchy-provision-hardware.service usr/share/omarchy/install/provisioning/omarchy-provision-hardware.service 644
+# omarchy runtime: snapper's root configuration (the image builder runs it)
+install/config/snapper.sh                        usr/share/omarchy/install/config/snapper.sh    644
+default/snapper/root                             usr/share/omarchy/default/snapper/root         644
+# omarchy-settings: the Limine menu template limine-boot.sh installs
+default/limine/limine.conf                       usr/share/omarchy/default/limine/limine.conf   644
+# omarchy-settings: the Apple pacman templates the image builder installs
+default/pacman/aarch64-apple/pacman-stable.conf  usr/share/omarchy/default/pacman/aarch64-apple/pacman-stable.conf 644
+default/pacman/aarch64-apple/mirrorlist-stable   usr/share/omarchy/default/pacman/aarch64-apple/mirrorlist-stable 644
+# omarchy-settings: the mkinitcpio module drop-ins. Not its HOOKS baseline
+# (00-omarchy-hooks.conf): that names plymouth on a Mac, which a room does not
+# ship; without it, mkinitcpio's default HOOKS and omarchy-mac-boot's 90-95
+# drop-ins give Omarchy's exact hook list, minus plymouth.
+etc/mkinitcpio.conf.d/omarchy_hooks.conf         etc/mkinitcpio.conf.d/omarchy_hooks.conf       644
+etc/mkinitcpio.conf.d/omarchy_vconsole.conf      etc/mkinitcpio.conf.d/omarchy_vconsole.conf    644
+etc/mkinitcpio.conf.d/thunderbolt_module.conf    etc/mkinitcpio.conf.d/thunderbolt_module.conf  644
+etc/mkinitcpio.conf.d/i2c_hid_of_module.conf     etc/mkinitcpio.conf.d/i2c_hid_of_module.conf   644
