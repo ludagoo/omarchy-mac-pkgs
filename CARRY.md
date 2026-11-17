@@ -1,0 +1,70 @@
+# SmartRoom carry on omarchy-mac-pkgs
+
+`smartroom/main` is what SmartRoom Firmware builds its boot package from:
+omacom's `main` (mirrored here as `main`, fast-forward only) plus the small
+patches below, rebased, never merged. Rooms run no desktop, so the only
+change to Omarchy's boot logic is what a headless room needs; everything else
+is copied unchanged.
+
+## Base
+
+| | |
+| --- | --- |
+| Base commit | `63a6941c698e75213e219205c656c83850c951e8` (omacom/omarchy-mac-pkgs main, "Merge pull request #154 … package-resolution-aurora-names") |
+| Stable channel today | `omarchy-mac-boot 20261104-1` = omarchy-mac-pkgs `7e50e937` + `user4k.patch` (omacom/omarchy-pkgs recipe). Our base differs from it only in `bin/omarchy-apple-silicon-boot-check` and tests. |
+
+## Carried patches
+
+| # | What | Why | Upstream PR candidate? | Drop when |
+| --- | --- | --- | --- | --- |
+| 1 | `CARRY.md`, `smartroom/sync-upstream.sh` | This file and the sync script | No (ours) | Never |
+| 2 | `omarchy-mac-boot/setup/limine-boot.sh`: keep a `TARGET_OS_NAME` the image (or an admin) already set in `/etc/default/limine`, default `Omarchy`; key the menu entry by that name | The Limine entry must say "SmartRoom Firmware"; without this, first boot's setup-boot rewrites it to "Omarchy" | Yes: "let an image name its Limine entry" | omacom takes it, or adds another way to name the entry |
+| 3 | `omarchy-mac-boot/.../omarchy-mac-first-boot`: a headless image (`/etc/omarchy-mac-boot/headless`) stages no owner provisioning, enables no display manager and never takes tty1 on a failure (the unit fails; the next boot retries) | Rooms have no person and no display; stock first boot hard-fails without the runtime's owner provisioning and otherwise waits on tty1 forever | Yes: "first boot for headless images" | omacom takes it |
+| 4 | `smartroom-omarchy-helpers/`: a tiny package of the omacom/omarchy runtime files the boot package, the image builder and first boot read, **copied unchanged** (tag in `SOURCE`, list in `FILES`, `sync-from-runtime` to refresh) | Lets `omarchy-mac-boot` drop its `omarchy` dependency (the full desktop) without reimplementing anything | No (ours) | omacom splits these helpers out of `omarchy` themselves |
+| 5 | `smartroom/pkgbuilds/`: the omacom/omarchy-pkgs recipe for `omarchy-mac-boot`, unchanged except source (this fork), `depends` (`smartroom-omarchy-helpers` + `sudo` instead of `omarchy`; `asahi-scripts` as the stable 20261104-1 has it) and pkgver/_commit from the build; and the helpers' recipe | omacom builds its packages in omarchy-pkgs from omacom main; ours build from this fork | No (ours) | Never |
+
+Nothing else differs from omacom. In particular the initramfs, in-place
+encryption (still switchable: `omarchy/install.conf` on the ESP, `encrypt=1`),
+vendor firmware, Limine activation, snapshots and factory reset are
+upstream's code.
+
+### Why patch the boot package instead of installing `omarchy` and turning things off
+
+Lucas's final model (2026-11-17): rooms never run `omarchy-update`; they take
+our own fixed releases. So "an Omarchy update re-enables sddm" is not a risk,
+and the deciding question is what keeps this fork easy to sync. Dropping one
+dependency and adding a package of unchanged copies touches no upstream file
+but the recipe; installing `omarchy` would put the whole desktop (hyprland
+session, quickshell, uwsm, sddm, plymouth, owner provisioning, its
+`omarchy-apply-system` defaults) on every room, and each would need its own
+"turn it off" patch, all of which move with every Omarchy release.
+
+## Branches
+
+- `main`: an exact mirror of omacom's `main`. Fast-forward only, never commit to it.
+- `smartroom/main`: `main` + the carry above. Rebased, never merged. Before
+  force-pushing it, tag the old tip `sr/prev-<date>`; never delete `sr/*` tags.
+
+## Syncing with upstream
+
+```sh
+smartroom/sync-upstream.sh            # fast-forward main, show how far behind the carry is
+smartroom/sync-upstream.sh --rebase   # rebase smartroom/main locally, print the range-diff
+smartroom/sync-upstream.sh --push     # tag sr/prev-<date> and force-push
+```
+
+After a sync: run `omarchy-mac-boot/test/all` and
+`OMARCHY_TEST_RUNTIME=<omarchy checkout at the tag in smartroom-omarchy-helpers/SOURCE> smartroom-omarchy-helpers/test/all`;
+when omacom/omarchy-pkgs moves its `omarchy-mac-boot` recipe, diff it against
+`smartroom/pkgbuilds/omarchy-mac-boot/PKGBUILD`; when the stable channel moves
+to a new Omarchy release, run `smartroom-omarchy-helpers/sync-from-runtime`.
+Then rebuild with ludagoo/omarchy-mac-installer `smartroom/build-packages`.
+
+GitHub Actions are disabled on this fork (no inherited workflow can publish
+anything); sync by hand with the script.
+
+## Rules
+
+- Patches by an AI agent carry `Assisted-by: Claude:claude-opus-5-5` and no
+  `Signed-off-by`. Upstream PRs go to omacom only (never AsahiLinux), and only
+  as drafts Lucas reviews and sends.
