@@ -1,0 +1,27 @@
+# SmartRoom only: choose the Mac's startup volume (macOS or SmartRoom
+# Firmware) from Linux with Omarchy's aurora-bless (smartroom-boot-os/).
+pkgname=smartroom-boot-os
+pkgver=${SMARTROOM_MAC_PKGS_DATE:?set by smartroom/build-packages}
+pkgrel=1
+pkgdesc='Switch an Apple Silicon room Mac between SmartRoom Firmware and macOS (aurora-bless)'
+arch=('any')
+url='https://github.com/ludagoo/omarchy-mac-pkgs'
+license=('MIT')
+makedepends=('git')
+depends=('bash' 'aurora-bless' 'systemd')
+_commit=${SMARTROOM_MAC_PKGS_COMMIT:?set by smartroom/build-packages}
+source=("omarchy-mac-pkgs::git+https://github.com/ludagoo/omarchy-mac-pkgs.git#commit=${_commit}")
+sha256sums=('SKIP')
+
+prepare() {
+  [[ $(git -C "$srcdir/omarchy-mac-pkgs" rev-parse HEAD) == "$_commit" ]]
+}
+
+check() {
+  "$srcdir/omarchy-mac-pkgs/smartroom-boot-os/test/all"
+}
+
+package() {
+  install -Dm0755 "$srcdir/omarchy-mac-pkgs/smartroom-boot-os/smartroom-boot-os" "$pkgdir/usr/bin/smartroom-boot-os"
+  install -Dm0644 "$srcdir/omarchy-mac-pkgs/LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}
