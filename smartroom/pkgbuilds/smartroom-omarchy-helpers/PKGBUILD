@@ -1,0 +1,28 @@
+# SmartRoom only: the omacom/omarchy runtime files omarchy-mac-boot calls,
+# copied unchanged (smartroom-omarchy-helpers/FILES in this repository).
+pkgname=smartroom-omarchy-helpers
+pkgver=${SMARTROOM_MAC_PKGS_DATE:?set by smartroom/build-packages}
+pkgrel=1
+pkgdesc='Runtime helpers omarchy-mac-boot needs, copied unchanged from Omarchy (no desktop)'
+arch=('any')
+url='https://github.com/ludagoo/omarchy-mac-pkgs'
+license=('MIT')
+makedepends=('git')
+depends=('bash' 'coreutils' 'util-linux' 'systemd')
+# Same paths as Omarchy's own packages: a room never has both.
+conflicts=('omarchy' 'omarchy-settings' 'omarchy-dev' 'omarchy-settings-dev')
+_commit=${SMARTROOM_MAC_PKGS_COMMIT:?set by smartroom/build-packages}
+source=("omarchy-mac-pkgs::git+https://github.com/ludagoo/omarchy-mac-pkgs.git#commit=${_commit}")
+sha256sums=('SKIP')
+
+prepare() {
+  [[ $(git -C "$srcdir/omarchy-mac-pkgs" rev-parse HEAD) == "$_commit" ]]
+}
+
+check() {
+  "$srcdir/omarchy-mac-pkgs/smartroom-omarchy-helpers/test/all"
+}
+
+package() {
+  "$srcdir/omarchy-mac-pkgs/smartroom-omarchy-helpers/install" "$pkgdir"
+}
