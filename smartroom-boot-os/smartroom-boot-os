@@ -1,0 +1,111 @@
+#!/bin/bash
+# smartroom-boot-os: choose what this Apple Silicon Mac starts up from, from
+# SmartRoom Firmware (Linux). Omarchy's own tool does the NVRAM write:
+# aurora-bless (Omarchy's asahi-bless; package aurora-bless) sets the
+# boot-volume variable (default) or alt-boot-volume (next boot only), which
+# the Mac's boot picker reads. No macOS password is needed from Linux.
+#
+#   smartroom-boot-os macos [--once] [--reboot]      start macOS (Zoom Rooms)
+#   smartroom-boot-os firmware [--once] [--reboot]   start SmartRoom Firmware
+#   smartroom-boot-os status                         default and next start
+#
+# --once sets the next start only (the Mac returns to its default after it).
+# Without --once the choice becomes the default and any pending next-start
+# choice is cleared, so the very next start already follows it.
+# --reboot restarts right after a verified change.
+# The firmware volume is named by TARGET_OS_NAME in /etc/default/limine
+# ("SmartRoom Firmware"); macOS is the one other startup volume (or name it
+# with SMARTROOM_BOOT_OS_MACOS="Macintosh HD"). Root only.
+set -euo pipefail
+PATH=/usr/bin:/usr/sbin:/bin
+bless=${SMARTROOM_BOOT_OS_BLESS:-aurora-bless}
+limine_defaults=${SMARTROOM_BOOT_OS_LIMINE_DEFAULTS:-/etc/default/limine}
+die() { echo "smartroom-boot-os: $*" >&2; exit 1; }
+usage() { sed -n '/^#   smartroom-boot-os/s/^#   //p' "$0" >&2; exit 64; }
+
+target="" once=0 reboot=0
+for arg in "$@"; do
+  case $arg in
+    macos|firmware|status) [[ -z $target ]] || usage; target=$arg ;;
+    --once) once=1 ;;
+    --reboot) reboot=1 ;;
+    -h|--help) usage ;;
+    *) usage ;;
+  esac
+done
+[[ -n $target ]] || usage
+[[ $target != status || ($once == 0 && $reboot == 0) ]] || usage
+(( EUID == 0 )) || die "run as root"
+command -v "$bless" >/dev/null || die "$bless is not installed (package aurora-bless)"
+
+# Names of the Linux startup volumes SmartRoom and Omarchy make, newest first.
+firmware_name=SmartRoom\ Firmware
+if [[ -r $limine_defaults ]]; then
+  name=$(sed -n 's/^TARGET_OS_NAME=//p' "$limine_defaults" | tail -n 1)
+  name=${name#[\"\']} name=${name%[\"\']}
+  [[ -z $name ]] || firmware_name=$name
+fi
+linux_names=("$firmware_name" "SmartRoom Firmware" "SmartRoomOS" "Omarchy")
+
+# aurora-bless --list-volumes: "*1) Macintosh HD" (* marks the default).
+candidates=()
+while IFS= read -r line; do
+  [[ $line =~ ^[\ *]?[0-9]+\)\ (.+)$ ]] || continue
+  candidates+=("${BASH_REMATCH[1]}")
+done < <("$bless" --list-volumes)
+((${#candidates[@]})) || die "$bless found no startup volumes"
+
+is_linux() { local n; for n in "${linux_names[@]}"; do [[ ${1,,} == "${n,,}" ]] && return 0; done; return 1; }
+count() { local n c=0; for n in "${candidates[@]}"; do [[ ${n,,} == "${1,,}" ]] && c=$((c + 1)); done; echo "$c"; }
+current() { # [--next]: the name aurora-bless reports, or "none"
+  local out
+  out=$("$bless" --get-boot "$@" 2>/dev/null) || { echo none; return; }
+  [[ $out == "No boot target set" || -z $out ]] && echo none || echo "$out"
+}
+
+if [[ $target == status ]]; then
+  echo "default: $(current)"
+  echo "next:    $(current --next)"
+  echo "volumes: $(printf '"%s" ' "${candidates[@]}")"
+  exit 0
+fi
+
+if [[ $target == firmware ]]; then
+  want=""
+  for n in "$firmware_name" SmartRoomOS; do
+    case $(count "$n") in
+      0) continue ;;
+      1) want=$n; break ;;
+      *) die "more than one startup volume is named \"$n\"" ;;
+    esac
+  done
+  [[ -n $want ]] || die "no startup volume named \"$firmware_name\" (found: $(printf '"%s" ' "${candidates[@]}"))"
+else
+  want=${SMARTROOM_BOOT_OS_MACOS-}
+  if [[ -z $want ]]; then
+    others=()
+    for n in "${candidates[@]}"; do is_linux "$n" || others+=("$n"); done
+    ((${#others[@]} == 1)) ||
+      die "cannot tell which startup volume is macOS (candidates: $(printf '"%s" ' "${candidates[@]}")); set SMARTROOM_BOOT_OS_MACOS to its name"
+    want=${others[0]}
+  fi
+  [[ $(count "$want") == 1 ]] || die "not exactly one startup volume is named \"$want\""
+  ! is_linux "$want" || die "\"$want\" is a Linux startup volume, not macOS"
+fi
+
+if (( once )); then
+  "$bless" --set-boot "$want" --next --yes >/dev/null
+  got=$(current --next)
+  what="next start"
+else
+  "$bless" --set-boot "$want" --yes >/dev/null
+  "$bless" --clear-next >/dev/null
+  got=$(current)
+  [[ $(current --next) == "$got" ]] || die "the next start is $(current --next), not $got, after clearing it"
+  what="default"
+fi
+[[ ${got,,} == "${want,,}" ]] || die "asked for \"$want\" as the $what, but the Mac reports \"$got\""
+echo "$what: $got"
+if (( reboot )); then
+  systemctl reboot
+fi

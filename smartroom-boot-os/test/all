@@ -1,0 +1,80 @@
+#!/bin/bash
+# smartroom-boot-os against a simulated aurora-bless (its CLI and output as in
+# aurora-bless 0.4.4: --list-volumes, --get-boot [--next], --set-boot NAME
+# [--next] --yes, --clear-next). NVRAM is two files: boot-volume, alt-boot-volume.
+set -euo pipefail
+here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+t=$(mktemp -d); trap 'rm -rf "$t"' EXIT
+fail() { echo "not ok - $*" >&2; exit 1; }
+cat >"$t/bless" <<'SH'
+#!/bin/bash
+s=$STATE; next=0; set_name=""; mode=""
+while (($#)); do
+  case $1 in
+    --list-volumes) mode=list ;; --get-boot) mode=get ;; --clear-next) mode=clear ;;
+    --set-boot) mode=set; set_name=$2; shift ;; --next|-n) next=1 ;; --yes|-y) ;;
+    *) echo "fake bless: $1" >&2; exit 2 ;;
+  esac
+  shift
+done
+def=$(cat "$s/boot-volume" 2>/dev/null || true); alt=$(cat "$s/alt-boot-volume" 2>/dev/null || true)
+case $mode in
+  list) i=0; while IFS= read -r n; do i=$((i + 1)); m=" "; [[ $n == "$def" ]] && m="*"; echo "$m$i) $n"; done <"$s/volumes" ;;
+  get) v=$def; ((next)) && [[ -n $alt ]] && v=$alt; [[ -n $v ]] || { echo "Error: Unable to parse current nvram contents" >&2; exit 1; }; echo "$v" ;;
+  clear) if [[ -n $alt ]]; then rm -f "$s/alt-boot-volume"; echo "Cleared next boot target"; else echo "Next boot target was already empty"; fi ;;
+  set) grep -qixF "$set_name" "$s/volumes" || { echo "Error: Unable to find specified volume" >&2; exit 1; }
+       n=$(grep -ixF "$set_name" "$s/volumes" | head -n 1)
+       echo "Will set volume $n as the ..."; if ((next)); then echo "$n" >"$s/alt-boot-volume"; else echo "$n" >"$s/boot-volume"; fi ;;
+esac
+SH
+chmod +x "$t/bless"
+cat >"$t/systemctl" <<SH
+#!/bin/bash
+echo "\$*" >>"$t/systemctl.log"
+SH
+chmod +x "$t/systemctl"
+# root-only check and PATH: run a copy with EUID checks lifted and our systemctl first
+sed -e 's/^(( EUID == 0 )) || die "run as root"$/:/' -e "s|^PATH=/usr/bin:/usr/sbin:/bin|PATH=$t:/usr/bin:/usr/sbin:/bin|" \
+  "$here/../smartroom-boot-os" >"$t/sbo"; chmod +x "$t/sbo"
+export STATE=$t/s SMARTROOM_BOOT_OS_BLESS=$t/bless SMARTROOM_BOOT_OS_LIMINE_DEFAULTS=$t/limine
+mkdir -p "$STATE"
+printf 'TARGET_OS_NAME="SmartRoom Firmware"\n' >"$t/limine"
+reset() { printf '%s\n' "$@" >"$STATE/volumes"; rm -f "$STATE/boot-volume" "$STATE/alt-boot-volume"; }
+
+reset "Macintosh HD" "SmartRoom Firmware"; echo "SmartRoom Firmware" >"$STATE/boot-volume"
+out=$("$t/sbo" macos --once) || fail "macos --once: $out"
+[[ $(cat "$STATE/alt-boot-volume") == "Macintosh HD" && $(cat "$STATE/boot-volume") == "SmartRoom Firmware" ]] || fail "macos --once state"
+[[ $out == "next start: Macintosh HD" ]] || fail "macos --once said: $out"
+echo "ok - macos --once sets only the next start"
+
+out=$("$t/sbo" firmware) || fail "firmware: $out"
+[[ ! -e $STATE/alt-boot-volume && $(cat "$STATE/boot-volume") == "SmartRoom Firmware" ]] || fail "firmware did not clear the pending next start"
+echo "ok - firmware as default clears a pending next start"
+
+out=$("$t/sbo" macos --reboot) || fail "macos: $out"
+[[ $(cat "$STATE/boot-volume") == "Macintosh HD" && $(cat "$t/systemctl.log") == reboot ]] || fail "macos default + reboot"
+out=$("$t/sbo" firmware --once) && [[ $(cat "$STATE/alt-boot-volume") == "SmartRoom Firmware" ]] || fail "firmware --once"
+st=$("$t/sbo" status); grep -qx 'default: Macintosh HD' <<<"$st" && grep -qx 'next:    SmartRoom Firmware' <<<"$st" || fail "status: $st"
+echo "ok - macos as default with --reboot, firmware --once, status"
+
+reset "Macintosh HD" "SmartRoomOS"
+"$t/sbo" firmware >/dev/null && [[ $(cat "$STATE/boot-volume") == SmartRoomOS ]] || fail "legacy SmartRoomOS stub"
+echo "ok - finds a legacy SmartRoomOS stub"
+
+reset "Macintosh HD" "Macintosh HD 2" "SmartRoom Firmware"
+"$t/sbo" macos >"$t/out" 2>&1 && fail "two macOS volumes accepted"
+grep -q "cannot tell which startup volume is macOS" "$t/out" || fail "wrong refusal: $(cat "$t/out")"
+SMARTROOM_BOOT_OS_MACOS="Macintosh HD 2" "$t/sbo" macos >/dev/null && [[ $(cat "$STATE/boot-volume") == "Macintosh HD 2" ]] || fail "SMARTROOM_BOOT_OS_MACOS"
+SMARTROOM_BOOT_OS_MACOS="SmartRoom Firmware" "$t/sbo" macos >/dev/null 2>&1 && fail "the firmware accepted as macOS"
+echo "ok - refuses an ambiguous macOS unless named, never takes a Linux volume for macOS"
+
+reset "Room Mac" "SmartRoom Firmware" "Omarchy"
+"$t/sbo" macos >/dev/null && [[ $(cat "$STATE/boot-volume") == "Room Mac" ]] || fail "renamed macOS beside Omarchy"
+reset "Macintosh HD"
+"$t/sbo" firmware >"$t/out" 2>&1 && fail "firmware without a stub accepted"
+reset "Macintosh HD" "SmartRoom Firmware" "SmartRoom Firmware"
+"$t/sbo" firmware >"$t/out" 2>&1 && fail "two firmware volumes accepted"
+"$t/sbo" status --once >/dev/null 2>&1 && fail "status --once accepted"
+"$t/sbo" >/dev/null 2>&1 && fail "no target accepted"
+echo "ok - a renamed macOS; refuses no stub, two stubs and bad usage"
+grep -q '^(( EUID == 0 )) || die "run as root"$' "$here/../smartroom-boot-os" || fail "the root check moved"
