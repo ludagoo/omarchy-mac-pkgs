@@ -258,6 +258,19 @@ grep -q '^KERNEL_CMDLINE\[default\]="root=UUID=root-uuid ' "$etc/limine" || fail
 [[ $(cat "$esp/EFI/BOOT/BOOTAA64.EFI") == "LIMINE v2" ]] || fail "Limine keeps the U-Boot slot"
 pass "under deferred hardware setup the leaf keys the image's entry and leaves the one UKI build to the end"
 
+# An image that names its own OS (TARGET_OS_NAME in /etc/default/limine) keeps
+# that name, and its entry is the one keyed to this Mac.
+cp "$esp/limine.conf" "$test_tmp/saved-menu"; cp "$etc/limine" "$test_tmp/saved-defaults"
+sed 's|^/+Omarchy$|/+SmartRoom Firmware|' "$test_tmp/image-menu" >"$esp/limine.conf"
+sed -i 's/^TARGET_OS_NAME=.*/TARGET_OS_NAME="SmartRoom Firmware"/' "$etc/limine"
+rm -f "$request"
+OMARCHY_IMAGE_BOOT_REBUILD="$request" OMARCHY_GRUB_PROBE=omarchy-test-absent-grub-probe run || fail "a named image's leaf finishes"
+grep -qx 'TARGET_OS_NAME="SmartRoom Firmware"' "$etc/limine" || fail "the image's OS name is kept" "$(cat "$etc/limine")"
+[[ $(grep -A1 '^/+SmartRoom Firmware$' "$esp/limine.conf" | tail -n 1) == "comment: machine-id=$(cat "$etc/machine-id")" ]] ||
+  fail "the named entry is keyed to this Mac" "$(cat "$esp/limine.conf")"
+cp "$test_tmp/saved-menu" "$esp/limine.conf"; cp "$test_tmp/saved-defaults" "$etc/limine"; rm -f "$request"
+pass "an image's own Limine OS name is kept and its entry keyed"
+
 # A menu already keyed to this Mac is left as it is.
 rm -f "$request"
 cp "$esp/limine.conf" "$test_tmp/keyed-menu"
