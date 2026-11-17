@@ -601,3 +601,29 @@ echo 'ok - first boot shows its steps on the splash, carrying on from the initra
 # The installed unit supplies the runtime path before a user session exists.
 [[ $(grep -c '^Environment=OMARCHY_PATH=/usr/share/omarchy$' "$unit") == 1 ]] || fail "the unit supplies one runtime path"
 echo 'ok - the unit supplies the runtime environment without a login session'
+
+# A headless image (no owner at a display) finishes first boot without owner
+# provisioning or a display manager, and a failure exits instead of taking tty1.
+new_case headless
+mkdir -p "$root/etc/omarchy-mac-boot"
+: >"$root/etc/omarchy-mac-boot/headless"
+rm -f "$root/usr/bin/omarchy-provision-owner" "$root/usr/share/omarchy/install/provisioning/omarchy-provision-owner.service"
+write_esp format=1 encrypt=0
+run attempt || fail "headless: the attempt failed" "$(cat "$case_dir/out")"
+grep -Fxq deferred "$case_dir/deferred.log" || fail "headless: the deferred hardware setup still runs"
+[[ ! -e $root/var/lib/omarchy/mac-first-boot/pending ]] || fail "headless: pending remains"
+[[ ! -e $root/etc/systemd/system/omarchy-provision-owner.service ]] || fail "headless: owner provisioning was staged"
+! grep -Eq 'sddm|display-manager|omarchy-provision-owner' "$case_dir/systemctl.log" ||
+  fail "headless: a display manager or owner provisioning was enabled or started"
+new_case headless-fails
+mkdir -p "$root/etc/omarchy-mac-boot"
+: >"$root/etc/omarchy-mac-boot/headless"
+: >"$case_dir/deferred-refuses"
+if timeout --kill-after=5 30 env OMARCHY_PATH="$root/usr/share/omarchy" PATH="$stubs:$PATH" CASE="$case_dir" \
+    OMARCHY_MAC_FIRST_BOOT_ROOT="$root" OMARCHY_MAC_ENCRYPT_PROGRESS_FILE="$case_dir/encrypt.progress" \
+    KEYRING_MASTER="$keyring_master_fpr" ARM_REPOSITORY_KEY="$arm_repository_key" \
+    "$BASH" "$script" </dev/null >"$case_dir/out" 2>&1; then
+  fail "headless: a failed first boot exits non-zero"
+fi
+[[ -f $root/var/lib/omarchy/mac-first-boot/pending ]] || fail "headless: a failed first boot stays pending for the next boot"
+echo 'ok - a headless image finishes first boot without owner setup or a display manager, and a failure exits for the next boot'
