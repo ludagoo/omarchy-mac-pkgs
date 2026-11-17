@@ -23,6 +23,12 @@ keyring_dir=$root/etc/pacman.d/gnupg
 keyring_record=$state_dir/keyring
 keyring_import_dir=$root/usr/share/pacman/keyrings
 image_target=$root/var/lib/omarchy/image/target
+# A headless image (no owner at a display: a server or a room controller)
+# ships this file. Its first boot stages no owner provisioning and starts no
+# display manager, and a failure never waits on tty1: the unit fails and the
+# next boot retries.
+headless_flag=$root/etc/omarchy-mac-boot/headless
+headless() { [[ -e $headless_flag ]]; }
 
 
 say() { printf '%s\n' "$*"; }
@@ -229,6 +235,10 @@ run_deferred_steps() {
 # $PROVISIONING_DIR/luks-key when the initramfs hook encrypted the root; this
 # service never touches keys.
 stage_provisioning() {
+  if headless; then
+    log "headless image: no owner provisioning, no display manager"
+    return 0
+  fi
   local unit=$root/usr/share/omarchy/install/provisioning/omarchy-provision-owner.service
   [[ -f $unit && -x $root/usr/bin/omarchy-provision-owner ]] ||
     fail "the installed runtime does not ship owner provisioning"
@@ -254,6 +264,10 @@ commit() {
   sync "$state_dir" || fail "could not persist the first-boot commit"
   rm -f "$pending"
   sync "$state_dir" || { : >"$pending"; sync "$state_dir" || true; fail "could not persist the first-boot commit"; }
+  if headless; then
+    log "committed (headless)"
+    return 0
+  fi
   systemctl start --no-block omarchy-provision-owner.service >>"$log_file" 2>&1 ||
     { : >"$pending"; sync "$state_dir" || true; fail "could not queue owner provisioning"; }
   systemctl start --no-block display-manager.service >>"$log_file" 2>&1 ||
@@ -279,7 +293,7 @@ attempt() {
   run_deferred_steps
   splash_progress 95 "Almost ready..."
   stage_provisioning
-  say "Ready for account setup."
+  headless || say "Ready for account setup."
   splash_progress 100
   commit
 }
@@ -358,6 +372,7 @@ main() {
     status=$?
     set -e
     ((status != 0)) || return 0
+    ! headless || return "$status"
     failure_screen
   done
 }
