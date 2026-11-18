@@ -69,7 +69,11 @@ def sha256(path: Path) -> str:
 
 def parse_pair(text: str) -> tuple[str, str]:
     name, value = text.split("=", 1)
-    if not name or "/" in name or name.startswith("."):
+    path = Path(name)
+    # A checked file may sit under a directory of the fake ESP (trial/boot.bin).
+    # Absolute paths and .. are refused, same as the trial path.
+    if (not name or path.is_absolute() or ".." in path.parts
+            or any(part.startswith(".") for part in path.parts)):
         raise SystemExit(f"bad file name in {text}")
     return name, value
 

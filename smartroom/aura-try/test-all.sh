@@ -23,7 +23,8 @@ grep -q checksum "$work/err"
 
 "$tool" arm --esp "$esp" --trial-path trial/boot.bin --configured m1n1/boot.bin \
   --release new --previous old --file "trial/boot.bin=$good" >"$work/arm.out"
-[[ $(cat "$esp/aura-try") == $'armed\ntrial/boot.bin\n' ]] || { echo "marker bytes" >&2; cat "$esp/aura-try"; exit 1; }
+printf 'armed\ntrial/boot.bin\n' >"$work/expect-marker"
+cmp -s "$esp/aura-try" "$work/expect-marker" || { echo "marker bytes" >&2; cat "$esp/aura-try"; exit 1; }
 cmp "$esp/m1n1/boot.bin" <(printf 'previous-boot\n')
 
 # Four quiet minutes is not enough. A gap resets the five minutes. A window
