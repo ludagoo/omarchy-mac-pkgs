@@ -49,9 +49,34 @@ echo "limine-update" >>"$TEST_CALLS"
 [[ -z ${FAIL_LIMINE_UPDATE:-} ]] || exit 1
 mkdir -p "$TEST_ESP/EFI/Linux"
 printf 'UKI\n' >"$TEST_ESP/EFI/Linux/omarchy_linux-aurora.efi"
+# Same load order as limine-entry-tool (ConfigReader): packaged conf, then
+# drop-ins in name order, then /etc/default/limine. The last ENABLE_VERIFICATION
+# wins. yes appends a 128-hex blake2-shaped suffix; anything else leaves the
+# path bare, which is what a room must boot.
 if ! grep -q '^/+Omarchy' "$TEST_ESP/limine.conf"; then
   cmdline=$(sed -n 's/^KERNEL_CMDLINE\[default\]="\(.*\)"$/\1/p' "$TEST_LIMINE_DEFAULT")
-  printf '/+Omarchy\n  //linux-aurora\n  protocol: efi\n  path: boot():/EFI/Linux/omarchy_linux-aurora.efi\n  cmdline: %s\n' "$cmdline" >>"$TEST_ESP/limine.conf"
+  root=$(dirname "$TEST_LIMINE_DEFAULT")
+  verify=
+  take() {
+    [[ -f $1 ]] || return 0
+    local line
+    line=$(sed -n 's/^ENABLE_VERIFICATION=//p' "$1" | tail -n 1)
+    line=${line#\"}; line=${line%\"}
+    [[ -n $line ]] && verify=$line
+  }
+  take "$root/limine-entry-tool.conf"
+  if [[ -d $root/limine-entry-tool.d ]]; then
+    for drop in "$root"/limine-entry-tool.d/*.conf; do
+      take "$drop"
+    done
+  fi
+  take "$TEST_LIMINE_DEFAULT"
+  path=boot\(\):/EFI/Linux/omarchy_linux-aurora.efi
+  if [[ $verify == yes ]]; then
+    hash=$(printf '%128s' '')
+    path="$path#${hash// /a}"
+  fi
+  printf '/+Omarchy\n  //linux-aurora\n  protocol: efi\n  path: %s\n  cmdline: %s\n' "$path" "$cmdline" >>"$TEST_ESP/limine.conf"
 fi
 SH
 chmod +x "$stub_bin"/*
@@ -399,3 +424,93 @@ chmod +x "$stub_bin/omarchy-mac-limine-deploy"
 if run; then fail "success without matching EFI bytes is refused"; fi
 [[ $(cat "$esp/EFI/BOOT/BOOTAA64.EFI") == "previous-efi" ]] || fail "false-success rollback retains the prior loader"
 pass "successful activation requires actual packaged EFI bytes"
+
+# The image's built configuration, then the real first-boot leaf (which runs
+# the real command-line helper and the real deploy). The case above left a
+# deploy that succeeds without copying; put the real one back. /etc/limine-entry-tool.conf
+# ships ENABLE_VERIFICATION=yes. The drop-in turns it off and sorts last. The
+# leaf rewrites /etc/default/limine and does not mention the key, so the
+# drop-in still wins and the menu gets no checksum. panic=10 is a word of
+# GRUB_CMDLINE_LINUX_DEFAULT; the console leaf does not rewrite that line, and
+# the helper copies it onto the UKI command line.
+rm -f "$stub_bin/omarchy-mac-limine-deploy"
+ln -s "$ROOT/bin/omarchy-mac-limine-deploy" "$stub_bin/omarchy-mac-limine-deploy"
+unset FAIL_LIMINE_UPDATE || true
+printf 'ENABLE_VERIFICATION=yes\n' >"$etc/limine-entry-tool.conf"
+mkdir -p "$etc/limine-entry-tool.d"
+printf '%s\n' '# first boot rewrites /etc/default/limine and keeps only TARGET_OS_NAME.' \
+  'ENABLE_VERIFICATION=no' >"$etc/limine-entry-tool.d/zz-smartroom-firmware.conf"
+cp "$etc/limine-entry-tool.d/zz-smartroom-firmware.conf" "$test_tmp/drop-in"
+printf '%s\n' \
+  'GRUB_VIDEO_BACKEND="efi_gop"' \
+  'GRUB_CMDLINE_LINUX="zswap.enabled=0 rootfstype=btrfs rootflags=x-systemd.device-timeout=0"' \
+  'GRUB_CMDLINE_LINUX_DEFAULT="quiet splash loglevel=0 systemd.show_status=false rd.udev.log_level=0 vt.global_cursor_default=0 plymouth.ignore-serial-consoles panic=10"' \
+  >"$etc/grub"
+printf 'TARGET_OS_NAME="SmartRoom Firmware"\nENABLE_UKI=yes\nCUSTOM_UKI_NAME="omarchy"\nFIND_BOOTLOADERS=no\nKERNEL_CMDLINE[default]=""\nESP_PATH="%s"\nBOOT_ORDER="linux-aurora, *, *fallback, Snapshots"\n' "$esp" >"$etc/limine"
+mkdir -p "$esp/EFI/Linux"
+printf 'UKI\n' >"$esp/EFI/Linux/omarchy_linux-aurora.efi"
+cat >"$esp/limine.conf" <<'MENU'
+timeout: 1
+quiet: yes
+interface_branding: Omarchy Bootloader
+/+SmartRoom Firmware
+  //linux-aurora
+  protocol: efi
+  path: boot():/EFI/Linux/omarchy_linux-aurora.efi
+  cmdline: root=UUID=root-uuid rw quiet splash panic=10
+MENU
+cp "$esp/limine.conf" "$test_tmp/built-menu"
+# Host copies of these would make the console leaf depend on the machine.
+printf '#!/bin/bash\nprintf "systemd\\n"\n' >"$stub_bin/omarchy-mac-initramfs-hooks"
+printf '#!/bin/bash\necho "omarchy-mac-boot-update" >>"$TEST_CALLS"\n' >"$stub_bin/omarchy-mac-boot-update"
+chmod +x "$stub_bin/omarchy-mac-initramfs-hooks" "$stub_bin/omarchy-mac-boot-update"
+# setup-boot runs the console leaf first. The device wait is already on the
+# line, so this changes nothing and must not drop panic=10.
+PATH="$stub_bin:$PATH" TEST_CALLS="$calls" OMARCHY_GRUB_DEFAULT="$etc/grub" \
+  OMARCHY_GRUB_CONSOLE_PENDING="$test_tmp/no-such-pending" \
+  bash -c 'source "$1"' _ "$ROOT/setup/grub-console.sh" || fail "the console leaf fails on the built configuration"
+! grep -qx 'omarchy-mac-boot-update' "$calls" || fail "the console leaf regenerated boot files that were already right" "$(cat "$calls")"
+grep -Fxq 'GRUB_CMDLINE_LINUX_DEFAULT="quiet splash loglevel=0 systemd.show_status=false rd.udev.log_level=0 vt.global_cursor_default=0 plymouth.ignore-serial-consoles panic=10"' "$etc/grub" ||
+  fail "the console leaf rewrote GRUB_CMDLINE_LINUX_DEFAULT" "$(cat "$etc/grub")"
+# Deferred hardware setup: a menu that already boots the UKI is left in place.
+request="$test_tmp/boot-rebuild"
+rm -f "$request"
+: >"$calls"
+OMARCHY_IMAGE_BOOT_REBUILD="$request" OMARCHY_GRUB_PROBE=omarchy-test-absent-grub-probe run ||
+  fail "first boot fails on the built configuration"
+[[ -f $request ]] || fail "first boot defers the UKI rebuild"
+! grep -qx 'limine-update' "$calls" || fail "first boot rebuilt the UKI itself" "$(cat "$calls")"
+cmp -s "$etc/limine-entry-tool.d/zz-smartroom-firmware.conf" "$test_tmp/drop-in" ||
+  fail "first boot rewrote the checksum drop-in"
+! grep -q '^ENABLE_VERIFICATION=' "$etc/limine" || fail "first boot put ENABLE_VERIFICATION back into /etc/default/limine" "$(cat "$etc/limine")"
+grep -qx 'TARGET_OS_NAME="SmartRoom Firmware"' "$etc/limine" || fail "first boot dropped the OS name" "$(cat "$etc/limine")"
+grep -Eq 'KERNEL_CMDLINE\[default\]="[^"]*(^|[[:space:]])panic=10([[:space:]"]|$)' "$etc/limine" ||
+  fail "the derived UKI command line lost panic=10" "$(grep KERNEL_CMDLINE "$etc/limine")"
+! grep -qE '^ *[a-z_]*path: .*#[0-9a-f]{128}' "$esp/limine.conf" ||
+  fail "first boot added a file checksum to the menu" "$(cat "$esp/limine.conf")"
+pass "first boot keeps checksums off and panic=10 on the UKI command line"
+
+# The same configuration when the menu does not boot yet: the leaf's own
+# limine-update writes the entry, still with no checksum, and the UKI line
+# carries panic=10.
+rm -f "$request"
+cp "$test_tmp/runtime/default/limine/limine.conf" "$esp/limine.conf"
+rm -f "$esp/EFI/Linux/omarchy_linux-aurora.efi"
+: >"$calls"
+OMARCHY_GRUB_PROBE=omarchy-test-absent-grub-probe run || fail "a rebuild of the built configuration fails"
+grep -qx 'limine-update' "$calls" || fail "a menu that boots nothing is built" "$(cat "$calls")"
+! grep -qE '^ *[a-z_]*path: .*#[0-9a-f]{128}' "$esp/limine.conf" ||
+  fail "the rebuilt menu carries a file checksum" "$(cat "$esp/limine.conf")"
+grep -Eq '^ *cmdline:.*(^|[[:space:]])panic=10([[:space:]]|$)' "$esp/limine.conf" ||
+  fail "the rebuilt UKI command line has no panic=10" "$(grep cmdline "$esp/limine.conf")"
+pass "a rebuild of the built configuration writes no checksum and puts panic=10 on the UKI line"
+
+# Without the drop-in the packaged default (yes) is in force, and the menu
+# gets a checksum. This is how the stub shows it really consulted the setting.
+rm -f "$etc/limine-entry-tool.d/zz-smartroom-firmware.conf"
+cp "$test_tmp/runtime/default/limine/limine.conf" "$esp/limine.conf"
+rm -f "$esp/EFI/Linux/omarchy_linux-aurora.efi"
+OMARCHY_GRUB_PROBE=omarchy-test-absent-grub-probe run || fail "a rebuild with checksums on fails"
+grep -qE '^ *[a-z_]*path: .*#[0-9a-f]{128}' "$esp/limine.conf" ||
+  fail "checksums on, the menu should carry one" "$(cat "$esp/limine.conf")"
+pass "with the drop-in gone, the packaged checksum default is on the menu"
