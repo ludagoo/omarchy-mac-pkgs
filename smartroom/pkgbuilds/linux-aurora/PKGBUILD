@@ -82,6 +82,9 @@ _check_kernelrelease() {
 }
 
 prepare() {
+  # scripts/rust_is_available.sh accepts BINDGEN only when `command -v` can
+  # run it. A mode 644 file fails that check.
+  chmod +x "$srcdir/bindgen-kernel.py"
   cd $_srcname
 
   local got
