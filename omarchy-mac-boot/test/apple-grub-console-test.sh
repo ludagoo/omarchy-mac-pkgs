@@ -118,3 +118,18 @@ MKINITCPIO_CONF="$test_tmp/missing.conf" run
 grep -Fxq 'GRUB_CMDLINE_LINUX="zswap.enabled=0 rootflags=x-systemd.device-timeout=0"' "$test_tmp/grub" ||
   fail "an unreadable configuration keeps the wait, as every image boots systemd" "$(cat "$test_tmp/grub")"
 pass "the initramfs kind comes from the preset, mkinitcpio.conf and its drop-ins in mkinitcpio's order"
+
+# panic=10 is a word of GRUB_CMDLINE_LINUX_DEFAULT. This leaf rewrites
+# GRUB_CMDLINE_LINUX (the device wait) and the video backend, not that line.
+printf '%s\n' \
+  'GRUB_VIDEO_BACKEND="efi_gop"' \
+  'GRUB_CMDLINE_LINUX="zswap.enabled=0 rootfstype=btrfs rootflags=x-systemd.device-timeout=0"' \
+  'GRUB_CMDLINE_LINUX_DEFAULT="quiet splash loglevel=0 systemd.show_status=false rd.udev.log_level=0 vt.global_cursor_default=0 plymouth.ignore-serial-consoles panic=10"' \
+  >"$test_tmp/grub"
+: >"$TEST_CALLS"
+run
+grep -Fxq 'GRUB_CMDLINE_LINUX_DEFAULT="quiet splash loglevel=0 systemd.show_status=false rd.udev.log_level=0 vt.global_cursor_default=0 plymouth.ignore-serial-consoles panic=10"' "$test_tmp/grub" ||
+  fail "panic=10 stays on GRUB_CMDLINE_LINUX_DEFAULT" "$(cat "$test_tmp/grub")"
+grep -Fxq 'GRUB_CMDLINE_LINUX="zswap.enabled=0 rootfstype=btrfs rootflags=x-systemd.device-timeout=0"' "$test_tmp/grub" ||
+  fail "a command line that already waits is left as the image wrote it" "$(cat "$test_tmp/grub")"
+pass "panic=10 on the default command line survives the console leaf"

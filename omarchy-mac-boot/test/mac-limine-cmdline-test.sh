@@ -141,6 +141,15 @@ PATH="$stub_bin:$PATH" run || fail "run on a btrfs top-level root succeeds"
 grep -Fq 'rootflags=subvol=/,x-systemd.device-timeout=0 ' "$limine" || fail "subvol=/ stays the top level" "$(cat "$limine")"
 pass "subvolid= and the top-level subvolume are kept"
 
+# panic=10 is one word of GRUB_CMDLINE_LINUX_DEFAULT. The UKI line is this
+# helper's KERNEL_CMDLINE, so the word has to come through whole.
+printf 'GRUB_CMDLINE_LINUX="zswap.enabled=0 rootfstype=btrfs rootflags=x-systemd.device-timeout=0"\nGRUB_CMDLINE_LINUX_DEFAULT="quiet splash panic=10"\n' >"$grub"
+printf 'UUID=%s / btrfs subvol=@ 0 0\n' "$root_uuid" >"$fstab"
+run || fail "run with panic=10 succeeds"
+grep -Eq 'KERNEL_CMDLINE\[default\]="[^"]*(^|[[:space:]])panic=10([[:space:]"]|$)' "$limine" ||
+  fail "panic=10 from GRUB_CMDLINE_LINUX_DEFAULT is on the UKI command line" "$(grep KERNEL_CMDLINE "$limine")"
+pass "panic=10 reaches the UKI command line"
+
 # A command line that cannot be written stops limine-entry-tool's rebuild: its
 # hook runner aborts only on 100 and above.
 cp "$limine" "$test_tmp/before"
