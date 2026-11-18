@@ -859,6 +859,30 @@ limine_system /boot/efi 'UUID=r / btrfs rw,subvol=/@ 0 0' 'root=UUID=r rw rootfl
 sed -i 's/#[0-9a-f]*$//' "$root/boot/efi/limine.conf"
 run_check
 expect_fail "an entry without a hash" "does not name a hash-verified omarchy_linux-asahi.efi"
+# The packaged conf says yes. SmartRoom's drop-in says no and sorts later, so
+# the menu names the UKI with no hash. The UKI must still be this kernel. A
+# later yes in /etc/default/limine requires the hash again, and a hash that is
+# written is still compared.
+mkdir -p "$root/etc/limine-entry-tool.d"
+printf 'ENABLE_VERIFICATION=yes\n' >"$root/etc/limine-entry-tool.conf"
+printf '%s\n' '# comment' 'ENABLE_VERIFICATION=no' >"$root/etc/limine-entry-tool.d/zz-smartroom-firmware.conf"
+run_check
+expect_pass "an entry without a hash when SmartRoom turns checksums off"
+uki="$root/boot/efi/EFI/Linux/omarchy_linux-asahi.efi"
+cp "$uki" "$test_tmp/good-uki"
+hash=$(b2sum "$uki" | cut -d' ' -f1)
+printf 'stale' >>"$uki"
+sed -i "s|path: boot():/EFI/Linux/omarchy_linux-asahi.efi$|path: boot():/EFI/Linux/omarchy_linux-asahi.efi#$hash|" "$root/boot/efi/limine.conf"
+run_check
+expect_fail "a UKI rebuilt after the menu when checksums are off" "does not match the hash in limine.conf"
+cp "$test_tmp/good-uki" "$uki"
+sed -i 's/#[0-9a-f]*$//' "$root/boot/efi/limine.conf"
+printf 'an older kernel\n' >"$uki"
+run_check
+expect_fail "a UKI from another kernel when checksums are off" "does not carry the installed $kver kernel"
+printf 'ENABLE_VERIFICATION=yes\n' >>"$root/etc/default/limine"
+run_check
+expect_fail "an entry without a hash after defaults turn checksums back on" "does not name a hash-verified omarchy_linux-asahi.efi"
 limine_system /boot/efi 'UUID=r / btrfs rw,subvol=/@ 0 0' 'root=UUID=r rw rootflags=subvol=@ quiet'
 uki="$root/boot/efi/EFI/Linux/omarchy_linux-asahi.efi"
 printf 'an older kernel\n' >"$uki"
