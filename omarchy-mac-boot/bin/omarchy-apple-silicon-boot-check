@@ -76,6 +76,31 @@ limine_esp_path() {
   sudo sed -n -E 's/^[[:space:]]*ESP_PATH=("([^"]*)"|'\''([^'\'']*)'\''|([^[:space:]#"'\'']*)).*/\2\3\4/p' "$(path /etc/default/limine)" | tail -n 1
 }
 
+# Last ENABLE_VERIFICATION, in limine-entry-tool's order: the packaged conf,
+# drop-ins by name, then /etc/default/limine. Empty when nothing sets it.
+# SmartRoom sets no in zz-smartroom-firmware.conf, after the packaged yes.
+limine_verification() {
+  local line value="" dir drop
+  consider() {
+    [[ -f $1 ]] || return 0
+    line=$(sudo sed -n 's/^ENABLE_VERIFICATION=//p' "$1" | tail -n 1)
+    line=${line#\"}
+    line=${line%\"}
+    if [[ -n $line ]]; then
+      value=$line
+    fi
+  }
+  consider "$(path /etc/limine-entry-tool.conf)"
+  dir=$(path /etc/limine-entry-tool.d)
+  if [[ -d $dir ]]; then
+    for drop in "$dir"/*.conf; do
+      consider "$drop"
+    done
+  fi
+  consider "$(path /etc/default/limine)"
+  printf '%s' "$value"
+}
+
 # The kernel the boot menu starts: the first kernel entry in Limine's menu,
 # where the tool writes the Omarchy block first and Omarchy's default_entry
 # points, else GRUB's first entry. A default_entry or GRUB_DEFAULT pointed
@@ -430,15 +455,22 @@ if (( limine_mac )); then
   [[ -n $limine_cmdline ]] || fail "$limine_esp/limine.conf has no cmdline for the $kernel entry"
   # The entry's hash must be the UKI's, and the UKI must carry the installed
   # kernel: limine-entry-tool can keep going after one UKI fails to build.
+  # ENABLE_VERIFICATION=no (SmartRoom's drop-in) writes the UKI path with no
+  # hash. Unset and yes still require one. A hash that is present is compared
+  # either way.
   limine_path=$(sudo awk -v entry="//$kernel" '
     { line = $0; sub(/^[[:space:]]+/, "", line) }
     line == entry { inside = 1; next }
     inside && $1 == "path:" { sub(/^[[:space:]]*path:[[:space:]]*/, ""); print; exit }
   ' "$limine_cfg")
-  [[ $limine_path == "boot():/EFI/Linux/omarchy_$kernel.efi#"* ]] ||
-    fail "the Limine $kernel entry does not name a hash-verified omarchy_$kernel.efi"
-  [[ $(sudo b2sum "$limine_uki" | cut -d' ' -f1) == "${limine_path##*#}" ]] ||
-    fail "$limine_esp/EFI/Linux/omarchy_$kernel.efi does not match the hash in limine.conf"
+  if [[ $(limine_verification) == no && $limine_path == "boot():/EFI/Linux/omarchy_$kernel.efi" ]]; then
+    :
+  else
+    [[ $limine_path == "boot():/EFI/Linux/omarchy_$kernel.efi#"* ]] ||
+      fail "the Limine $kernel entry does not name a hash-verified omarchy_$kernel.efi"
+    [[ $(sudo b2sum "$limine_uki" | cut -d' ' -f1) == "${limine_path##*#}" ]] ||
+      fail "$limine_esp/EFI/Linux/omarchy_$kernel.efi does not match the hash in limine.conf"
+  fi
   if command -v objcopy >/dev/null 2>&1; then
     uki_kernel=$workdir/uki.linux
     sudo objcopy -O binary --only-section=.linux "$limine_uki" "$uki_kernel" 2>/dev/null ||

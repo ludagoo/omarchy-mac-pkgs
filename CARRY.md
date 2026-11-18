@@ -29,6 +29,14 @@ The Limine boot test reports an Asahi kernel for the one console-leaf call
 that has no boot-update environment; Aurora's user4k cases stay in the
 console test.
 
+`omarchy-apple-silicon-boot-check` still requires a blake2 hash on a Limine
+entry. It skips that compare only when the last `ENABLE_VERIFICATION` is
+`no` (packaged conf, then drop-ins, then `/etc/default/limine`) and the path
+is exactly `boot():/EFI/Linux/omarchy_<kernel>.efi`. SmartRoom's drop-in is
+what sets `no`. The UKI must still exist and carry the installed kernel, and
+a hash that is present is still compared. An entry with no hash and no `no`
+still fails.
+
 `smartroom/main` is what a stable SmartRoom Firmware boot package builds from:
 omacom's `main` (mirrored here as `main`, fast-forward only) plus the small
 patches below, rebased, never merged. Rooms run no desktop, so the only
