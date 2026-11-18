@@ -22,6 +22,13 @@ clock, marks good by write-beside, and rolls back by leaving the configured
 file alone. `smartroom/aura-try/test-all.sh` runs offline. It does not touch
 a real EFI partition and it does not reboot.
 
+`user4k.patch` in the omarchy-mac-boot recipe is the stable line's (see
+Base): the upstream console change, its cases after upstream's M4 cases,
+and one more that checks user4k leaves `panic=10` on the default command line.
+The Limine boot test reports an Asahi kernel for the one console-leaf call
+that has no boot-update environment; Aurora's user4k cases stay in the
+console test.
+
 `smartroom/main` is what a stable SmartRoom Firmware boot package builds from:
 omacom's `main` (mirrored here as `main`, fast-forward only) plus the small
 patches below, rebased, never merged. Rooms run no desktop, so the only
