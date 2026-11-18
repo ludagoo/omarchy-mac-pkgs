@@ -465,10 +465,16 @@ printf '#!/bin/bash\nprintf "systemd\\n"\n' >"$stub_bin/omarchy-mac-initramfs-ho
 printf '#!/bin/bash\necho "omarchy-mac-boot-update" >>"$TEST_CALLS"\n' >"$stub_bin/omarchy-mac-boot-update"
 chmod +x "$stub_bin/omarchy-mac-initramfs-hooks" "$stub_bin/omarchy-mac-boot-update"
 # setup-boot runs the console leaf first. The device wait is already on the
-# line, so this changes nothing and must not drop panic=10.
+# line, so this changes nothing and must not drop panic=10. The packaged
+# user4k.patch adds user4k=on when the kernel is linux-aurora and then
+# rebuilds boot files. This invocation has no update-grub environment, so
+# report Asahi here. Aurora's user4k cases, including panic=10 staying on
+# the default line, are in apple-grub-console-test.sh.
+printf '#!/bin/bash\nprintf "linux-asahi\\n"\n' >"$stub_bin/omarchy-mac-kernel"
 PATH="$stub_bin:$PATH" TEST_CALLS="$calls" OMARCHY_GRUB_DEFAULT="$etc/grub" \
   OMARCHY_GRUB_CONSOLE_PENDING="$test_tmp/no-such-pending" \
   bash -c 'source "$1"' _ "$ROOT/setup/grub-console.sh" || fail "the console leaf fails on the built configuration"
+printf '#!/bin/bash\necho linux-aurora\n' >"$stub_bin/omarchy-mac-kernel"
 ! grep -qx 'omarchy-mac-boot-update' "$calls" || fail "the console leaf regenerated boot files that were already right" "$(cat "$calls")"
 grep -Fxq 'GRUB_CMDLINE_LINUX_DEFAULT="quiet splash loglevel=0 systemd.show_status=false rd.udev.log_level=0 vt.global_cursor_default=0 plymouth.ignore-serial-consoles panic=10"' "$etc/grub" ||
   fail "the console leaf rewrote GRUB_CMDLINE_LINUX_DEFAULT" "$(cat "$etc/grub")"

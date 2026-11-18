@@ -1,5 +1,13 @@
 # SmartRoom carry on omarchy-mac-pkgs
 
+`user4k.patch` in the omarchy-mac-boot recipe is still the upstream console
+change. Its test hunk is retargeted so it applies after the panic=10 case,
+and that case checks user4k leaves `panic=10` on the default command line.
+The Limine boot test reports an Asahi kernel for the one console-leaf call
+that has no boot-update environment; Aurora's user4k cases stay in the
+console test. `smartroom/pkgbuilds/omarchy-mac-boot/recipe-test.sh` applies
+the patch as the recipe does and runs the patched console test.
+
 `smartroom/main` is what SmartRoom Firmware builds its boot package from:
 omacom's `main` (mirrored here as `main`, fast-forward only) plus the small
 patches below, rebased, never merged. Rooms run no desktop, so the only
