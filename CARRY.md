@@ -1,6 +1,28 @@
 # SmartRoom carry on omarchy-mac-pkgs
 
-`smartroom/main` is what SmartRoom Firmware builds its boot package from:
+`smartroom/edge` (this branch) is `smartroom/main` at `9540b55` plus the edge
+boot packages and an offline `aura-try` prototype. `smartroom/main` stays the
+stable line. Do not merge this branch back into `smartroom/main`.
+
+`omarchy-apple-silicon-boot-check` already accepts `aura` as the bootloader
+for `linux-aurora` (it refuses a root that has both `aura` and
+`m1n1-aurora`). No change to that check was required. The edge image installs
+`aura` from `smartroom/pkgbuilds/aura` (ludagoo/aura `fd7819aa`,
+`ave/t6021-fw`: aura main plus the t6021 encoder firmware handoff) and
+`linux-aurora` 7.3 from `smartroom/pkgbuilds/linux-aurora` (ludagoo/linux
+`b6d00c75`, `ave/t6021-j475c`). Both are signed into the SmartRoom repo in
+place of the channel packages. The kernel is not the omarchy-pkgs#3025 pin
+`4454eda`: cherry-picking the encoder commits onto that tip conflicted in
+the ave driver, so the package builds the ludagoo tree, which already has
+those commits and the AQC113 fix, and does not have the pin's M3/Neo carry.
+
+`smartroom/aura-try/` is the first rollback prototype from the design in
+`~/smartroom-rollback/DESIGN.md`. It arms a marker, checks health on a fake
+clock, marks good by write-beside, and rolls back by leaving the configured
+file alone. `smartroom/aura-try/test-all.sh` runs offline. It does not touch
+a real EFI partition and it does not reboot.
+
+`smartroom/main` is what a stable SmartRoom Firmware boot package builds from:
 omacom's `main` (mirrored here as `main`, fast-forward only) plus the small
 patches below, rebased, never merged. Rooms run no desktop, so the only
 change to Omarchy's boot logic is what a headless room needs; everything else

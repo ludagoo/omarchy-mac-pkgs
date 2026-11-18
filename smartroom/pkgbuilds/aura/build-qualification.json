@@ -1,0 +1,6 @@
+{
+  "source_commit": "fd7819aac5d9b9fe007cdec2ae56e490bc819818",
+  "hardware_tested": false,
+  "stage1_auto_enrollment": false,
+  "publication_gate": "SmartRoom edge build. Not the edgeB2 pin. Not hardware-qualified. The package does not enroll stage 1; the image builder copies the raw image and the pinned Engine enrolls it at install for j475cap on 13.5 only."
+}
