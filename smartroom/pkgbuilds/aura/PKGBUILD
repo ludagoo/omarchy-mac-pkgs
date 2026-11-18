@@ -1,0 +1,84 @@
+# SmartRoom edge build of aura.
+# Source is ludagoo/aura ave/t6021-fw (fd7819aa): aura main 3d517e63 plus the
+# t6021 encoder firmware hand-off. It is not omacom/m1n1 carry/edgeB-7.3
+# (703a0a92, the draft pin). That pin's extra commits are M3/Neo boot-loader
+# fixes; this package keeps the room's stage-2 hand-off instead.
+# The logo files are Omarchy's, the same bytes as the pin's aura recipe.
+# Package updates do not enroll stage 1 (stage1_auto_enrollment is false).
+# The image builder copies usr/share/aura/stage1/aura-raw.bin into the
+# payload, and the pinned Engine enrolls it.
+# studio-build has 15 GiB of RAM: the default job count is 3.
+pkgname=aura
+pkgver=1.0.0b13.r20261118.sredge1
+pkgrel=1
+pkgdesc='Aurora Silicon bootloader for Apple Silicon (SmartRoom edge build)'
+arch=('aarch64')
+groups=('omarchy-platform-apple-silicon')
+url='https://github.com/ludagoo/aura'
+license=('MIT' 'GPL-2.0-only')
+_commit=fd7819aac5d9b9fe007cdec2ae56e490bc819818
+# Matches the m1n1-aurora this package stands in for, so m1n1>=1.6.1 is met.
+_compat=1.6.1.aurora23
+provides=("m1n1=$_compat" "m1n1-aurora=$_compat" "m1n1-neo=$_compat")
+conflicts=('m1n1' 'm1n1-aurora' 'm1n1-neo' 'linux-aurora<7.3.0')
+replaces=('m1n1-aurora' 'm1n1-neo')
+makedepends=('git' 'clang' 'lld' 'llvm' 'rustup' 'make' 'python')
+options=('!strip' '!debug')
+source=("aura::git+https://github.com/ludagoo/aura.git#commit=${_commit}"
+        build-qualification.json validate-qualification.py
+        bootlogo_48.bin bootlogo_128.bin bootlogo_256.bin)
+sha256sums=('SKIP'
+            'e20bde6fda8621c4d70423c08a3c5af76142a38aa655ae0d1f1eaab09aa85a78'
+            'd89f89a68105e4663bdf14bf9d4d70f3fad79538a4c566e8fae73c0b40a9be26'
+            '6668050653645711ad7523fe2abeb4cbe85a92c875f3eec754b6db23cea2191c'
+            'b19cb017645c7a9068ea0be9b6bb394131d7ca11b28093cf6caa1ffca74b0a4e'
+            '9c659b392aacfa31c62c638003d2257abfdbe17919b5c90cde4c4e62f87addab')
+
+prepare() {
+  rustup toolchain install 1.99.0 --profile minimal --target aarch64-unknown-none-softfloat
+  [[ $(git -C aura rev-parse HEAD) == "$_commit" ]]
+  local size
+  for size in 48 128 256; do
+    install -Dm644 "$srcdir/bootlogo_$size.bin" "$srcdir/logo/omarchy_$size.bin"
+  done
+}
+
+build() {
+  cd aura
+  export RUSTUP_TOOLCHAIN=1.99.0
+  export AURA_VERSION_TAG="$(cat VERSION)-g${_commit:0:8}-sredge1"
+  make clean
+  make -j"${OMARCHY_BUILD_JOBS:-3}" RELEASE=1 CHAINLOADING=1 USE_CLANG=1 \
+    LOGO_DIR="$srcdir/logo" BUILTIN_LOGO=omarchy
+  install -Dm644 build/aura.bin "$srcdir/stage1/aura-raw.bin"
+  install -Dm644 build/aura.macho "$srcdir/stage1/aura.macho"
+  python3 tools/verify_builtin_logo.py build/aura.bin omarchy --logo-dir "$srcdir/logo"
+  make clean
+  make -j"${OMARCHY_BUILD_JOBS:-3}" RELEASE=1 CHAINLOADING=1 ESP_STAGE2=1 USE_CLANG=1 \
+    LOGO_DIR="$srcdir/logo" BUILTIN_LOGO=omarchy
+  python3 tools/verify_builtin_logo.py build/aura.bin omarchy --logo-dir "$srcdir/logo"
+}
+
+package() {
+  depends=('aurora-scripts>=20260127.1' 'uboot-aurora')
+  python "$srcdir/validate-qualification.py" --build-only "$srcdir/build-qualification.json" "$_commit"
+  # Refuse to ship m1n1 under aura's path. The marker is the enroll proof.
+  python - "$srcdir/stage1/aura-raw.bin" aura/build/aura.bin <<'PY'
+import pathlib, sys
+stage1 = pathlib.Path(sys.argv[1]).read_bytes()
+stage2 = pathlib.Path(sys.argv[2]).read_bytes()
+magic = b"AURORA-S1-CFG01\0"
+if not (stage1.endswith(b"STACKBOT") and stage1.count(magic) == 1 and b"aura-try" in stage1):
+    sys.exit("stage 1 is not an aura raw image (aura-try, one config block, STACKBOT)")
+if b"aura-try" not in stage2:
+    sys.exit("stage 2 aura.bin has no aura-try string")
+PY
+  install -Dm644 aura/build/aura.bin "$pkgdir/usr/lib/asahi-boot/m1n1.bin"
+  install -d "$pkgdir/usr/lib/m1n1-neo"
+  ln -s ../asahi-boot/m1n1.bin "$pkgdir/usr/lib/m1n1-neo/m1n1.bin"
+  install -Dm644 stage1/aura-raw.bin "$pkgdir/usr/share/aura/stage1/aura-raw.bin"
+  install -Dm644 stage1/aura.macho "$pkgdir/usr/share/aura/stage1/aura.macho"
+  install -Dm644 aura/LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -m644 aura/3rdparty_licenses/* "$pkgdir/usr/share/licenses/$pkgname/"
+  install -Dm644 "$srcdir/build-qualification.json" "$pkgdir/usr/share/doc/aura/build-qualification.json"
+}

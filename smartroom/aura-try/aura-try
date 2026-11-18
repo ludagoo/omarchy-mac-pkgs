@@ -1,0 +1,295 @@
+#!/usr/bin/env python3
+"""Offline prototype of the aura-try rollback from ~/smartroom-rollback/DESIGN.md.
+
+This does not reboot, does not arm a watchdog, and does not touch a real EFI
+partition. Point --esp at a directory that stands in for the ESP root.
+
+The marker file is aura-try at that root. Armed contents are exactly
+`armed\\n<path>\\n`. Mark-good replaces the configured file by writing the trial
+bytes beside it, flushing, and renaming, and keeps the previous bytes under a
+spare name. Rollback leaves the configured file alone.
+
+Health: the Room Controller is connected, the network is up, and the displays
+are present, together, for five minutes, and that window ends within 15
+minutes of userspace start. Pass samples as T,connected,network,displays.
+A sample holds until the next one. Times are integer seconds. The 178 second
+watchdog is not this timer.
+"""
+import argparse
+import hashlib
+import json
+import os
+import sys
+from pathlib import Path
+
+QUIET_SECONDS = 300
+LIMIT_SECONDS = 900
+MARKER = "aura-try"
+STATE = "smartroom-aura-try-state.json"
+REASONS = ("health-timeout", "panic-reboot", "watchdog-reboot", "trial-did-not-start")
+
+
+def state_path(esp: Path) -> Path:
+    return esp / STATE
+
+
+def load(esp: Path) -> dict:
+    path = state_path(esp)
+    if not path.exists():
+        return {"events": []}
+    return json.loads(path.read_text())
+
+
+def save(esp: Path, state: dict) -> None:
+    path = state_path(esp)
+    tmp = path.with_suffix(".json.tmp")
+    data = json.dumps(state, indent=2, sort_keys=True) + "\n"
+    tmp.write_text(data)
+    fd = os.open(tmp, os.O_RDWR)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.replace(tmp, path)
+
+
+def event(state: dict, name: str, **fields) -> None:
+    record = {"event": name}
+    record.update(fields)
+    state.setdefault("events", []).append(record)
+
+
+def sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while chunk := stream.read(1 << 20):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def parse_pair(text: str) -> tuple[str, str]:
+    name, value = text.split("=", 1)
+    if not name or "/" in name or name.startswith("."):
+        raise SystemExit(f"bad file name in {text}")
+    return name, value
+
+
+def cmd_arm(args) -> int:
+    esp = Path(args.esp)
+    esp.mkdir(parents=True, exist_ok=True)
+    trial = Path(args.trial_path)
+    if trial.is_absolute() or ".." in trial.parts or not trial.parts:
+        raise SystemExit("trial path must be relative to the ESP root")
+    trial_file = esp / trial
+    if not trial_file.is_file():
+        raise SystemExit(f"trial file is missing: {trial}")
+    configured = esp / args.configured
+    if not configured.is_file():
+        raise SystemExit(f"configured file is missing: {args.configured}")
+    state = load(esp)
+    state["release"] = args.release
+    state["previous"] = args.previous
+    state["boot"] = "trial"
+    state["trial_path"] = trial.as_posix()
+    state["configured"] = args.configured
+    state["health_passed"] = False
+    checked = []
+    for item in args.file or []:
+        name, expect = parse_pair(item)
+        path = esp / name
+        if not path.is_file():
+            event(state, "files-checked", result="failed", file=name, reason="missing")
+            save(esp, state)
+            raise SystemExit(f"checked file is missing: {name}")
+        got = sha256(path)
+        if got != expect:
+            event(state, "files-checked", result="failed", file=name, reason="checksum")
+            save(esp, state)
+            raise SystemExit(f"checksum mismatch: {name}")
+        checked.append(name)
+    event(state, "started", release=args.release, previous=args.previous)
+    event(state, "files-checked", result="ok", files=checked)
+    marker = esp / MARKER
+    # Do not replace a configured boot file here. Only the marker is written.
+    payload = f"armed\n{trial.as_posix()}\n"
+    tmp = esp / ".aura-try.tmp"
+    tmp.write_text(payload)
+    fd = os.open(tmp, os.O_RDWR)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.replace(tmp, marker)
+    event(state, "armed", path=trial.as_posix(), release=args.release)
+    save(esp, state)
+    print(f"armed {trial.as_posix()}")
+    return 0
+
+
+def samples_of(items: list[str]) -> list[tuple[int, int, int, int]]:
+    rows = []
+    for item in items:
+        parts = item.split(",")
+        if len(parts) != 4:
+            raise SystemExit(f"sample must be T,connected,network,displays: {item}")
+        t, connected, network, displays = (int(part) for part in parts)
+        if connected not in (0, 1) or network not in (0, 1) or displays not in (0, 1):
+            raise SystemExit(f"sample flags must be 0 or 1: {item}")
+        rows.append((t, connected, network, displays))
+    rows.sort()
+    return rows
+
+
+def healthy(start: int, now: int, rows: list[tuple[int, int, int, int]]) -> bool:
+    if now < start:
+        return False
+    horizon = min(now, start + LIMIT_SECONDS)
+    state = (0, 0, 0)
+    changes = []
+    for t, connected, network, displays in rows:
+        if t <= start:
+            state = (connected, network, displays)
+        elif t < horizon:
+            changes.append((t, (connected, network, displays)))
+    cursor = start
+    stretch = 0
+    for moment, new in changes + [(horizon, None)]:
+        if state == (1, 1, 1):
+            stretch += moment - cursor
+        else:
+            stretch = 0
+        if stretch >= QUIET_SECONDS:
+            return True
+        cursor = moment
+        if new is not None:
+            state = new
+    return False
+
+
+def cmd_health(args) -> int:
+    esp = Path(args.esp)
+    state = load(esp)
+    rows = samples_of(args.sample or [])
+    passed = healthy(args.boot_started, args.now, rows)
+    state["health_passed"] = passed
+    if passed:
+        state["health_passed_at"] = args.now
+        event(state, "health-passed", at=args.now)
+    save(esp, state)
+    print("pass" if passed else "fail")
+    return 0 if passed else 1
+
+
+def write_beside(destination: Path, data: bytes) -> None:
+    tmp = destination.with_name(destination.name + ".new")
+    tmp.write_bytes(data)
+    fd = os.open(tmp, os.O_RDWR)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.replace(tmp, destination)
+
+
+def cmd_mark_good(args) -> int:
+    esp = Path(args.esp)
+    state = load(esp)
+    if not state.get("health_passed"):
+        raise SystemExit("mark-good refused: the health check has not passed")
+    configured = esp / state["configured"]
+    trial = esp / state["trial_path"]
+    if not configured.is_file() or not trial.is_file():
+        raise SystemExit("mark-good refused: configured or trial file is missing")
+    previous = configured.read_bytes()
+    new = trial.read_bytes()
+    spare = esp / (state["configured"] + ".previous")
+    spare.parent.mkdir(parents=True, exist_ok=True)
+    write_beside(spare, previous)
+    write_beside(configured, new)
+    marker = esp / MARKER
+    if marker.exists():
+        marker.unlink()
+    state["boot"] = "configured"
+    state["release_running"] = state.get("release")
+    event(state, "marked-good", at=args.now, release=state.get("release"))
+    save(esp, state)
+    print("marked-good")
+    return 0
+
+
+def cmd_rollback(args) -> int:
+    if args.reason not in REASONS:
+        raise SystemExit(f"reason must be one of: {', '.join(REASONS)}")
+    esp = Path(args.esp)
+    state = load(esp)
+    configured = state.get("configured")
+    before = (esp / configured).read_bytes() if configured and (esp / configured).is_file() else None
+    # Leave the configured file untouched. A spent or armed marker stays, so
+    # the next boot is the configured image, which is what aura already did
+    # when it spent the marker.
+    if before is not None and (esp / configured).read_bytes() != before:
+        raise SystemExit("rollback changed the configured file")
+    state["boot"] = "configured"
+    state["health_passed"] = False
+    state["release_running"] = state.get("previous")
+    event(state, "rolled-back", at=args.now, reason=args.reason, release=state.get("previous"))
+    save(esp, state)
+    print(f"rolled-back {args.reason}")
+    return 0
+
+
+def cmd_report(args) -> int:
+    state = load(Path(args.esp))
+    release = state.get("release_running") or state.get("release") or ""
+    boot = state.get("boot") or "configured"
+    previous = state.get("previous") or ""
+    print(f"release={release}")
+    print(f"boot={boot}")
+    print(f"previous={previous}")
+    for record in state.get("events", []):
+        fields = " ".join(f"{key}={value}" for key, value in record.items() if key != "event")
+        print(f"event {record['event']} {fields}".rstrip())
+    return 0
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    arm = sub.add_parser("arm")
+    arm.add_argument("--esp", required=True)
+    arm.add_argument("--trial-path", required=True)
+    arm.add_argument("--configured", required=True)
+    arm.add_argument("--release", required=True)
+    arm.add_argument("--previous", required=True)
+    arm.add_argument("--file", action="append", help="NAME=sha256, checked before the marker is written")
+    arm.set_defaults(func=cmd_arm)
+
+    health = sub.add_parser("health")
+    health.add_argument("--esp", required=True)
+    health.add_argument("--now", type=int, required=True)
+    health.add_argument("--boot-started", type=int, required=True)
+    health.add_argument("--sample", action="append")
+    health.set_defaults(func=cmd_health)
+
+    good = sub.add_parser("mark-good")
+    good.add_argument("--esp", required=True)
+    good.add_argument("--now", type=int, required=True)
+    good.set_defaults(func=cmd_mark_good)
+
+    back = sub.add_parser("rollback")
+    back.add_argument("--esp", required=True)
+    back.add_argument("--now", type=int, required=True)
+    back.add_argument("--reason", required=True)
+    back.set_defaults(func=cmd_rollback)
+
+    report = sub.add_parser("report")
+    report.add_argument("--esp", required=True)
+    report.set_defaults(func=cmd_report)
+
+    args = parser.parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
