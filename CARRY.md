@@ -7,14 +7,17 @@ stable line. Do not merge this branch back into `smartroom/main`.
 `omarchy-apple-silicon-boot-check` already accepts `aura` as the bootloader
 for `linux-aurora` (it refuses a root that has both `aura` and
 `m1n1-aurora`). No change to that check was required. The edge image installs
-`aura` from `smartroom/pkgbuilds/aura` (ludagoo/aura `fd7819aa`,
-`ave/t6021-fw`: aura main plus the t6021 encoder firmware handoff) and
-`linux-aurora` 7.3 from `smartroom/pkgbuilds/linux-aurora` (ludagoo/linux
-`b6d00c75`, `ave/t6021-j475c`). Both are signed into the SmartRoom repo in
-place of the channel packages. The kernel is not the omarchy-pkgs#3025 pin
-`4454eda`: cherry-picking the encoder commits onto that tip conflicted in
-the ave driver, so the package builds the ludagoo tree, which already has
-those commits and the AQC113 fix, and does not have the pin's M3/Neo carry.
+`aura` from `smartroom/pkgbuilds/aura` (ludagoo/aura `ave/t6021-fw`: aura
+main plus the hand-off of both t6021 encoders' firmware) and `linux-aurora`
+7.3 from `smartroom/pkgbuilds/linux-aurora` (ludagoo/linux `ave/t6021-j475c`:
+the Aurora encoder stack on aurora-silicon `integration/aurora`, J475c
+auxiliary DMA blocks left disabled). Each commit is named once, as `_commit`
+at the top of its PKGBUILD; the aura qualification record gets it from there.
+Both are signed into the SmartRoom repo in place of the channel packages.
+The kernel is not the omarchy-pkgs#3025 pin `4454eda`: cherry-picking the
+encoder commits onto that tip conflicted in the ave driver, so the package
+builds the ludagoo tree, which has those commits and, in its base, the
+AQC113 own-address filter, and does not have the pin's M3/Neo carry.
 
 `smartroom/aura-try/` is the first rollback prototype from the design in
 `~/smartroom-rollback/DESIGN.md`. It arms a marker, checks health on a fake

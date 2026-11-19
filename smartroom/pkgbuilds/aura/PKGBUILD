@@ -1,6 +1,10 @@
+# ludagoo/aura ave/t6021-fw. The only place the aura commit is named.
+# A different commit also needs a new pkgver suffix, or pacman sees no update.
+_commit=117fd2e7eb10cc7742ee526381e8bb117c0523af
+
 # SmartRoom edge build of aura.
-# Source is ludagoo/aura ave/t6021-fw (fd7819aa): aura main 3d517e63 plus the
-# t6021 encoder firmware hand-off. It is not omacom/m1n1 carry/edgeB-7.3
+# Source is ludagoo/aura ave/t6021-fw: aura main plus the hand-off of both
+# t6021 encoders' preloaded firmware. It is not omacom/m1n1 carry/edgeB-7.3
 # (703a0a92, the draft pin). That pin's extra commits are M3/Neo boot-loader
 # fixes; this package keeps the room's stage-2 hand-off instead.
 # The logo files are Omarchy's, the same bytes as the pin's aura recipe.
@@ -9,14 +13,13 @@
 # payload, and the pinned Engine enrolls it.
 # studio-build has 15 GiB of RAM: the default job count is 3.
 pkgname=aura
-pkgver=1.0.0b13.r20261118.sredge1
+pkgver=1.0.0b13.r20261118.sredge2
 pkgrel=1
 pkgdesc='Aurora Silicon bootloader for Apple Silicon (SmartRoom edge build)'
 arch=('aarch64')
 groups=('omarchy-platform-apple-silicon')
 url='https://github.com/ludagoo/aura'
 license=('MIT' 'GPL-2.0-only')
-_commit=fd7819aac5d9b9fe007cdec2ae56e490bc819818
 # Matches the m1n1-aurora this package stands in for, so m1n1>=1.6.1 is met.
 _compat=1.6.1.aurora23
 provides=("m1n1=$_compat" "m1n1-aurora=$_compat" "m1n1-neo=$_compat")
@@ -28,7 +31,7 @@ source=("aura::git+https://github.com/ludagoo/aura.git#commit=${_commit}"
         build-qualification.json validate-qualification.py
         bootlogo_48.bin bootlogo_128.bin bootlogo_256.bin)
 sha256sums=('SKIP'
-            'e20bde6fda8621c4d70423c08a3c5af76142a38aa655ae0d1f1eaab09aa85a78'
+            'b8b38a188a469116e12ce0c0eb596a4f7cf43627d151ee3b44574733ffe40b95'
             'd89f89a68105e4663bdf14bf9d4d70f3fad79538a4c566e8fae73c0b40a9be26'
             '6668050653645711ad7523fe2abeb4cbe85a92c875f3eec754b6db23cea2191c'
             'b19cb017645c7a9068ea0be9b6bb394131d7ca11b28093cf6caa1ffca74b0a4e'
@@ -41,12 +44,22 @@ prepare() {
   for size in 48 128 256; do
     install -Dm644 "$srcdir/bootlogo_$size.bin" "$srcdir/logo/omarchy_$size.bin"
   done
+  # The recipe's record names no commit; the shipped one names _commit.
+  # build-qualification.json in srcdir is a link into the recipe directory.
+  python - "$srcdir/build-qualification.json" "$_commit" "$srcdir/qualification.json" <<'PY'
+import json, pathlib, sys
+record = json.loads(pathlib.Path(sys.argv[1]).read_text())
+if "source_commit" in record:
+    sys.exit("build-qualification.json names a commit; the pin is _commit in the PKGBUILD")
+record = {"source_commit": sys.argv[2], **record}
+pathlib.Path(sys.argv[3]).write_text(json.dumps(record, indent=2) + "\n")
+PY
 }
 
 build() {
   cd aura
   export RUSTUP_TOOLCHAIN=1.99.0
-  export AURA_VERSION_TAG="$(cat VERSION)-g${_commit:0:8}-sredge1"
+  export AURA_VERSION_TAG="$(cat VERSION)-g${_commit:0:8}-${pkgver##*.}"
   make clean
   make -j"${OMARCHY_BUILD_JOBS:-3}" RELEASE=1 CHAINLOADING=1 USE_CLANG=1 \
     LOGO_DIR="$srcdir/logo" BUILTIN_LOGO=omarchy
@@ -61,7 +74,7 @@ build() {
 
 package() {
   depends=('aurora-scripts>=20260127.1' 'uboot-aurora')
-  python "$srcdir/validate-qualification.py" --build-only "$srcdir/build-qualification.json" "$_commit"
+  python "$srcdir/validate-qualification.py" --build-only "$srcdir/qualification.json" "$_commit"
   # Refuse to ship m1n1 under aura's path. The marker is the enroll proof.
   python - "$srcdir/stage1/aura-raw.bin" aura/build/aura.bin <<'PY'
 import pathlib, sys
@@ -80,5 +93,5 @@ PY
   install -Dm644 stage1/aura.macho "$pkgdir/usr/share/aura/stage1/aura.macho"
   install -Dm644 aura/LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
   install -m644 aura/3rdparty_licenses/* "$pkgdir/usr/share/licenses/$pkgname/"
-  install -Dm644 "$srcdir/build-qualification.json" "$pkgdir/usr/share/doc/aura/build-qualification.json"
+  install -Dm644 "$srcdir/qualification.json" "$pkgdir/usr/share/doc/aura/build-qualification.json"
 }
