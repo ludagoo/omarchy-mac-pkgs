@@ -31,8 +31,8 @@ _auroraver=7.3.0
 _aurorarel=0sredge3
 pkgrel=1
 
-# The GPU driver is named "aurora", so a matching mesa-aurora is still
-# wanted; this image does not rebuild mesa (see the edge report).
+# The GPU driver is named "aurora". smartroom/pkgbuilds/mesa-aurora is the
+# Mesa that opens it.
 
 # Any m1n1 1.6.1 loads these device trees. The Neo's own Stage 2 comes from the
 # image, so the floor stays where M1 and M2 users' m1n1-aurora already meets it.
