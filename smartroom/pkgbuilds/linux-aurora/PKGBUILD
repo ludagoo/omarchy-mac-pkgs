@@ -1,3 +1,7 @@
+# ludagoo/linux ave/t6021-j475c. The only place the kernel commit is named.
+# A different commit also needs a new _aurorarel, or pacman sees no update.
+_commit=337b30e63809d30963f06434bf5a79d12a242725
+
 # AArch64 Apple Silicon (Aurora Silicon)
 # Based on the asahi-alarm linux-asahi package by Jos Dehaes and Matthias Kurz.
 #
@@ -8,27 +12,25 @@
 # for Macs on the Omarchy edge channel. It reaches rc and stable only after
 # cold-boot qualification on M1 and M2.
 
-# SmartRoom edge image. Kernel 7.3 from ludagoo/linux ave/t6021-j475c
-# (b6d00c75): aurora-silicon integration/aurora at 0abc2f38, plus the room's
-# three t6021 encoder commits already applied on that branch. Cherry-picking
-# those three onto omacom/linux-aurora carry/edgeB-7.3 (4454eda, the
-# omarchy-pkgs#3025 pin) conflicted in ave-sess.c, ave-v4l2.c and
-# ave-writer.c, so this package does not build that pin. It therefore also
-# lacks the pin's carry of aurora-silicon/linux PRs #2145 to #2156 and the
-# M3/Neo cpufreq fix 48c1af3a787. The config fragment and configure helpers
-# are still the edgeB2 ones. The release number 0sredge1 sorts below a real
-# 7.3.0.aurora<N> and does not collide with the draft's 0testedgeB2. The
-# kernel release is 7.3.0-0sredge1-1-ARCH. The AQC113 own-address filter is
-# already in 0abc2f38. studio-build has 15 GiB of RAM: the default job count
-# is 3.
+# SmartRoom edge image. Kernel 7.3 from ludagoo/linux ave/t6021-j475c: the
+# Aurora encoder stack (the T6021 driver series and the J475c enable, which
+# leaves the encoders' auxiliary DMA blocks disabled) on aurora-silicon
+# integration/aurora. That base already has the AQC113 own-address filter.
+# This package does not build the omarchy-pkgs#3025 pin (omacom/linux-aurora
+# carry/edgeB-7.3): cherry-picking the encoder commits onto it conflicted in
+# the ave driver. It therefore lacks the pin's carry of aurora-silicon/linux
+# PRs #2145 to #2156 and the M3/Neo cpufreq fix 48c1af3a787. The config
+# fragment and configure helpers are still the edgeB2 ones. The release
+# number 0sredge<N> sorts below a real 7.3.0.aurora<N> and does not collide
+# with the draft's 0testedgeB2. The kernel release is
+# 7.3.0-${_aurorarel}-${pkgrel}-ARCH. studio-build has 15 GiB of RAM: the
+# default job count is 3.
 _auroraver=7.3.0
-_aurorarel=0sredge1
+_aurorarel=0sredge2
 pkgrel=1
 
-# ludagoo/linux ave/t6021-j475c. Not a new branch: the existing tip.
 # The GPU driver is named "aurora", so a matching mesa-aurora is still
 # wanted; this image does not rebuild mesa (see the edge report).
-_commit=b6d00c7597fd5d5fd0b9898ccb8e7b0a62660641
 
 # Any m1n1 1.6.1 loads these device trees. The Neo's own Stage 2 comes from the
 # image, so the floor stays where M1 and M2 users' m1n1-aurora already meets it.
