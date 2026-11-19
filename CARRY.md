@@ -22,6 +22,15 @@ encoder commits onto that tip conflicted in the ave driver, so the package
 builds the ludagoo tree, which has those commits and, in its base, the
 AQC113 own-address filter, and does not have the pin's M3/Neo carry.
 
+The 7.3 kernel's GPU driver is named `aurora`. The published edge
+`mesa-aurora` (20261107, `b7b03c5b3b8`) opens only `asahi`, so EGL fails and
+Hyprland aborts at start, with or without a screen. `smartroom/pkgbuilds/mesa-aurora`
+is the omarchy-pkgs#3025 (edgeB2) recipe, unchanged: omacom/mesa
+`carry/edgeB-7.3` `23791c134af`, which opens `aurora` and still accepts
+`asahi`. It builds `mesa-aurora` and `vulkan-aurora`, and the image takes
+both from the SmartRoom repo by name. Drop it when the edge channel
+publishes that Mesa or a newer one.
+
 `smartroom/aura-try/` is the first rollback prototype from the design in
 `~/smartroom-rollback/DESIGN.md`. It arms a marker, checks health on a fake
 clock, marks good by write-beside, and rolls back by leaving the configured
