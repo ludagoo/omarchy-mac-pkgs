@@ -9,9 +9,12 @@ for `linux-aurora` (it refuses a root that has both `aura` and
 `m1n1-aurora`). No change to that check was required. The edge image installs
 `aura` from `smartroom/pkgbuilds/aura` (ludagoo/aura `ave/t6021-fw`: aura
 main plus the hand-off of both t6021 encoders' firmware) and `linux-aurora`
-7.3 from `smartroom/pkgbuilds/linux-aurora` (ludagoo/linux `ave/t6021-j475c`:
-the Aurora encoder stack on aurora-silicon `integration/aurora`, J475c
-auxiliary DMA blocks left disabled). Each commit is named once, as `_commit`
+7.3 from `smartroom/pkgbuilds/linux-aurora` (ludagoo/linux
+`smartroom/edge-kernel-3`: the Aurora encoder stack of `ave/t6021-j475c` on
+aurora-silicon `integration/aurora`, J475c auxiliary DMA blocks left
+disabled, plus the J475c SMC sensor tree from `smc/j475c-sensors` and the
+apple-ave sysfs usage counter from `ave/usage-counter`, cherry-picked onto
+it). Each commit is named once, as `_commit`
 at the top of its PKGBUILD; the aura qualification record gets it from there.
 Both are signed into the SmartRoom repo in place of the channel packages.
 The kernel is not the omarchy-pkgs#3025 pin `4454eda`: cherry-picking the

@@ -1,6 +1,6 @@
 # ludagoo/aura ave/t6021-fw. The only place the aura commit is named.
 # A different commit also needs a new pkgver suffix, or pacman sees no update.
-_commit=117fd2e7eb10cc7742ee526381e8bb117c0523af
+_commit=13fb868849da6a286d46a4aaa010368c2649f87f
 
 # SmartRoom edge build of aura.
 # Source is ludagoo/aura ave/t6021-fw: aura main plus the hand-off of both
@@ -13,7 +13,7 @@ _commit=117fd2e7eb10cc7742ee526381e8bb117c0523af
 # payload, and the pinned Engine enrolls it.
 # studio-build has 15 GiB of RAM: the default job count is 3.
 pkgname=aura
-pkgver=1.0.0b13.r20261118.sredge2
+pkgver=1.0.0b13.r20261119.sredge3
 pkgrel=1
 pkgdesc='Aurora Silicon bootloader for Apple Silicon (SmartRoom edge build)'
 arch=('aarch64')
