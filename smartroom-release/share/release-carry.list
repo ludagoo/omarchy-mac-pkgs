@@ -16,6 +16,12 @@
 /var/lib/bluetooth
 # The Studio first boot's latch: without it a new root would register again.
 /var/lib/smartroomos
+# First-boot state the room already completed: keeping its package keyring
+# and vendor firmware stamp stops an image-built release from reinitializing them.
+/etc/pacman.d/gnupg
+/var/lib/omarchy/mac-first-boot/install.conf
+/var/lib/omarchy/mac-first-boot/keyring
+/var/lib/omarchy/vendor-firmware.stamp
 /opt/smartroom/config
 /opt/smartroom/state
 /opt/smartroom/chrome-profiles

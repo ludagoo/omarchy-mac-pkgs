@@ -756,6 +756,27 @@ def fix_root_files(host: Host, new_root: Path, subvol: str, release: str) -> Non
 
     edit("etc/default/limine", limine_defaults)
     edit("etc/default/grub", lambda t: re.sub(r"rootflags=subvol=/?@(?=[\s,\"'])", f"rootflags=subvol={subvol}", t))
+    # A release built from a fresh image still carries first-boot triggers.
+    # An updated room already ran first boot and ships its own verified UKI;
+    # clearing those latches stops omarchy-mac-first-boot or deferred hardware
+    # setup from rebuilding the UKI and overwriting the configured ESP entry
+    # while a trial is running.
+    for latch in (
+        "var/lib/omarchy/mac-first-boot/pending",
+        "var/lib/omarchy/mac-first-boot/deferred-steps",
+        "var/lib/omarchy/image/deferred-steps",
+        "var/lib/omarchy/image/pacman-keyring",
+        "var/lib/omarchy/image/boot-rebuild",
+        "var/lib/omarchy/image/initramfs-inputs",
+    ):
+        remove(new_root / latch)
+    target = new_root / "var/lib/omarchy/image/target"
+    booted = new_root / "var/lib/omarchy/image/target.booted"
+    if target.is_file() or target.is_symlink():
+        if not (booted.exists() or booted.is_symlink()):
+            os.replace(target, booted)
+        else:
+            remove(target)
     info = new_root / "usr/share/smartroomos"
     info.mkdir(parents=True, exist_ok=True)
     write_atomic(info / "release-id", (release + "\n").encode(), mode=0o644)

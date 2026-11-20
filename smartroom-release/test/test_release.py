@@ -432,6 +432,71 @@ class Stage(unittest.TestCase):
         self.w.run("discard")
         self.assertEqual(self.w.run("stage", str(d), "--unsigned")[0], 0)
 
+    def test_stage_disarms_fresh_image_first_boot_triggers(self):
+        # Simulate a release captured from a fresh image root plus an already-booted room.
+        for rel, data in {
+            "etc/pacman.d/gnupg/pubring.gpg": "ROOM-GPG",
+            "var/lib/omarchy/mac-first-boot/install.conf": "format=1\nencrypt=0\n",
+            "var/lib/omarchy/mac-first-boot/keyring": "master=ABC\n",
+            "var/lib/omarchy/vendor-firmware.stamp": "",
+        }.items():
+            f = self.w.prefix / rel
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_text(data)
+        d = self.w.tmp / "release-fresh-img"
+        (d / "m1n1").mkdir(parents=True)
+        (d / "EFI/Linux").mkdir(parents=True)
+        stage2 = b"stage2-fresh"
+        uki = b"uki-fresh"
+        (d / "m1n1/boot.bin").write_bytes(stage2)
+        (d / "EFI/Linux/omarchy_linux-aurora.efi").write_bytes(uki)
+        tree = self.w.tmp / "tree-fresh-img"
+        root = tree / "factory"
+        (root / "etc/default").mkdir(parents=True)
+        (root / "etc/fstab").write_text("UUID=aa  /  btrfs  noatime,subvol=@  0 0\n")
+        (root / "etc/default/limine").write_text(f'KERNEL_CMDLINE[default]="{CMDLINE}"\n')
+        for rel, data in {
+            "var/lib/omarchy/mac-first-boot/pending": "",
+            "var/lib/omarchy/mac-first-boot/deferred-steps": "install/hardware/apple/limine-boot.sh\n",
+            "var/lib/omarchy/image/deferred-steps": "install/hardware/platform-setup.sh\n",
+            "var/lib/omarchy/image/target": "format=1\nplatform=apple-silicon\n",
+            "var/lib/omarchy/image/pacman-keyring": "",
+            "var/lib/omarchy/image/boot-rebuild": "",
+            "var/lib/omarchy/image/initramfs-inputs": "123 456\n",
+        }.items():
+            f = root / rel
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_text(data)
+        tar = subprocess.run(["tar", "-C", str(tree), "-cf", "-", "factory"], capture_output=True, check=True).stdout
+        stream = subprocess.run(["zstd", "-q", "-c"], input=tar, capture_output=True, check=True).stdout
+        (d / "root.btrfs.zst").write_bytes(stream)
+        manifest = {
+            "schema": 1, "id": "2026.11.21-fresh", "created": "2026-11-21T00:00:00Z", "parent": None,
+            "root": {"file": "root.btrfs.zst", "sha256": sha(stream), "size": len(stream)},
+            "boot": [
+                {"role": "stage2", "path": "m1n1/boot.bin", "sha256": sha(stage2), "size": len(stage2)},
+                {"role": "uki", "path": "EFI/Linux/omarchy_linux-aurora.efi", "sha256": sha(uki), "size": len(uki)},
+            ],
+        }
+        (d / "manifest.json").write_text(json.dumps(manifest))
+        code, _, err = self.w.run("stage", str(d), "--unsigned")
+        self.assertEqual(code, 0, err)
+        new = self.w.prefix / "top/@r-2026.11.21-fresh"
+        for gone in (
+            "var/lib/omarchy/mac-first-boot/pending",
+            "var/lib/omarchy/mac-first-boot/deferred-steps",
+            "var/lib/omarchy/image/deferred-steps",
+            "var/lib/omarchy/image/target",
+            "var/lib/omarchy/image/pacman-keyring",
+            "var/lib/omarchy/image/boot-rebuild",
+            "var/lib/omarchy/image/initramfs-inputs",
+        ):
+            self.assertFalse((new / gone).exists(), gone)
+        self.assertEqual((new / "var/lib/omarchy/image/target.booted").read_text(), "format=1\nplatform=apple-silicon\n")
+        self.assertEqual((new / "etc/pacman.d/gnupg/pubring.gpg").read_text(), "ROOM-GPG")
+        self.assertEqual((new / "var/lib/omarchy/mac-first-boot/keyring").read_text(), "master=ABC\n")
+        self.assertTrue((new / "var/lib/omarchy/vendor-firmware.stamp").exists())
+
 
 class Arm(unittest.TestCase):
     def setUp(self):
