@@ -31,6 +31,27 @@ is the omarchy-pkgs#3025 (edgeB2) recipe, unchanged: omacom/mesa
 both from the SmartRoom repo by name. Drop it when the edge channel
 publishes that Mesa or a newer one.
 
+### What an edge room runs that only we maintain
+
+Each row is a full build of ours that the edge image installs from the signed
+SmartRoom repo instead of the channel's package. The recipe is in this repo,
+so every one can be rebuilt; the commit each builds is `_commit` in its
+PKGBUILD.
+
+| Package | Source we build | Why not the channel's | Drop when |
+| --- | --- | --- | --- |
+| `linux-aurora` 7.3 | ludagoo/linux `smartroom/edge-kernel-3` `d77dde4a` (`smartroom/pkgbuilds/linux-aurora`) | The edge channel is still 7.2.11; the t6021 encoder stack, the J475c SMC sensor tree and the apple-ave usage counter are not upstream | Omarchy's edge channel publishes 7.3 (edgeB2) with the encoder stack, and our sensor and counter patches are upstream or dropped |
+| `aura` | ludagoo/aura `13fb8688` (`smartroom/pkgbuilds/aura`) | The channel ships m1n1-aurora, not aura, and not the t6021 encoder firmware hand-off | Omarchy publishes aura as the Mac boot loader with the t6021 hand-off |
+| `mesa-aurora`, `vulkan-aurora` | omacom/mesa `carry/edgeB-7.3` `23791c134af` (`smartroom/pkgbuilds/mesa-aurora`, the omarchy-pkgs#3025 recipe unchanged) | The published edge Mesa opens only `asahi`; the 7.3 kernel's GPU is `aurora`, so Hyprland cannot start | The edge channel publishes that Mesa or a newer one |
+| `chromium-smartroom` 158 | Arch Linux ARM's chromium PKGBUILD plus `sr-0001`..`sr-0013` (`smartroom/pkgbuilds/chromium-smartroom`; `BUILT` names the package the image pins) | Omarchy's Chromium has no direct V4L2 decode and encode for AVD and AVE | Omarchy's Chromium carries V4L2 decode and encode for AVD/AVE (the `sr-0001`..`sr-0007` changes are prepared for Chromium main) |
+
+`chromium-smartroom` is a long compile (hours on a Studio), so the installer's
+`smartroom/build-packages` copies the built file (`room/prebuilt.sha256`)
+instead of building it. `smartroom/test/chromium-smartroom-recipe-test.sh`
+fails when the recipe here is not the one that built that file
+(`.BUILDINFO`'s `pkgbuild_sha256sum`). `smartroom/chromium-148-v4l2/` records
+the earlier 148 attempt, which never shipped.
+
 `smartroom/aura-try/` is the first rollback prototype from the design in
 `~/smartroom-rollback/DESIGN.md`. It arms a marker, checks health on a fake
 clock, marks good by write-beside, and rolls back by leaving the configured

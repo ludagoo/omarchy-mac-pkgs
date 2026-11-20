@@ -1,0 +1,24 @@
+# Chromium's GPU sandbox brokers the ChromeOS V4L2 names and refuses
+# /dev/videoN, so a camera is not authorized. Point those names at the
+# Apple codec nodes. Other SoCs need their own matches; these rules
+# only name Aurora's drivers.
+#
+# Match add and change. A rule that matches only add creates the
+# symlink, and the next change event drops it. pacman reloads udev
+# with a plain trigger after the install script, which is a change
+# event. Checked on the Studio: add created /dev/video-dec0, and the
+# following change removed it until these rules matched both.
+#
+# AVD (stateless request API): one decoder. sysfs name "avd", media
+# model "avd". Capture is NV12, and P010 after a 10-bit stream is set.
+# AVE (stateful mem2mem): sysfs name "apple-ave", card "Apple AVE
+# video encoder", NV12 in, stateful H.264 and HEVC out. The M2 has two
+# nodes, 40d100000.video-codec and 507100000.video-codec. Pin them by
+# platform address. A first-free index is wrong on a change event,
+# because the old symlink still exists when a PROGRAM helper runs, so
+# both nodes can pick the same slot. v4l2loopback cameras do not match.
+
+ACTION=="add|change", SUBSYSTEM=="video4linux", ATTR{name}=="avd", SYMLINK+="video-dec0", TAG+="uaccess"
+ACTION=="add|change", SUBSYSTEM=="media", ATTR{model}=="avd", SYMLINK+="media-dec0", TAG+="uaccess"
+ACTION=="add|change", SUBSYSTEM=="video4linux", ATTR{name}=="apple-ave", KERNELS=="40d100000.video-codec", SYMLINK+="video-enc0", TAG+="uaccess"
+ACTION=="add|change", SUBSYSTEM=="video4linux", ATTR{name}=="apple-ave", KERNELS=="507100000.video-codec", SYMLINK+="video-enc1", TAG+="uaccess"

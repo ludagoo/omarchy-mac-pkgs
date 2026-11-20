@@ -1,0 +1,143 @@
+From 8c7938c9d11af21cf9655b62b52341214e067aa8 Mon Sep 17 00:00:00 2001
+From: Lucas Goossen <lucas.goossen@hey.com>
+Date: Wed, 18 Nov 2026 19:00:02 -0300
+Subject: [PATCH 12/12] room: Feed the desktop Linux V4L2 encoder CPU NV12
+ frames
+
+Desktop GBM drivers (Mesa on the Studio) refuse NV12, so the encoder's
+image processor cannot allocate its output as mappable shared images.
+On Linux the LibYUV image processor now writes owned-memory frames,
+which are queued as USERPTR, and the WebCodecs adapter sends CPU
+frames. ChromeOS keeps the platform layout and DMA-BUF.
+
+158 added a bounds check: a USERPTR frame must be shared memory whose
+region covers every device plane. The image processor cannot write a
+shared-memory frame (VideoFrame::writable_data() CHECKs against
+STORAGE_SHMEM), so its owned frames are measured by their own
+allocation, VideoFrame::AllocationSize(), with the same check. Frames
+from the client still have to be shared memory.
+
+Room package only (148 patch 015, reworked for 158's USERPTR check).
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ .../gpu/v4l2/v4l2_video_encode_accelerator.cc | 51 +++++++++++++++----
+ .../video/video_encode_accelerator_adapter.cc |  8 ++-
+ 2 files changed, 48 insertions(+), 11 deletions(-)
+
+diff --git a/media/gpu/v4l2/v4l2_video_encode_accelerator.cc b/media/gpu/v4l2/v4l2_video_encode_accelerator.cc
+index 29cc66f..fe0bdbc 100644
+--- a/media/gpu/v4l2/v4l2_video_encode_accelerator.cc
++++ b/media/gpu/v4l2/v4l2_video_encode_accelerator.cc
+@@ -34,6 +34,7 @@
+ #include "base/task/task_traits.h"
+ #include "base/task/thread_pool.h"
+ #include "base/trace_event/trace_event.h"
++#include "build/build_config.h"
+ #include "gpu/ipc/service/gpu_channel_shared_image_interface.h"
+ #include "gpu/ipc/service/shared_image_stub.h"
+ #include "media/base/bitstream_buffer.h"
+@@ -511,9 +512,29 @@ bool V4L2VideoEncodeAccelerator::CreateImageProcessor(
+     return false;
+   }
+ 
+-  auto platform_layout = GetPlatformVideoFrameLayout(
+-      output_format, output_size,
+-      gfx::BufferUsage::VEA_READ_CAMERA_AND_CPU_READ_WRITE);
++  std::optional<VideoFrameLayout> platform_layout;
++  VideoFrame::StorageType output_storage_type =
++      VideoFrame::STORAGE_MAPPABLE_SHARED_IMAGE;
++#if BUILDFLAG(IS_LINUX)
++  if (!native_input_mode_) {
++    // Desktop GBM drivers may not allocate NV12. LibYUV converts into a CPU
++    // frame, which is queued to the encoder as USERPTR.
++    auto cpu_frame = VideoFrame::CreateFrame(
++        output_format, output_size, output_visible_rect,
++        output_visible_rect.size(), base::TimeDelta());
++    if (!cpu_frame) {
++      LOG(ERROR) << "Failed to allocate a CPU image processor frame";
++      return false;
++    }
++    platform_layout = cpu_frame->layout();
++    output_storage_type = VideoFrame::STORAGE_OWNED_MEMORY;
++  }
++#endif  // BUILDFLAG(IS_LINUX)
++  if (!platform_layout) {
++    platform_layout = GetPlatformVideoFrameLayout(
++        output_format, output_size,
++        gfx::BufferUsage::VEA_READ_CAMERA_AND_CPU_READ_WRITE);
++  }
+   if (!platform_layout) {
+     LOG(ERROR) << "Failed to get Platform VideoFrameLayout";
+     return false;
+@@ -524,9 +545,8 @@ bool V4L2VideoEncodeAccelerator::CreateImageProcessor(
+                << *platform_layout;
+     return false;
+   }
+-  auto output_config =
+-      VideoFrameLayoutToPortConfig(*output_layout, output_visible_rect,
+-                                   VideoFrame::STORAGE_MAPPABLE_SHARED_IMAGE);
++  auto output_config = VideoFrameLayoutToPortConfig(
++      *output_layout, output_visible_rect, output_storage_type);
+   if (!output_config) {
+     LOG(ERROR) << "Failed to create ImageProcessor output config";
+     return false;
+@@ -598,6 +618,12 @@ bool V4L2VideoEncodeAccelerator::AllocateImageProcessorOutputBuffers(
+                 sii_.get());
+         break;
+       }
++      case VideoFrame::STORAGE_OWNED_MEMORY:
++        image_processor_output_buffers_[i] = VideoFrame::CreateFrame(
++            output_config.fourcc.ToVideoPixelFormat(), output_config.size,
++            output_config.visible_rect, output_config.visible_rect.size(),
++            base::TimeDelta());
++        break;
+       default:
+         LOG(ERROR) << "Unsupported output storage type of image processor: "
+                    << output_config.storage_type;
+@@ -1659,13 +1685,20 @@ bool V4L2VideoEncodeAccelerator::EnqueueInputRecord(
+ 
+   switch (input_buf.Memory()) {
+     case V4L2_MEMORY_USERPTR: {
+-      if (frame->storage_type() != VideoFrame::STORAGE_SHMEM) {
++      size_t shm_size = 0;
++      if (frame->storage_type() == VideoFrame::STORAGE_SHMEM) {
++        shm_size = frame->shm_region() ? frame->shm_region()->GetSize() : 0u;
++      } else if (image_processor_ &&
++                 frame->storage_type() == VideoFrame::STORAGE_OWNED_MEMORY) {
++        // An output of |image_processor_|, allocated by
++        // AllocateImageProcessorOutputBuffers() with VideoFrame::CreateFrame().
++        shm_size =
++            VideoFrame::AllocationSize(frame->format(), frame->coded_size());
++      } else {
+         SetErrorState({EncoderStatus::Codes::kInvalidInputFrame,
+                        "VideoFrame doesn't have shared memory"});
+         return false;
+       }
+-      const size_t shm_size =
+-          frame->shm_region() ? frame->shm_region()->GetSize() : 0u;
+       // The frame data is readable only and the driver doesn't actually write
+       // the buffer. But USRPTR buffer needs void*. So const_cast<> is required.
+       std::vector<void*> user_ptrs(num_planes);
+diff --git a/media/video/video_encode_accelerator_adapter.cc b/media/video/video_encode_accelerator_adapter.cc
+index b829845..adf51ba 100644
+--- a/media/video/video_encode_accelerator_adapter.cc
++++ b/media/video/video_encode_accelerator_adapter.cc
+@@ -607,8 +607,12 @@ void VideoEncodeAcceleratorAdapter::InitializeOnAcceleratorThread(
+ #endif  // BUILDFLAG(USE_PROPRIETARY_CODECS)
+ 
+   auto storage_type = VideoEncodeAccelerator::Config::StorageType::kShmem;
+-#if BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_CHROMEOS)
+-  // Linux/ChromeOS require a special configuration to use dmabuf storage.
++#if BUILDFLAG(IS_LINUX)
++  // Desktop GBM drivers may not allocate NV12, so the V4L2 encoder takes
++  // CPU NV12 as USERPTR.
++  input_buffer_preference_ = InputBufferKind::CpuMemBuf;
++#elif BUILDFLAG(IS_CHROMEOS)
++  // ChromeOS requires a special configuration to use dmabuf storage.
+   // We need to keep sending frames with the same storage type.
+   // Other platforms will happily mix GpuMemoryBuffer storage with shared-mem
+   // storage, so we don't care about mismatches on other platforms.
+-- 
+2.56.0
+

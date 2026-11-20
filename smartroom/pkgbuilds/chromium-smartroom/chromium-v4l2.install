@@ -1,0 +1,16 @@
+post_install() {
+  udevadm control --reload-rules || true
+  # add creates the links for nodes that are already enumerated.
+  # The rules also match change, so the pacman udev hook that follows
+  # this script (a plain trigger) cannot drop them.
+  udevadm trigger --action=add --subsystem-match=video4linux --subsystem-match=media || true
+}
+
+post_upgrade() {
+  post_install
+}
+
+post_remove() {
+  udevadm control --reload-rules || true
+  udevadm trigger --action=add --subsystem-match=video4linux --subsystem-match=media || true
+}

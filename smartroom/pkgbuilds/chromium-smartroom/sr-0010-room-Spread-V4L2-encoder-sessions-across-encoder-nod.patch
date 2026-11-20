@@ -1,0 +1,167 @@
+From 6553f5b9bceea110c7188c3b56888d9790772908 Mon Sep 17 00:00:00 2001
+From: Lucas Goossen <lucas.goossen@hey.com>
+Date: Wed, 18 Nov 2026 18:56:35 -0300
+Subject: [PATCH 10/12] room: Spread V4L2 encoder sessions across encoder nodes
+
+apple-ave allows two sessions per core. GetDevicePathFor() returned
+the first encoder node for every encoder, so a third RTCPeerConnection
+STREAMON failed with EBUSY and WebRTC fell back to OpenH264 while the
+second node was idle. Open() now claims a node with fewer than two
+sessions. Decoders and enumeration opens do not take a claim.
+
+Room package only (148 patch 021). Two sessions per node is an
+apple-ave fact, not a generic rule; not for upstream.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ media/gpu/v4l2/v4l2_device.cc | 68 ++++++++++++++++++++++++++++++++++-
+ media/gpu/v4l2/v4l2_device.h  |  8 +++++
+ 2 files changed, 75 insertions(+), 1 deletion(-)
+
+diff --git a/media/gpu/v4l2/v4l2_device.cc b/media/gpu/v4l2/v4l2_device.cc
+index 7ef2332..912c8b2 100644
+--- a/media/gpu/v4l2/v4l2_device.cc
++++ b/media/gpu/v4l2/v4l2_device.cc
+@@ -18,15 +18,18 @@
+ 
+ #include <algorithm>
+ #include <array>
++#include <map>
+ #include <set>
+ 
+ #include "base/compiler_specific.h"
+ #include "base/functional/bind.h"
+ #include "base/logging.h"
++#include "base/no_destructor.h"
+ #include "base/not_fatal_until.h"
+ #include "base/posix/eintr_wrapper.h"
+ #include "base/strings/string_number_conversions.h"
+ #include "base/strings/stringprintf.h"
++#include "base/synchronization/lock.h"
+ #include "build/build_config.h"
+ #include "media/base/color_plane_layout.h"
+ #include "media/base/media_switches.h"
+@@ -62,6 +65,21 @@ uint32_t V4L2PixFmtToDrmFormat(uint32_t format) {
+   }
+ }
+ 
++// apple-ave 6070 allows two sessions on each encoder node. A third
++// STREAMON on that node returns EBUSY while the other core is idle.
++// Open() claims a slot so encoders spread across the encoder nodes.
++constexpr int kAveSessionsPerNode = 2;
++
++base::Lock& EncoderSessionLock() {
++  static base::NoDestructor<base::Lock> lock;
++  return *lock;
++}
++
++std::map<std::string, int>& EncoderSessionCount() {
++  static base::NoDestructor<std::map<std::string, int>> counts;
++  return *counts;
++}
++
+ }  // namespace
+ 
+ // This class is used to expose V4L2Queue's constructor to this module. This is
+@@ -123,7 +141,40 @@ void V4L2Device::OnQueueDestroyed(v4l2_buf_type buf_type) {
+ 
+ bool V4L2Device::Open(Type type, uint32_t v4l2_pixfmt) {
+   DVLOGF(3);
+-  std::string path = GetDevicePathFor(type, v4l2_pixfmt);
++  // Enumeration opens and closes nodes. Do that before taking the
++  // session lock: CloseDevice() releases a claim and must not run
++  // while this function holds EncoderSessionLock().
++  const Devices& devices = GetDevicesForType(type);
++
++  std::string path;
++  if (type == Type::kEncoder) {
++    base::AutoLock auto_lock(EncoderSessionLock());
++    std::string fallback;
++    auto& counts = EncoderSessionCount();
++    for (const auto& device : devices) {
++      if (!std::ranges::contains(device.second, v4l2_pixfmt)) {
++        continue;
++      }
++      if (fallback.empty()) {
++        fallback = device.first;
++      }
++      if (counts[device.first] < kAveSessionsPerNode) {
++        path = device.first;
++        break;
++      }
++    }
++    if (path.empty()) {
++      path = fallback;
++    }
++    if (!path.empty()) {
++      counts[path]++;
++      encoder_path_ = path;
++      VLOGF(1) << "AVE encoder " << path << " claimed, held "
++               << counts[path];
++    }
++  } else {
++    path = GetDevicePathFor(type, v4l2_pixfmt);
++  }
+ 
+   if (path.empty()) {
+     VLOGF(1) << "No devices supporting " << FourccToString(v4l2_pixfmt)
+@@ -133,6 +184,7 @@ bool V4L2Device::Open(Type type, uint32_t v4l2_pixfmt) {
+ 
+   if (!OpenDevicePath(path)) {
+     VLOGF(1) << "Failed opening " << path;
++    ReleaseEncoderSession();
+     return false;
+   }
+ 
+@@ -855,8 +907,22 @@ bool V4L2Device::OpenDevicePath(const std::string& path) {
+   return device_fd_.is_valid();
+ }
+ 
++void V4L2Device::ReleaseEncoderSession() {
++  base::AutoLock auto_lock(EncoderSessionLock());
++  if (encoder_path_.empty()) {
++    return;
++  }
++  auto& counts = EncoderSessionCount();
++  auto it = counts.find(encoder_path_);
++  if (it != counts.end() && it->second > 0) {
++    --it->second;
++  }
++  encoder_path_.clear();
++}
++
+ void V4L2Device::CloseDevice() {
+   DVLOGF(3);
++  ReleaseEncoderSession();
+   device_fd_.reset();
+ }
+ 
+diff --git a/media/gpu/v4l2/v4l2_device.h b/media/gpu/v4l2/v4l2_device.h
+index 08039c4..2448c0b 100644
+--- a/media/gpu/v4l2/v4l2_device.h
++++ b/media/gpu/v4l2/v4l2_device.h
+@@ -238,6 +238,9 @@ class MEDIA_GPU_EXPORT V4L2Device
+   // Close the currently open device.
+   void CloseDevice();
+ 
++  // Drop the encoder-node claim taken by Open(), if this instance has one.
++  void ReleaseEncoderSession();
++
+   // Enumerate all V4L2 devices on the system for |type| and store the results
+   // under devices_by_type_[type].
+   void EnumerateDevicesForType(V4L2Device::Type type);
+@@ -272,6 +275,11 @@ class MEDIA_GPU_EXPORT V4L2Device
+   // The actual device fd.
+   base::ScopedFD device_fd_;
+ 
++  // Encoder node claimed by Open(). Empty for decoders and for the
++  // temporary opens inside EnumerateDevicesForType(). apple-ave allows
++  // two sessions per node; a third STREAMON on the same node is EBUSY.
++  std::string encoder_path_;
++
+   // eventfd fd to signal device poll thread when its poll() should be
+   // interrupted.
+   base::ScopedFD device_poll_interrupt_fd_;
+-- 
+2.56.0
+

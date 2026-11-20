@@ -1,0 +1,141 @@
+From 4b1a561e0db539f79c006a22116cb000bc89deb3 Mon Sep 17 00:00:00 2001
+From: Lucas Goossen <lucas.goossen@hey.com>
+Date: Wed, 18 Nov 2026 18:57:28 -0300
+Subject: [PATCH 11/12] room: Encode HEVC with the V4L2 stateful encoder on
+ Linux
+
+is_linux joins platform_has_optional_hevc_encode_support, so the
+renderer asks the GPU process for an HEVC encoder profile. The V4L2
+encoder accepts V4L2_PIX_FMT_HEVC as its output format, and
+InitControlsHEVC() turns B-frames off and sets Main or Main 10.
+158 already maps the stateful HEVC fourcc in v4l2_utils.cc.
+
+Room package only (the non-hybrid parts of 148 patch 016; its
+fourcc.h, fourcc.cc and image_processor_factory.cc hunks only mattered
+with use_vaapi and use_v4l2_codec both on). The encoder controls could
+be an upstream change once the encoder is built outside ChromeOS.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ .../gpu/v4l2/v4l2_video_encode_accelerator.cc | 46 ++++++++++++++++++-
+ .../gpu/v4l2/v4l2_video_encode_accelerator.h  |  5 ++
+ media/media_options.gni                       |  2 +-
+ 3 files changed, 51 insertions(+), 2 deletions(-)
+
+diff --git a/media/gpu/v4l2/v4l2_video_encode_accelerator.cc b/media/gpu/v4l2/v4l2_video_encode_accelerator.cc
+index 9718549..29cc66f 100644
+--- a/media/gpu/v4l2/v4l2_video_encode_accelerator.cc
++++ b/media/gpu/v4l2/v4l2_video_encode_accelerator.cc
+@@ -52,6 +52,7 @@
+ #include "media/gpu/gpu_video_encode_accelerator_helpers.h"
+ #include "media/gpu/macros.h"
+ #include "media/gpu/v4l2/v4l2_utils.h"
++#include "media/media_buildflags.h"
+ #include "media/parsers/h264_level_limits.h"
+ #include "media/parsers/h264_parser.h"
+ #include "third_party/perfetto/include/perfetto/tracing/track.h"
+@@ -2128,7 +2129,11 @@ bool V4L2VideoEncodeAccelerator::InitControls(const Config& config) {
+ 
+   // Don't expect other output formats.
+   CHECK(output_format_fourcc_ == V4L2_PIX_FMT_H264 ||
+-        output_format_fourcc_ == V4L2_PIX_FMT_VP8);
++        output_format_fourcc_ == V4L2_PIX_FMT_VP8
++#if BUILDFLAG(ENABLE_HEVC_PARSER_AND_HW_DECODER)
++        || output_format_fourcc_ == V4L2_PIX_FMT_HEVC
++#endif
++  );
+ 
+   // Enable frame-level bitrate control. This is the only mandatory control.
+   if (!device_->SetExtCtrls(
+@@ -2148,6 +2153,13 @@ bool V4L2VideoEncodeAccelerator::InitControls(const Config& config) {
+     case V4L2_PIX_FMT_VP8:
+       InitControlsVP8(config);
+       break;
++#if BUILDFLAG(ENABLE_HEVC_PARSER_AND_HW_DECODER)
++    case V4L2_PIX_FMT_HEVC:
++      if (!InitControlsHEVC(config)) {
++        return false;
++      }
++      break;
++#endif
+     default:
+       NOTREACHED() << "Unsupported codec "
+                    << FourccToString(output_format_fourcc_);
+@@ -2164,6 +2176,38 @@ bool V4L2VideoEncodeAccelerator::InitControls(const Config& config) {
+   return true;
+ }
+ 
++#if BUILDFLAG(ENABLE_HEVC_PARSER_AND_HW_DECODER)
++bool V4L2VideoEncodeAccelerator::InitControlsHEVC(const Config& config) {
++  // No B-frames, matching the H.264 path and the apple-ave low-delay setup.
++  device_->SetExtCtrls(V4L2_CTRL_CLASS_MPEG,
++                       {V4L2ExtCtrl(V4L2_CID_MPEG_VIDEO_B_FRAMES, 0)});
++
++  int32_t profile_value = -1;
++  switch (config.output_profile) {
++    case HEVCPROFILE_MAIN:
++      profile_value = V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN;
++      break;
++    case HEVCPROFILE_MAIN10:
++      profile_value = V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN_10;
++      break;
++    default:
++      SetErrorState({EncoderStatus::Codes::kEncoderUnsupportedProfile,
++                     base::StrCat({"Unexpected hevc profile: ",
++                                   GetProfileName(config.output_profile)})});
++      return false;
++  }
++  if (!device_->SetExtCtrls(
++          V4L2_CTRL_CLASS_MPEG,
++          {V4L2ExtCtrl(V4L2_CID_MPEG_VIDEO_HEVC_PROFILE, profile_value)})) {
++    SetErrorState({EncoderStatus::Codes::kEncoderUnsupportedProfile,
++                   base::StrCat({"Failed setting hevc profile: ",
++                                 GetProfileName(config.output_profile)})});
++    return false;
++  }
++  return true;
++}
++#endif
++
+ bool V4L2VideoEncodeAccelerator::InitControlsH264(const Config& config) {
+ #ifndef V4L2_CID_MPEG_VIDEO_PREPEND_SPSPPS_TO_IDR
+ #define V4L2_CID_MPEG_VIDEO_PREPEND_SPSPPS_TO_IDR (V4L2_CID_MPEG_BASE + 644)
+diff --git a/media/gpu/v4l2/v4l2_video_encode_accelerator.h b/media/gpu/v4l2/v4l2_video_encode_accelerator.h
+index 1cd51be..483e550 100644
+--- a/media/gpu/v4l2/v4l2_video_encode_accelerator.h
++++ b/media/gpu/v4l2/v4l2_video_encode_accelerator.h
+@@ -27,6 +27,7 @@
+ #include "media/gpu/chromeos/image_processor.h"
+ #include "media/gpu/media_gpu_export.h"
+ #include "media/gpu/v4l2/v4l2_device.h"
++#include "media/media_buildflags.h"
+ #include "media/video/video_encode_accelerator.h"
+ #include "ui/gfx/geometry/size.h"
+ 
+@@ -251,6 +252,10 @@ class MEDIA_GPU_EXPORT V4L2VideoEncodeAccelerator
+   // Initialize device controls with |config| or default values.
+   bool InitControlsH264(const Config& config);
+ 
++#if BUILDFLAG(ENABLE_HEVC_PARSER_AND_HW_DECODER)
++  bool InitControlsHEVC(const Config& config);
++#endif
++
+   // Initialize device controls with |config| or default values.
+   void InitControlsVP8(const Config& config);
+ 
+diff --git a/media/media_options.gni b/media/media_options.gni
+index dd17545..91f9233 100644
+--- a/media/media_options.gni
++++ b/media/media_options.gni
+@@ -175,7 +175,7 @@ declare_args() {
+       enable_platform_hevc &&
+       (is_win || is_chromeos || is_linux || is_apple || is_android)
+   platform_has_optional_hevc_encode_support =
+-      enable_platform_hevc && (is_win || is_apple || is_android)
++      enable_platform_hevc && (is_win || is_apple || is_android || is_linux)
+ }
+ 
+ assert(!enable_hls_demuxer || enable_mse_mpeg2ts_stream_parser,
+-- 
+2.56.0
+

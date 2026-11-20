@@ -1,0 +1,15 @@
+Include signal.h before the SYS_SECCOMP fallback.
+glibc 2.43 adds SYS_SECCOMP to the SIGSYS si_code enum. Chromium's
+macro expanded that enumerator to "1 = 1". Including signal.h first
+lets glibc define the name, and the #ifndef fallback stays for older
+glibc.
+--- a/sandbox/linux/system_headers/linux_seccomp.h
++++ b/sandbox/linux/system_headers/linux_seccomp.h
+@@ -6,6 +6,7 @@
+ #define SANDBOX_LINUX_SYSTEM_HEADERS_LINUX_SECCOMP_H_
+ 
+ #include <stdint.h>
++#include <signal.h>
+ #include <sys/ioctl.h>
+ 
+ #include "build/build_config.h"
