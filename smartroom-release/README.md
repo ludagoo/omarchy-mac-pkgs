@@ -127,6 +127,24 @@ Controller reboots the room itself after `restore`.
 - Releases are full streams. Incremental streams (`parent`) are in the manifest
   but not used yet.
 - The ESP holds at most three boot sets (configured, previous, trial), about 230 MB.
+- A bad boot image plus a bad kernel image in the same trial is untested: the
+  unconsumed Limine one-shot could send the fallback boot into the trial entry without
+  the trial watchdog. Release builds check both files, so this needs two faults at once.
+- On a Studio whose startup volume is macOS (the home test Studio), a trial that dies
+  before Linux starts resets into macOS, not into Linux. The room's own release is
+  untouched; blessing SmartRoom Firmware once more returns it, and the tool then records
+  the failure. A room whose startup volume is SmartRoom Firmware has not been tried on
+  hardware, because the safety rules for the test Studio keep macOS as the default.
+
+## Hardware results (home Studio, test settings: 60 s quiet, 240 s limit)
+
+- Healthy update: trial boots with `aurora,trial` set, the one-shot is consumed and the
+  deletion persists, the release becomes configured, the previous set is kept.
+- `rollback`: a trial of the previous release, becomes configured again.
+- Room not healthy: `health-timeout`, clean reboot back onto the configured release.
+- Kernel and initrd that cannot start, and a garbage kernel image: reset, then
+  `lost-before-userspace`, files and trial entry cleaned up.
+- Garbage boot image: aura falls back, then `trial-did-not-start`, cleaned up.
 
 ## Tests
 

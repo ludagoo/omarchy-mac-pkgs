@@ -589,6 +589,20 @@ class Trial(unittest.TestCase):
         self.assertFalse((self.w.esp / sr.TRIAL_UKI).exists())
         self.assertEqual(self.w.host.reboots, 0)
 
+    def test_the_root_of_a_failed_trial_is_removed_when_the_next_update_starts(self):
+        self.w.trial_boot()
+        self.w.back_on_configured()
+        self.w.host.oneshot = None
+        self.health()
+        failed = self.w.prefix / "top" / f"@r-{self.NAME}"
+        self.assertTrue(failed.exists())              # kept until something needs the room
+        (self.w.prefix / "top/@home").mkdir(exist_ok=True)
+        self.w.run("update", str(self.w.release("2026.11.30-1")), "--unsigned")
+        self.assertFalse(failed.exists())
+        self.assertTrue((self.w.prefix / "top/@r-2026.11.30-1").exists())
+        self.assertTrue((self.w.prefix / "top/@home").exists())
+        self.assertTrue((self.w.prefix / "top/@").exists())
+
     def test_a_trial_lost_after_userspace_says_so(self):
         self.w.trial_boot()
         st = self.w.state()

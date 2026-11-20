@@ -956,6 +956,7 @@ def stage_release(host: Host, state: dict, directory: Path, unsigned: bool, kind
     roles = {item["role"]: item for item in manifest["boot"]}
     subvol = subvol_name(release)
     cmdline = None
+    prune(host, state)                 # roots left by failed trials are dead weight; free their space first
     with host.top() as top:
         if subvol_exists(top, subvol):
             delete_subvolume(host, top, subvol)
