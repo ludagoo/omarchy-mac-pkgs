@@ -1,6 +1,7 @@
-# ludagoo/linux smartroom/edge-kernel-3. The only place the kernel commit is
-# named. A different commit also needs a new _aurorarel, or pacman sees no update.
-_commit=d77dde4ace48c8ec617d6431efa76316678f9162
+# ludagoo/linux smartroom/edge-kernel-3 (fix/ws8 commit below). The only place
+# the kernel commit is named. A different commit also needs a new _aurorarel, or
+# pacman sees no update.
+_commit=7149d1ac27bf522f1996e9bac69d9daaac04b5ae
 
 # AArch64 Apple Silicon (Aurora Silicon)
 # Based on the asahi-alarm linux-asahi package by Jos Dehaes and Matthias Kurz.
@@ -16,7 +17,9 @@ _commit=d77dde4ace48c8ec617d6431efa76316678f9162
 # the Aurora encoder stack of ave/t6021-j475c (the T6021 driver series and the
 # J475c enable, which leaves the encoders' auxiliary DMA blocks disabled) on
 # aurora-silicon integration/aurora, plus the J475c SMC sensor tree
-# (smc/j475c-sensors) and the apple-ave sysfs usage counter (ave/usage-counter).
+# (smc/j475c-sensors), the apple-ave sysfs usage counter (ave/usage-counter),
+# and the J475c dcpext2/dcpext3 three-display device-tree wiring (m2_dcpext2 and
+# m2_dcpext3 routed across typec0-3 and kept disabled for aura firmware gating).
 # That base already has the AQC113 own-address filter.
 # This package does not build the omarchy-pkgs#3025 pin (omacom/linux-aurora
 # carry/edgeB-7.3): cherry-picking the encoder commits onto it conflicted in
@@ -28,7 +31,7 @@ _commit=d77dde4ace48c8ec617d6431efa76316678f9162
 # 7.3.0-${_aurorarel}-${pkgrel}-ARCH. studio-build has 15 GiB of RAM: the
 # default job count is 3.
 _auroraver=7.3.0
-_aurorarel=0sredge3
+_aurorarel=0sredge4
 pkgrel=1
 
 # The GPU driver is named "aurora". smartroom/pkgbuilds/mesa-aurora is the

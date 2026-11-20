@@ -13,11 +13,15 @@ main plus the hand-off of both t6021 encoders' firmware) and `linux-aurora`
 7.3 from `smartroom/pkgbuilds/linux-aurora` (ludagoo/linux
 `smartroom/edge-kernel-3`: the Aurora encoder stack of `ave/t6021-j475c` on
 aurora-silicon `integration/aurora`, J475c auxiliary DMA blocks left
-disabled, plus the J475c SMC sensor tree from `smc/j475c-sensors` and the
-apple-ave sysfs usage counter from `ave/usage-counter`, cherry-picked onto
-it). Each commit is named once, as `_commit`
-at the top of its PKGBUILD; the aura qualification record gets it from there.
-Both are signed into the SmartRoom repo in place of the channel packages.
+disabled, plus the J475c SMC sensor tree from `smc/j475c-sensors`, the
+apple-ave sysfs usage counter from `ave/usage-counter`, and the J475c
+`dcpext2`/`dcpext3` three-display device-tree wiring (`7.3.0.aurora0sredge4-1`,
+commit `7149d1ac27bf522f1996e9bac69d9daaac04b5ae`)). Each commit is named once,
+as `_commit` at the top of its PKGBUILD; the aura qualification record gets it
+from there. Both are signed into the SmartRoom repo in place of the channel
+packages. See [smartroom/docs/carried-packages.md](smartroom/docs/carried-packages.md)
+for the maintained build, re-sync, upstream PR tracking, and release-pinning
+process for every carried package.
 The kernel is not the omarchy-pkgs#3025 pin `4454eda`: cherry-picking the
 encoder commits onto that tip conflicted in the ave driver, so the package
 builds the ludagoo tree, which has those commits and, in its base, the
@@ -41,10 +45,10 @@ PKGBUILD.
 
 | Package | Source we build | Why not the channel's | Drop when |
 | --- | --- | --- | --- |
-| `linux-aurora` 7.3 | ludagoo/linux `smartroom/edge-kernel-3` `d77dde4a` (`smartroom/pkgbuilds/linux-aurora`) | The edge channel is still 7.2.11; the t6021 encoder stack, the J475c SMC sensor tree and the apple-ave usage counter are not upstream | Omarchy's edge channel publishes 7.3 (edgeB2) with the encoder stack, and our sensor and counter patches are upstream or dropped |
+| `linux-aurora` 7.3 | ludagoo/linux `smartroom/edge-kernel-3` `7149d1ac` (`smartroom/pkgbuilds/linux-aurora`) | The edge channel is still 7.2.11; the t6021 encoder stack, the J475c SMC sensor tree, the apple-ave usage counter, and the J475c `dcpext2`/`dcpext3` three-display wiring are not upstream | Omarchy's edge channel publishes 7.3 (edgeB2) with the encoder stack, and our sensor, counter, and display patches are upstream or dropped |
 | `aura` | ludagoo/aura `13fb8688` (`smartroom/pkgbuilds/aura`) | The channel ships m1n1-aurora, not aura, and not the t6021 encoder firmware hand-off | Omarchy publishes aura as the Mac boot loader with the t6021 hand-off |
 | `mesa-aurora`, `vulkan-aurora` | omacom/mesa `carry/edgeB-7.3` `23791c134af` (`smartroom/pkgbuilds/mesa-aurora`, the omarchy-pkgs#3025 recipe unchanged) | The published edge Mesa opens only `asahi`; the 7.3 kernel's GPU is `aurora`, so Hyprland cannot start | The edge channel publishes that Mesa or a newer one |
-| `chromium-smartroom` 158 | Arch Linux ARM's chromium PKGBUILD plus `sr-0001`..`sr-0013` (`smartroom/pkgbuilds/chromium-smartroom`; `BUILT` names the package the image pins) | Omarchy's Chromium has no direct V4L2 decode and encode for AVD and AVE | Omarchy's Chromium carries V4L2 decode and encode for AVD/AVE (the `sr-0001`..`sr-0007` changes are prepared for Chromium main) |
+| `chromium-smartroom` 158 | Arch Linux ARM's chromium PKGBUILD plus `sr-0001`..`sr-0016` (`smartroom/pkgbuilds/chromium-smartroom`; `BUILT` names the package the image pins) | Omarchy's Chromium has no direct V4L2 decode and encode for AVD and AVE | Omarchy's Chromium carries V4L2 decode and encode for AVD/AVE (the `sr-0001`..`sr-0007` changes are prepared for Chromium main) |
 
 `chromium-smartroom` is a long compile (hours on a Studio), so the installer's
 `smartroom/build-packages` copies the built file (`room/prebuilt.sha256`)
