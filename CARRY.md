@@ -66,7 +66,23 @@ to a new Omarchy release, run `smartroom-omarchy-helpers/sync-from-runtime`.
 Then rebuild with ludagoo/omarchy-mac-installer `smartroom/build-packages`.
 
 GitHub Actions are disabled on this fork (no inherited workflow can publish
-anything); sync by hand with the script.
+anything); sync by hand with the script. `.github/workflows/smartroom-ci.yml`
+(ours) runs every package's `test/all` and `smartroom/test/all` in upstream
+`tests.yml`'s pinned Arch container on pushes to `smartroom/main`,
+`smartroom/edge` and `fix/**`, read-only and without secrets;
+`smartroom-omarchy-helpers` is compared with omacom/omarchy at its `SOURCE`
+commit. It runs once Lucas enables Actions. To enable: turn Actions on, then
+at once disable every inherited workflow except `SmartRoom checks`
+(`gh workflow disable`), because their files on `main` would otherwise run on
+upstream's triggers.
+
+`omarchy-mac-first-boot` also populates the `smartroom` keyring when the
+image ships `/usr/share/pacman/keyrings/smartroom.gpg`: a SmartRoom release
+image (ludagoo/omarchy-mac-installer, PROGRAM decision 4) takes every package
+from one repository signed with the SmartRoom package key, and each Mac's
+first boot makes its keyring from that directory. Stock images ship no such
+file and populate what they did before (`mac-first-boot-test.sh`,
+`keyring-smartroom`).
 
 ## Rules
 
