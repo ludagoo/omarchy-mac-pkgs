@@ -34,7 +34,7 @@ buildarch=8
 
 pkgname=chromium-smartroom
 pkgver=158.0.8127.36
-pkgrel=1
+pkgrel=3
 _launcher_ver=8
 _manual_clone=0
 _system_clang=1
@@ -151,6 +151,9 @@ source=(https://commondatastorage.googleapis.com/chromium-browser-official/chrom
         sr-0011-room-Encode-HEVC-with-the-V4L2-stateful-encoder-on-L.patch
         sr-0012-room-Feed-the-desktop-Linux-V4L2-encoder-CPU-NV12-fr.patch
         sr-0013-room-Derive-HEVC-chroma-offsets-in-the-V4L2-slice-pa.patch
+        sr-0014-room-Copy-V4L2-encoder-input-into-a-device-sized-.patch
+        sr-0015-room-Accept-a-V4L2-encoder-without-the-frame-level.patch
+        sr-0016-room-Copy-V4L2-encoder-input-into-driver-MMAP-buf.patch
         chromium-v4l2.rules)
 noextract=("gn-$_gn_rev-linux-arm64.zip")
 sha256sums=('8a93030a68231ea046479c47d6b26dfae43becef1b5343cf95f8146109291d6d'
@@ -190,6 +193,9 @@ sha256sums=('8a93030a68231ea046479c47d6b26dfae43becef1b5343cf95f8146109291d6d'
             '3e23e9b3f452f6a95217d4ea8ee8083115bfd88e5c67edc1c81aea4174a0a8e1'
             'decd3f7e90880fd2bcda64bc7545885a672fa1cd922cc7b45c2e3c4d7febcea1'
             '374e48755fb0516cd704e8b8035806d17d2056d6e9b02a8b455601f72ec93dfe'
+            'e5f71dd037733b737a04d8bf989fba64eefc5a5bcd520e10ed09db574a184868'
+            '6b996b9285fd95da95f25ecc8ba3e895b515a30cc87a433373aa60b2f75ea28c'
+            '83a6fca286f2e9b30c69d2853d0316ebbbd364d004cde3329b6215b4eb956517'
             '6f804802f4ef24af2e1cf198854cc87560b4fb2085a869b288a4382a6fae865a')
 
 if (( _manual_clone )); then

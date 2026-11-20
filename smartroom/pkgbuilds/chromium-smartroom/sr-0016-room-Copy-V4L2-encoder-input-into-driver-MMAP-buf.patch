@@ -1,0 +1,192 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Lucas Goossen <lucas.goossen@hey.com>
+Date: Fri, 20 Nov 2026 16:20:00 -0300
+Subject: [PATCH] room: Copy V4L2 encoder input into driver MMAP buffers when USERPTR fails
+
+Apple's AVE driver in the 7.3 edge kernel does not take USERPTR on its
+OUTPUT queue: VIDIOC_REQBUFS answers EINVAL, and its MMAP and DMABUF
+work. The encoder asked for USERPTR whenever it got CPU frames (the
+image processor's owned-memory frames, or shared-memory frames from
+WebRTC), failed with "Failed to allocate V4L2 input buffers." and WebRTC
+fell back to OpenH264.
+
+If REQBUFS for USERPTR input buffers fails, allocate MMAP buffers
+instead and copy each frame into the buffer the driver allocated. The
+buffer has the size and layout the driver reads, so no further alignment
+is needed. The row copy of the previous patch is now a helper shared by
+both paths.
+
+Room package only.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ media/gpu/v4l2/v4l2_video_encode_accelerator.cc | 88 ++++++++++++++++++++++++++++++-------
+ media/gpu/v4l2/v4l2_video_encode_accelerator.h | 9 +++++++++
+ 2 files changed, 90 insertions(+), 7 deletions(-)
+
+diff --git a/media/gpu/v4l2/v4l2_video_encode_accelerator.cc b/media/gpu/v4l2/v4l2_video_encode_accelerator.cc
+--- a/media/gpu/v4l2/v4l2_video_encode_accelerator.cc
++++ b/media/gpu/v4l2/v4l2_video_encode_accelerator.cc
+@@ -1659,6 +1659,10 @@
+         input_buf.SetPlaneSize(i, device_input_layout_->planes()[i].size);
+         break;
+ 
++      case V4L2_MEMORY_MMAP:
++        // The length of an MMAP buffer is the driver's sizeimage already.
++        break;
++
+       case V4L2_MEMORY_DMABUF: {
+         const std::vector<gfx::NativePixmapPlane>& planes =
+             gmb_handle.native_pixmap_handle().planes;
+@@ -1765,6 +1769,41 @@
+       }
+       break;
+     }
++    case V4L2_MEMORY_MMAP: {
++      // The driver takes no USERPTR input: copy the frame into the buffer the
++      // driver allocated, which has exactly the size and layout it reads.
++      if (!VideoFrame::StorageTypeAllowsDirectCpuAccess(
++              frame->storage_type())) {
++        SetErrorState({EncoderStatus::Codes::kInvalidInputFrame,
++                       "VideoFrame can not be read by the CPU"});
++        return false;
++      }
++      std::vector<base::span<uint8_t>> destinations;
++      for (size_t i = 0; i < num_planes; ++i) {
++        void* mapping = input_buf.GetPlaneMapping(i);
++        if (!mapping) {
++          SetErrorState({EncoderStatus::Codes::kSystemAPICallError,
++                         "Input buffer is not mapped"});
++          return false;
++        }
++        destinations.push_back(UNSAFE_TODO(base::span<uint8_t>(
++            static_cast<uint8_t*>(mapping), input_buf.GetPlaneSize(i))));
++      }
++      if (!CopyFrameToDeviceLayout(*frame, *device_input_layout_,
++                                   destinations)) {
++        SetErrorState({EncoderStatus::Codes::kInvalidInputFrame,
++                       "Input frame does not fit the device input layout"});
++        return false;
++      }
++      if (!std::move(input_buf).QueueMMap()) {
++        SetErrorState(
++            {EncoderStatus::Codes::kEncoderHardwareDriverError,
++             base::StrCat({"Failed queue a MMAP buffer to input queue, errno=",
++                           base::NumberToString(errno)})});
++        return false;
++      }
++      break;
++    }
+     case V4L2_MEMORY_DMABUF: {
+       if (!std::move(input_buf).QueueDMABuf(
+               gmb_handle.native_pixmap_handle().planes)) {
+@@ -1837,6 +1876,31 @@
+     user_ptrs[i] = copy.data();
+   }
+ 
++  std::vector<base::span<uint8_t>> destinations;
++  for (size_t i = 0; i < num_planes; ++i) {
++    destinations.push_back(
++        input_device_copies_[buffer_id * num_planes + i].as_span());
++  }
++  return CopyFrameToDeviceLayout(frame, device_layout, destinations);
++}
++
++// static
++bool V4L2VideoEncodeAccelerator::CopyFrameToDeviceLayout(
++    const VideoFrame& frame,
++    const VideoFrameLayout& device_layout,
++    base::span<base::span<uint8_t>> destinations) {
++  const VideoPixelFormat format = frame.format();
++  const size_t num_color_planes = VideoFrame::NumPlanes(format);
++  const size_t num_planes = destinations.size();
++  if (num_planes == 0 || num_planes > num_color_planes ||
++      (num_planes != 1 && num_planes != num_color_planes) ||
++      device_layout.planes().size() < num_color_planes ||
++      frame.layout().planes().size() < num_color_planes) {
++    LOG(ERROR) << "Cannot copy frame " << frame.AsHumanReadableString()
++               << " to the device layout " << device_layout;
++    return false;
++  }
++
+   // The part of the picture the driver reads.
+   const int width = std::min(frame.coded_size().width(),
+                              device_layout.coded_size().width());
+@@ -1844,15 +1908,15 @@
+                               device_layout.coded_size().height());
+   for (size_t plane = 0; plane < num_color_planes; ++plane) {
+     // A single-buffer format has all its color planes in V4L2 plane 0.
+-    auto& copy = input_device_copies_[buffer_id * num_planes +
+-                                      (num_planes == 1 ? 0 : plane)];
++    base::span<uint8_t> destination =
++        destinations[num_planes == 1 ? 0 : plane];
+     const ColorPlaneLayout& device_plane = device_layout.planes()[plane];
+     const size_t row_bytes = VideoFrame::RowBytes(plane, format, width);
+     const size_t rows = VideoFrame::Rows(plane, format, height);
+     const int source_stride = frame.stride(plane);
+     if (rows == 0 || row_bytes == 0 || source_stride < 0 ||
+         row_bytes > static_cast<size_t>(source_stride) ||
+-        row_bytes > device_plane.stride) {
++        row_bytes > device_plane.stride || !frame.data(plane)) {
+       LOG(ERROR) << "Cannot copy plane " << plane << " of "
+                  << frame.AsHumanReadableString() << " to " << device_layout;
+       return false;
+@@ -1862,13 +1926,12 @@
+     end *= destination_stride;
+     end += device_plane.offset;
+     end += row_bytes;
+-    if (!end.IsValid() || end.ValueOrDie() > copy.size()) {
++    if (!end.IsValid() || end.ValueOrDie() > destination.size()) {
+       LOG(ERROR) << "Device plane " << plane << " does not fit its buffer: "
+                  << device_layout;
+       return false;
+     }
+     const uint8_t* source = frame.data(plane);
+-    base::span<uint8_t> destination = copy.as_span();
+     for (size_t row = 0; row < rows; ++row) {
+       destination.subspan(device_plane.offset + row * destination_stride,
+                           row_bytes)
+@@ -2543,8 +2606,19 @@
+       break;
+   }
+ 
+-  if (input_queue_->AllocateBuffers(num_buffers, input_memory_type_,
+-                                    /*incoherent=*/false) < kInputBufferCount) {
++  size_t num_allocated = input_queue_->AllocateBuffers(
++      num_buffers, input_memory_type_, /*incoherent=*/false);
++  if (num_allocated < kInputBufferCount &&
++      input_memory_type_ == V4L2_MEMORY_USERPTR) {
++    // Not every driver takes USERPTR on the OUTPUT queue (Apple's AVE in the
++    // 7.3 edge kernel has MMAP and DMABUF only). Fall back to buffers the
++    // driver allocates and copy the frames into them.
++    VLOGF(1) << "Device does not take USERPTR input buffers, using MMAP";
++    input_memory_type_ = V4L2_MEMORY_MMAP;
++    num_allocated = input_queue_->AllocateBuffers(
++        num_buffers, input_memory_type_, /*incoherent=*/false);
++  }
++  if (num_allocated < kInputBufferCount) {
+     SetErrorState({EncoderStatus::Codes::kEncoderHardwareDriverError,
+                    "Failed to allocate V4L2 input buffers."});
+     return false;
+diff --git a/media/gpu/v4l2/v4l2_video_encode_accelerator.h b/media/gpu/v4l2/v4l2_video_encode_accelerator.h
+--- a/media/gpu/v4l2/v4l2_video_encode_accelerator.h
++++ b/media/gpu/v4l2/v4l2_video_encode_accelerator.h
+@@ -187,6 +187,15 @@
+                                 size_t buffer_id,
+                                 size_t num_planes,
+                                 std::vector<void*>& user_ptrs);
++
++  // Copies |frame| into |destinations|, one span per V4L2 plane (a single-plane
++  // format has one span for all its color planes), in the layout the driver
++  // reads (|device_layout|). Returns false if the frame or a destination does
++  // not fit.
++  static bool CopyFrameToDeviceLayout(
++      const VideoFrame& frame,
++      const VideoFrameLayout& device_layout,
++      base::span<base::span<uint8_t>> destinations);
+   bool EnqueueOutputRecord(V4L2WritableBufferRef output_buf);
+ 
+   // Attempt to start/stop device_poll_thread_.
+-- 
+2.56.0
+

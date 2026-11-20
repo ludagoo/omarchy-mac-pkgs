@@ -1,0 +1,50 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Lucas Goossen <lucas.goossen@hey.com>
+Date: Fri, 20 Nov 2026 15:50:00 -0300
+Subject: [PATCH] room: Accept a V4L2 encoder without the frame-level rate control switch
+
+InitControls() sets V4L2_CID_MPEG_VIDEO_FRAME_RC_ENABLE first and fails
+the session when that fails ("Failed enabling bitrate control"). The
+control is mandatory for ChromeOS drivers, but Apple's AVE driver in the
+7.3 edge kernel does not have it (the SmartRoom kernels up to sr22 added
+it only to satisfy this check). On that kernel every encoder session
+fails before the first frame, at any resolution, and WebRTC falls back
+to OpenH264.
+
+Set the control only when the device exposes it, as is done for the
+optional controls around it. The driver runs its rate controller per
+frame in the bitrate mode InitControls() sets next.
+
+Room package only.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ media/gpu/v4l2/v4l2_video_encode_accelerator.cc | 13 +++++++++----
+ 1 file changed, 9 insertions(+), 4 deletions(-)
+
+diff --git a/media/gpu/v4l2/v4l2_video_encode_accelerator.cc b/media/gpu/v4l2/v4l2_video_encode_accelerator.cc
+--- a/media/gpu/v4l2/v4l2_video_encode_accelerator.cc
++++ b/media/gpu/v4l2/v4l2_video_encode_accelerator.cc
+@@ -2279,10 +2279,15 @@
+ #endif
+   );
+ 
+-  // Enable frame-level bitrate control. This is the only mandatory control.
+-  if (!device_->SetExtCtrls(
+-          V4L2_CTRL_CLASS_MPEG,
+-          {V4L2ExtCtrl(V4L2_CID_MPEG_VIDEO_FRAME_RC_ENABLE, 1)})) {
++  // Enable frame-level bitrate control. ChromeOS drivers expose it and it is
++  // mandatory for them. A driver that does not have the control (Apple's AVE
++  // in the 7.3 edge kernel) runs its rate controller on every frame in the
++  // bitrate mode that is set below, so the missing control is not an error.
++  if (!device_->IsCtrlExposed(V4L2_CID_MPEG_VIDEO_FRAME_RC_ENABLE)) {
++    DVLOGF(2) << "Device has no frame-level bitrate control switch";
++  } else if (!device_->SetExtCtrls(
++                 V4L2_CTRL_CLASS_MPEG,
++                 {V4L2ExtCtrl(V4L2_CID_MPEG_VIDEO_FRAME_RC_ENABLE, 1)})) {
+     SetErrorState({EncoderStatus::Codes::kEncoderHardwareDriverError,
+                    "Failed enabling bitrate control"});
+     return false;
+-- 
+2.56.0
+
