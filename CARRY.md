@@ -1,7 +1,8 @@
 # SmartRoom carry on omarchy-mac-pkgs
 
-`smartroom/edge` (this branch) is `smartroom/main` at `9540b55` plus the edge
-boot packages and an offline `aura-try` prototype. `smartroom/main` stays the
+`smartroom/edge` (this branch) is `smartroom/main` at `ef30f9d` (the carry on
+omacom main `95b0dd9`, synced 2026-11-20) plus the edge boot packages and an
+offline `aura-try` prototype. `smartroom/main` stays the
 stable line. Do not merge this branch back into `smartroom/main`.
 
 `omarchy-apple-silicon-boot-check` already accepts `aura` as the bootloader
