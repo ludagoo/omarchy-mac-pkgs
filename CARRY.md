@@ -1,12 +1,13 @@
 # SmartRoom carry on omarchy-mac-pkgs
 
 `user4k.patch` in the omarchy-mac-boot recipe is still the upstream console
-change. Its test hunk is retargeted so it applies after the panic=10 case,
-and that case checks user4k leaves `panic=10` on the default command line.
-The Limine boot test reports an Asahi kernel for the one console-leaf call
-that has no boot-update environment; Aurora's user4k cases stay in the
-console test. `smartroom/pkgbuilds/omarchy-mac-boot/recipe-test.sh` applies
-the patch as the recipe does and runs the patched console test.
+change. Its test hunk is retargeted past upstream's M4 cases at the end of
+the console test, and the panic=10 case checks user4k leaves `panic=10` on
+the default command line. The Limine boot test reports an Asahi kernel for
+the one console-leaf call that has no boot-update environment; Aurora's
+user4k cases stay in the console test.
+`smartroom/pkgbuilds/omarchy-mac-boot/recipe-test.sh` applies the patch as
+the recipe does and runs the patched console test.
 
 `smartroom/main` is what SmartRoom Firmware builds its boot package from:
 omacom's `main` (mirrored here as `main`, fast-forward only) plus the small
@@ -18,8 +19,9 @@ is copied unchanged.
 
 | | |
 | --- | --- |
-| Base commit | `63a6941c698e75213e219205c656c83850c951e8` (omacom/omarchy-mac-pkgs main, "Merge pull request #154 … package-resolution-aurora-names") |
-| Stable channel today | `omarchy-mac-boot 20261104-1` = omarchy-mac-pkgs `7e50e937` + `user4k.patch` (omacom/omarchy-pkgs recipe). Our base differs from it only in `bin/omarchy-apple-silicon-boot-check` and tests. |
+| Base commit | `95b0dd9776c7e24e687b62665d152e885a453777` (omacom/omarchy-mac-pkgs main, "Merge pull request #164 … docs/manual-hardware-truth") |
+| Last sync | 2026-11-20 (from `63a6941`, 23 commits: the M4 display switches in `setup/grub-console.sh`, `update-verify`'s owner-managed boot chains, the Limine sync skip after a snapper cleanup, the integration fixtures). Sync at least once a month and whenever omacom touches a file this carry patches. |
+| Stable channel today | `omarchy-mac-boot 20261104-1` = omarchy-mac-pkgs `7e50e937` + `user4k.patch` (omacom/omarchy-pkgs recipe). Our base is newer than that pin: it also has the changes listed under "Last sync". `user4k.patch` (omacom/omarchy-mac-pkgs#46, still open) is carried onto our base: the same `grub-console.sh` change, its test cases after upstream's M4 cases. |
 
 ## Carried patches
 
@@ -63,7 +65,10 @@ smartroom/sync-upstream.sh --rebase   # rebase smartroom/main locally, print the
 smartroom/sync-upstream.sh --push     # tag sr/prev-<date> and force-push
 ```
 
-After a sync: run `omarchy-mac-boot/test/all` and
+After a sync: check that `smartroom/pkgbuilds/omarchy-mac-boot/user4k.patch`
+still applies (`patch -d omarchy-mac-boot --dry-run -Np2 <…/user4k.patch`)
+and run the console test on the patched copy, update "Base commit" and "Last
+sync" above, run `omarchy-mac-boot/test/all` and
 `OMARCHY_TEST_RUNTIME=<omarchy checkout at the tag in smartroom-omarchy-helpers/SOURCE> smartroom-omarchy-helpers/test/all`;
 when omacom/omarchy-pkgs moves its `omarchy-mac-boot` recipe, diff it against
 `smartroom/pkgbuilds/omarchy-mac-boot/PKGBUILD`; when the stable channel moves
@@ -71,7 +76,23 @@ to a new Omarchy release, run `smartroom-omarchy-helpers/sync-from-runtime`.
 Then rebuild with ludagoo/omarchy-mac-installer `smartroom/build-packages`.
 
 GitHub Actions are disabled on this fork (no inherited workflow can publish
-anything); sync by hand with the script.
+anything); sync by hand with the script. `.github/workflows/smartroom-ci.yml`
+(ours) runs every package's `test/all` and `smartroom/test/all` in upstream
+`tests.yml`'s pinned Arch container on pushes to `smartroom/main`,
+`smartroom/edge` and `fix/**`, read-only and without secrets;
+`smartroom-omarchy-helpers` is compared with omacom/omarchy at its `SOURCE`
+commit. It runs once Lucas enables Actions. To enable: turn Actions on, then
+at once disable every inherited workflow except `SmartRoom checks`
+(`gh workflow disable`), because their files on `main` would otherwise run on
+upstream's triggers.
+
+`omarchy-mac-first-boot` also populates the `smartroom` keyring when the
+image ships `/usr/share/pacman/keyrings/smartroom.gpg`: a SmartRoom release
+image (ludagoo/omarchy-mac-installer, PROGRAM decision 4) takes every package
+from one repository signed with the SmartRoom package key, and each Mac's
+first boot makes its keyring from that directory. Stock images ship no such
+file and populate what they did before (`mac-first-boot-test.sh`,
+`keyring-smartroom`).
 
 ## Rules
 
