@@ -10,8 +10,9 @@ is copied unchanged.
 
 | | |
 | --- | --- |
-| Base commit | `63a6941c698e75213e219205c656c83850c951e8` (omacom/omarchy-mac-pkgs main, "Merge pull request #154 … package-resolution-aurora-names") |
-| Stable channel today | `omarchy-mac-boot 20261104-1` = omarchy-mac-pkgs `7e50e937` + `user4k.patch` (omacom/omarchy-pkgs recipe). Our base differs from it only in `bin/omarchy-apple-silicon-boot-check` and tests. |
+| Base commit | `95b0dd9776c7e24e687b62665d152e885a453777` (omacom/omarchy-mac-pkgs main, "Merge pull request #164 … docs/manual-hardware-truth") |
+| Last sync | 2026-11-20 (from `63a6941`, 23 commits: the M4 display switches in `setup/grub-console.sh`, `update-verify`'s owner-managed boot chains, the Limine sync skip after a snapper cleanup, the integration fixtures). Sync at least once a month and whenever omacom touches a file this carry patches. |
+| Stable channel today | `omarchy-mac-boot 20261104-1` = omarchy-mac-pkgs `7e50e937` + `user4k.patch` (omacom/omarchy-pkgs recipe). Our base is newer than that pin: it also has the changes listed under "Last sync". `user4k.patch` (omacom/omarchy-mac-pkgs#46, still open) is carried onto our base: the same `grub-console.sh` change, its test cases after upstream's M4 cases. |
 
 ## Carried patches
 
@@ -54,7 +55,10 @@ smartroom/sync-upstream.sh --rebase   # rebase smartroom/main locally, print the
 smartroom/sync-upstream.sh --push     # tag sr/prev-<date> and force-push
 ```
 
-After a sync: run `omarchy-mac-boot/test/all` and
+After a sync: check that `smartroom/pkgbuilds/omarchy-mac-boot/user4k.patch`
+still applies (`patch -d omarchy-mac-boot --dry-run -Np2 <…/user4k.patch`)
+and run the console test on the patched copy, update "Base commit" and "Last
+sync" above, run `omarchy-mac-boot/test/all` and
 `OMARCHY_TEST_RUNTIME=<omarchy checkout at the tag in smartroom-omarchy-helpers/SOURCE> smartroom-omarchy-helpers/test/all`;
 when omacom/omarchy-pkgs moves its `omarchy-mac-boot` recipe, diff it against
 `smartroom/pkgbuilds/omarchy-mac-boot/PKGBUILD`; when the stable channel moves
