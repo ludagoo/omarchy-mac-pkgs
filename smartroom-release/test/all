@@ -1,0 +1,14 @@
+#!/bin/bash
+# smartroom-release offline: the whole update, trial, mark-good and rollback
+# path on a directory tree, with a fake btrfs and a fake clock. Needs python3,
+# tar, zstd; the signature test also needs gpg.
+set -euo pipefail
+here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+python3 -m py_compile "$here/../bin/smartroom-release"
+find "$here/.." -name __pycache__ -prune -exec rm -rf {} + 2>/dev/null || true
+for need in tar zstd gpg gpgv; do
+  command -v "$need" >/dev/null || { echo "not ok - $need is needed" >&2; exit 1; }
+done
+cd "$here"
+python3 -B -m unittest -v test_release 2>&1 | tail -n +1
+echo "ok - smartroom-release"

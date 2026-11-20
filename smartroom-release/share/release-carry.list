@@ -1,0 +1,23 @@
+# What makes this room this room. smartroom-release copies each of these from
+# the running root into the new release's root before its first boot, so an
+# update never changes the room's identity, network or Room Controller state.
+# One absolute path per line; * and ? match inside the last name only.
+# Keep this list short and about the room, not about the release.
+/etc/machine-id
+/etc/hostname
+/etc/hosts
+/etc/localtime
+/etc/ssh/ssh_host_*
+/etc/smartroomos/unique-id
+/etc/systemd/system/smartroom-agent.service.d/server-url.conf
+/etc/NetworkManager/system-connections
+/var/lib/NetworkManager
+/var/lib/iwd
+/var/lib/bluetooth
+# The Studio first boot's latch: without it a new root would register again.
+/var/lib/smartroomos
+/opt/smartroom/config
+/opt/smartroom/state
+/opt/smartroom/chrome-profiles
+# Room-specific health settings, if the room has any.
+/etc/smartroomos/release.conf

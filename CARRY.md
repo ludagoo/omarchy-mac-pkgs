@@ -31,11 +31,37 @@ is the omarchy-pkgs#3025 (edgeB2) recipe, unchanged: omacom/mesa
 both from the SmartRoom repo by name. Drop it when the edge channel
 publishes that Mesa or a newer one.
 
-`smartroom/aura-try/` is the first rollback prototype from the design in
-`~/smartroom-rollback/DESIGN.md`. It arms a marker, checks health on a fake
-clock, marks good by write-beside, and rolls back by leaving the configured
-file alone. `smartroom/aura-try/test-all.sh` runs offline. It does not touch
-a real EFI partition and it does not reboot.
+`smartroom-release/` (recipe `smartroom/pkgbuilds/smartroom-release`) is the Studio update
+and rollback tool built on aura's trial boot (`aura-try`); see its README. It installs a
+release's root and boot set beside the running one, boots it once under aura's 178 s
+hardware watchdog, and keeps it only when the room proves healthy (Room Controller
+connected, network up, no screen lost, five quiet minutes inside fifteen); otherwise aura
+boots the previous set by itself. It is the production form of the offline prototype
+in `smartroom/aura-try/` (which stays as the design reference and its own test).
+`smartroom-release/test/all` runs the whole path offline with a fake `btrfs` and a fake clock.
+
+#### smartroom-release: the process
+
+- **What we carry and why.** One package of ours, no upstream file touched. Nothing in
+  Omarchy or Asahi trials a boot set under aura; this is how a Studio gets updates and an
+  automatic rollback with no person. It rides only on `smartroom/edge`, because `aura`
+  (the enrolled first stage and its `aura-try` marker) exists only on the edge line.
+- **How to rebuild it reproducibly.** It is a Python script plus data files, `arch=any`, built
+  from this repository at one commit by ludagoo/omarchy-mac-installer `smartroom/build-packages`
+  (`smartroom-release` is in its package list): `pkgver` is the commit date, `_commit` the
+  commit. `check()` runs `smartroom-release/test/all` (needs `python3`, `tar`, `zstd`, `gpg`).
+- **How to re-sync.** There is no upstream. Three things outside it can move and are the
+  reason to re-test: aura's `trial.rs` (marker format `armed\n<path>\n`, the `chosen/aurora,trial`
+  property, the 10 s fall-back), omarchy-mac-boot's Limine entry layout (`limine.conf`'s kernel entry
+  and its `LoaderEntryOneShot` behaviour through U-Boot's `ubootefi.var`), and the Room Controller's
+  snapshot-helper contract (`fw/docs/room-snapshots-contract.md`). After bumping `aura` or
+  `omarchy-mac-boot`, run `smartroom-release/test/all` and one hardware cycle
+  (`fw/docs/update-rollback.md`: a good release, an unhealthy one, a bad UKI).
+- **How it gets into a pinned release.** A release pins exact package versions (decision 4):
+  the image build records this package's file name and sha256 in the image's package list like
+  any other SmartRoom package; `desk-check` asserts the binary, the health unit, the release
+  keyring and the Room Controller pin. Releases themselves are signed with the SmartRoom
+  package key (the public key is `/usr/share/smartroomos/release-keyring.gpg`).
 
 `user4k.patch` in the omarchy-mac-boot recipe is still the upstream console
 change. Its test hunk is retargeted so it applies after the panic=10 case,
@@ -75,8 +101,9 @@ is copied unchanged.
 | 4 | `smartroom-omarchy-helpers/`: a tiny package of the omacom/omarchy runtime files the boot package, the image builder and first boot read, **copied unchanged** (tag in `SOURCE`, list in `FILES`, `sync-from-runtime` to refresh) | Lets `omarchy-mac-boot` drop its `omarchy` dependency (the full desktop) without reimplementing anything. One omarchy-settings file is deliberately left out: the mkinitcpio HOOKS baseline `00-omarchy-hooks.conf`, which names `plymouth` on a Mac; without it mkinitcpio's default plus omarchy-mac-boot's 90-95 drop-ins give Omarchy's exact hook list minus `plymouth` (checked on the stock image) | No (ours) | omacom splits these helpers out of `omarchy` themselves |
 | 5 | `smartroom/pkgbuilds/`: the omacom/omarchy-pkgs recipe for `omarchy-mac-boot`, unchanged except source (this fork), `depends` (`smartroom-omarchy-helpers` + `sudo` instead of `omarchy`; `asahi-scripts` as the stable 20261104-1 has it) and pkgver/_commit from the build; and the helpers' recipe | omacom builds its packages in omarchy-pkgs from omacom main; ours build from this fork | No (ours) | Never |
 | 6 | `smartroom-boot-os/` and its recipe: `smartroom-boot-os macos\|firmware [--once] [--reboot]`, a thin wrapper around Omarchy's `aurora-bless` (depends on it) | Zoom-room Macs switch between SmartRoom Firmware and macOS (Zoom Rooms) from Linux with no macOS password. Omarchy already ships `aurora-bless` (its asahi-bless fork) in every Mac image for exactly this; the wrapper only picks the volume by name, clears a pending next start when setting a default, and reads the result back | No (ours) | Never |
+| 7 | `smartroom-release/` and its recipe (edge only): trial-boot update and automatic rollback for a Studio on aura's `aura-try` | A Studio had no update path and no rollback by itself (the Mini's snapshot tools do not apply to the Studio boot chain). See the process below | No (ours) | Never |
 
-Nothing else differs from omacom (#6 is a new package of ours beside theirs). In particular the initramfs, in-place
+Nothing else differs from omacom (#6 and #7 are new packages of ours beside theirs). In particular the initramfs, in-place
 encryption (still switchable: `omarchy/install.conf` on the ESP, `encrypt=1`),
 vendor firmware, Limine activation, snapshots and factory reset are
 upstream's code.

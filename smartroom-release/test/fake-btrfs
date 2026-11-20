@@ -1,0 +1,41 @@
+#!/usr/bin/env python3
+"""A btrfs for directories, enough for smartroom-release's tests.
+
+receive DIR            read a tar stream on stdin into DIR (the tar's top directory is the subvolume)
+send [-q] PATH         write PATH as a tar stream whose top directory is PATH's name
+subvolume snapshot [-r] SRC DST
+subvolume delete [--commit-after] PATH
+property set ...       nothing
+filesystem du ...      one line
+"""
+import os
+import shutil
+import subprocess
+import sys
+
+args = sys.argv[1:]
+if args[:1] == ["receive"]:
+    dest = args[1]
+    sys.exit(subprocess.run(["tar", "-C", dest, "-xf", "-"]).returncode)
+if args[:1] == ["send"]:
+    path = [a for a in args[1:] if not a.startswith("-")][0]
+    sys.exit(subprocess.run(["tar", "-C", os.path.dirname(path), "-cf", "-", os.path.basename(path)]).returncode)
+if args[:2] == ["subvolume", "snapshot"]:
+    rest = [a for a in args[2:] if not a.startswith("-")]
+    src, dst = rest
+    if os.path.exists(dst):
+        print(f"ERROR: {dst} exists", file=sys.stderr)
+        sys.exit(1)
+    shutil.copytree(src, dst, symlinks=True)
+    sys.exit(0)
+if args[:2] == ["subvolume", "delete"]:
+    path = [a for a in args[2:] if not a.startswith("-")][0]
+    shutil.rmtree(path)
+    sys.exit(0)
+if args[:1] == ["property"]:
+    sys.exit(0)
+if args[:2] == ["filesystem", "du"]:
+    print("Total   Exclusive  Set shared  Filename")
+    sys.exit(0)
+print("fake-btrfs: unsupported: " + " ".join(args), file=sys.stderr)
+sys.exit(2)
