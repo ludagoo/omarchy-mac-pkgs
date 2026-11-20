@@ -18,6 +18,15 @@ omarchy-hw-apple-silicon || return 0
     sed -n "s/^$1=//p" "$grub_default" | tail -n 1 | sed -E "s/^\"(.*)\"$/\1/; s/^'(.*)'$/\1/"
   }
 
+  # SmartRoom: a headless room has nobody to unlock a disk, so for a headless,
+  # unencrypted root a missing root device must end in systemd's emergency
+  # target (the room's initrd hook reboots from there), not in an endless wait.
+  # Everything else keeps the wait without a timeout.
+  if [[ -e ${OMARCHY_MAC_HEADLESS_MARKER:-/etc/omarchy-mac-boot/headless} ]] &&
+    [[ " $(grub_console_get GRUB_CMDLINE_LINUX) " != *" rd.luks."* && " $(grub_console_get GRUB_CMDLINE_LINUX) " != *" cryptdevice="* ]]; then
+    device_wait="rootflags=x-systemd.device-timeout=${OMARCHY_MAC_HEADLESS_DEVICE_TIMEOUT:-60}"
+  fi
+
   grub_console_set() {
     local key=$1 value=$2 staged
     if [[ $(grub_console_get "$key") == "$value" && $(grep -Ec "^$key=" "$grub_default") == "1" ]]; then
@@ -58,6 +67,19 @@ omarchy-hw-apple-silicon || return 0
     local hooks=$1 wait=${device_wait#rootflags=} word flags last=-1 i
     local -a words kept=()
     read -ra words <<<"$2"
+    if [[ $wait != x-systemd.device-timeout=0 ]]; then
+      # A finite wait replaces an endless one an earlier run (or an older
+      # image) left in a rootflags= word.
+      for i in "${!words[@]}"; do
+        [[ ${words[i]} == rootflags=* ]] || continue
+        flags=",${words[i]#rootflags=},"
+        flags=${flags//,x-systemd.device-timeout=0,/,}
+        flags=${flags#,}
+        flags=${flags%,}
+        if [[ -n $flags ]]; then words[i]="rootflags=$flags"; else words[i]=; fi
+      done
+      read -ra words <<<"${words[*]}"
+    fi
     if [[ -z $hooks || " $hooks " == *" systemd "* ]]; then
       for i in "${!words[@]}"; do
         if [[ ${words[i]} == rootflags=* ]]; then
