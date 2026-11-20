@@ -1,9 +1,11 @@
 #!/bin/bash
-# smartroom-boot-os: choose what this Apple Silicon Mac starts up from, from
-# SmartRoom Firmware (Linux). Omarchy's own tool does the NVRAM write:
-# aurora-bless (Omarchy's asahi-bless; package aurora-bless) sets the
-# boot-volume variable (default) or alt-boot-volume (next boot only), which
-# the Mac's boot picker reads. No macOS password is needed from Linux.
+# smartroom-boot-os: choose what this room Mac starts up from, from
+# SmartRoom Firmware (Linux).
+# - On Apple Silicon: aurora-bless sets boot-volume / alt-boot-volume.
+# - On Intel T2 (Macmini8,1): efibootmgr sets BootOrder / BootNext, recreates
+#   missing SmartRoom or macOS Boot#### entries (using saved macos-boot-device
+#   metadata from /boot/smartroomos when bless overwrote Boot0080), and syncs
+#   Apple efi-boot-device / efi-boot-next variables in efivarfs when present.
 #
 #   smartroom-boot-os macos [--once] [--reboot]      start macOS (Zoom Rooms)
 #   smartroom-boot-os firmware [--once] [--reboot]   start SmartRoom Firmware
@@ -20,6 +22,10 @@ set -euo pipefail
 PATH=/usr/bin:/usr/sbin:/bin
 bless=${SMARTROOM_BOOT_OS_BLESS:-aurora-bless}
 limine_defaults=${SMARTROOM_BOOT_OS_LIMINE_DEFAULTS:-/etc/default/limine}
+efibootmgr_bin=${SMARTROOM_BOOT_OS_EFIBOOTMGR:-efibootmgr}
+esp_dir=${SMARTROOM_BOOT_OS_ESP_DIR:-/boot}
+meta_dir=${SMARTROOM_BOOT_OS_META_DIR:-$esp_dir/smartroomos}
+efivars_dir=${SMARTROOM_BOOT_OS_EFIVARS:-/sys/firmware/efi/efivars}
 die() { echo "smartroom-boot-os: $*" >&2; exit 1; }
 usage() { sed -n '/^#   smartroom-boot-os/s/^#   //p' "$0" >&2; exit 64; }
 
@@ -36,7 +42,17 @@ done
 [[ -n $target ]] || usage
 [[ $target != status || ($once == 0 && $reboot == 0) ]] || usage
 (( EUID == 0 )) || die "run as root"
-command -v "$bless" >/dev/null || die "$bless is not installed (package aurora-bless)"
+
+backend=${SMARTROOM_BOOT_OS_BACKEND:-}
+if [[ -z $backend ]]; then
+  if [[ -n ${SMARTROOM_BOOT_OS_BLESS:-} ]]; then
+    backend=aurora-bless
+  elif [[ $(uname -m 2>/dev/null || true) == x86_64 ]]; then
+    backend=efibootmgr
+  else
+    backend=aurora-bless
+  fi
+fi
 
 # Names of the Linux startup volumes SmartRoom and Omarchy make, newest first.
 firmware_name=SmartRoom\ Firmware
@@ -46,66 +62,401 @@ if [[ -r $limine_defaults ]]; then
   [[ -z $name ]] || firmware_name=$name
 fi
 linux_names=("$firmware_name" "SmartRoom Firmware" "SmartRoomOS" "Omarchy")
-
-# aurora-bless --list-volumes: "*1) Macintosh HD" (* marks the default).
-candidates=()
-while IFS= read -r line; do
-  [[ $line =~ ^[\ *]?[0-9]+\)\ (.+)$ ]] || continue
-  candidates+=("${BASH_REMATCH[1]}")
-done < <("$bless" --list-volumes)
-((${#candidates[@]})) || die "$bless found no startup volumes"
-
 is_linux() { local n; for n in "${linux_names[@]}"; do [[ ${1,,} == "${n,,}" ]] && return 0; done; return 1; }
-count() { local n c=0; for n in "${candidates[@]}"; do [[ ${n,,} == "${1,,}" ]] && c=$((c + 1)); done; echo "$c"; }
-current() { # [--next]: the name aurora-bless reports, or "none"
-  local out
-  out=$("$bless" --get-boot "$@" 2>/dev/null) || { echo none; return; }
-  [[ $out == "No boot target set" || -z $out ]] && echo none || echo "$out"
+
+run_aurora_bless() {
+  command -v "$bless" >/dev/null || die "$bless is not installed (package aurora-bless)"
+
+  # aurora-bless --list-volumes: "*1) Macintosh HD" (* marks the default).
+  candidates=()
+  while IFS= read -r line; do
+    [[ $line =~ ^[\ *]?[0-9]+\)\ (.+)$ ]] || continue
+    candidates+=("${BASH_REMATCH[1]}")
+  done < <("$bless" --list-volumes)
+  ((${#candidates[@]})) || die "$bless found no startup volumes"
+
+  count() { local n c=0; for n in "${candidates[@]}"; do [[ ${n,,} == "${1,,}" ]] && c=$((c + 1)); done; echo "$c"; }
+  current() { # [--next]: the name aurora-bless reports, or "none"
+    local out
+    out=$("$bless" --get-boot "$@" 2>/dev/null) || { echo none; return; }
+    [[ $out == "No boot target set" || -z $out ]] && echo none || echo "$out"
+  }
+
+  if [[ $target == status ]]; then
+    echo "default: $(current)"
+    echo "next:    $(current --next)"
+    echo "volumes: $(printf '"%s" ' "${candidates[@]}")"
+    exit 0
+  fi
+
+  local want=""
+  if [[ $target == firmware ]]; then
+    for n in "$firmware_name" SmartRoomOS; do
+      case $(count "$n") in
+        0) continue ;;
+        1) want=$n; break ;;
+        *) die "more than one startup volume is named \"$n\"" ;;
+      esac
+    done
+    [[ -n $want ]] || die "no startup volume named \"$firmware_name\" (found: $(printf '"%s" ' "${candidates[@]}"))"
+  else
+    want=${SMARTROOM_BOOT_OS_MACOS-}
+    if [[ -z $want ]]; then
+      others=()
+      for n in "${candidates[@]}"; do is_linux "$n" || others+=("$n"); done
+      ((${#others[@]} == 1)) ||
+        die "cannot tell which startup volume is macOS (candidates: $(printf '"%s" ' "${candidates[@]}")); set SMARTROOM_BOOT_OS_MACOS to its name"
+      want=${others[0]}
+    fi
+    [[ $(count "$want") == 1 ]] || die "not exactly one startup volume is named \"$want\""
+    ! is_linux "$want" || die "\"$want\" is a Linux startup volume, not macOS"
+  fi
+
+  local got what
+  if (( once )); then
+    "$bless" --set-boot "$want" --next --yes >/dev/null
+    got=$(current --next)
+    what="next start"
+  else
+    "$bless" --set-boot "$want" --yes >/dev/null
+    "$bless" --clear-next >/dev/null
+    got=$(current)
+    [[ $(current --next) == "$got" ]] || die "the next start is $(current --next), not $got, after clearing it"
+    what="default"
+  fi
+  [[ ${got,,} == "${want,,}" ]] || die "asked for \"$want\" as the $what, but the Mac reports \"$got\""
+  echo "$what: $got"
+  if (( reboot )); then
+    systemctl reboot
+  fi
 }
 
-if [[ $target == status ]]; then
-  echo "default: $(current)"
-  echo "next:    $(current --next)"
-  echo "volumes: $(printf '"%s" ' "${candidates[@]}")"
-  exit 0
-fi
+# ---- Intel T2 (efibootmgr + efivarfs) backend --------------------------------
+APPLE_GUID="7c436110-ab2a-4bbb-a880-fe41995c9f82"
+GLOBAL_GUID="8be4df61-93ca-11d2-aa0d-00e098032b8c"
 
-if [[ $target == firmware ]]; then
-  want=""
-  for n in "$firmware_name" SmartRoomOS; do
-    case $(count "$n") in
-      0) continue ;;
-      1) want=$n; break ;;
-      *) die "more than one startup volume is named \"$n\"" ;;
-    esac
-  done
-  [[ -n $want ]] || die "no startup volume named \"$firmware_name\" (found: $(printf '"%s" ' "${candidates[@]}"))"
-else
-  want=${SMARTROOM_BOOT_OS_MACOS-}
-  if [[ -z $want ]]; then
-    others=()
-    for n in "${candidates[@]}"; do is_linux "$n" || others+=("$n"); done
-    ((${#others[@]} == 1)) ||
-      die "cannot tell which startup volume is macOS (candidates: $(printf '"%s" ' "${candidates[@]}")); set SMARTROOM_BOOT_OS_MACOS to its name"
-    want=${others[0]}
+efi_detect_esp() {
+  esp_partuuid=${SMARTROOM_BOOT_OS_ESP_PARTUUID:-}
+  esp_disk=${SMARTROOM_BOOT_OS_ESP_DISK:-}
+  esp_part=${SMARTROOM_BOOT_OS_ESP_PART:-}
+  [[ -n $esp_partuuid && -n $esp_disk && -n $esp_part ]] && return 0
+  local src="" pk="" pn=""
+  if command -v findmnt >/dev/null 2>&1; then
+    src=$(findmnt -n -o SOURCE "$esp_dir" 2>/dev/null || true)
   fi
-  [[ $(count "$want") == 1 ]] || die "not exactly one startup volume is named \"$want\""
-  ! is_linux "$want" || die "\"$want\" is a Linux startup volume, not macOS"
-fi
+  if [[ -n $src && -b $src ]]; then
+    if [[ -z $esp_partuuid ]] && command -v blkid >/dev/null 2>&1; then
+      esp_partuuid=$(blkid -s PARTUUID -o value "$src" 2>/dev/null || true)
+    fi
+    if [[ -z $esp_disk || -z $esp_part ]] && command -v lsblk >/dev/null 2>&1; then
+      pk=$(lsblk -no PKNAME "$src" 2>/dev/null | head -n 1 || true)
+      pn=$(lsblk -no PARTN "$src" 2>/dev/null | head -n 1 || true)
+      [[ -z $esp_disk && -n $pk ]] && esp_disk="/dev/$pk"
+      [[ -z $esp_part && -n $pn ]] && esp_part="$pn"
+    fi
+  fi
+  esp_partuuid=${esp_partuuid,,}
+}
 
-if (( once )); then
-  "$bless" --set-boot "$want" --next --yes >/dev/null
-  got=$(current --next)
-  what="next start"
-else
-  "$bless" --set-boot "$want" --yes >/dev/null
-  "$bless" --clear-next >/dev/null
-  got=$(current)
-  [[ $(current --next) == "$got" ]] || die "the next start is $(current --next), not $got, after clearing it"
-  what="default"
-fi
-[[ ${got,,} == "${want,,}" ]] || die "asked for \"$want\" as the $what, but the Mac reports \"$got\""
-echo "$what: $got"
-if (( reboot )); then
-  systemctl reboot
-fi
+efi_parse() {
+  local raw line rest
+  raw=$("$efibootmgr_bin" -v 2>/dev/null) || die "$efibootmgr_bin -v failed (are EFI runtime services available?)"
+  EFI_CURRENT="" EFI_NEXT="" EFI_ORDER=""
+  E_ID=() E_NAME=() E_REST=()
+  while IFS= read -r line; do
+    case $line in
+      BootCurrent:\ *) EFI_CURRENT=${line#BootCurrent: }; EFI_CURRENT=${EFI_CURRENT^^} ;;
+      BootNext:\ *) EFI_NEXT=${line#BootNext: }; EFI_NEXT=${EFI_NEXT^^} ;;
+      BootOrder:\ *) EFI_ORDER=${line#BootOrder: }; EFI_ORDER=${EFI_ORDER^^} ;;
+      Boot[0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f]*)
+        local id=${line:4:4}
+        id=${id^^}
+        rest=${line:9}
+        rest=${rest#"${rest%%[![:space:]]*}"}
+        local label="" path=""
+        if [[ $rest == *$'\t'* ]]; then
+          label=${rest%%$'\t'*}
+          path=${rest#*$'\t'}
+        elif [[ $rest =~ ^(.*[^[:space:]])[[:space:]]+((HD|PciRoot|Fv|VenMedia|Acpi|USB|File)\(.*) ]]; then
+          label=${BASH_REMATCH[1]}
+          path=${BASH_REMATCH[2]}
+        else
+          label=$rest
+        fi
+        E_ID+=("$id")
+        E_NAME+=("$label")
+        E_REST+=("$path")
+        ;;
+    esac
+  done <<<"$raw"
+}
+
+efi_idx_by_id() {
+  local want=${1^^} i
+  for ((i = 0; i < ${#E_ID[@]}; i++)); do
+    [[ ${E_ID[i]} == "$want" ]] && { echo "$i"; return 0; }
+  done
+  return 1
+}
+
+efi_is_macos_idx() {
+  local i=$1
+  local name=${E_NAME[i],,} rest=${E_REST[i],,}
+  local mac_override=${SMARTROOM_BOOT_OS_MACOS:-}
+  if [[ -n $mac_override ]]; then
+    [[ $name == "${mac_override,,}" ]]
+    return
+  fi
+  [[ $rest == *'\system\library\coreservices\boot.efi'* || $rest == *'be74fcf7-0b7c-49f3-9147-01f4042e6842'* ]] && return 0
+  [[ $name == 'mac os x' || $name == 'macos' || $name == 'macintosh hd' ]] && return 0
+  return 1
+}
+
+efi_is_firmware_idx() {
+  local i=$1
+  local name=${E_NAME[i],,} rest=${E_REST[i],,}
+  efi_is_macos_idx "$i" && return 1
+  if [[ -n $esp_partuuid && $rest == *'hd('* ]]; then
+    [[ $rest == *"$esp_partuuid"* ]] || return 1
+  fi
+  if [[ $rest == *'\efi\boot\bootx64.efi'* || $rest == *'\efi\limine\limine_x64.efi'* ]]; then
+    return 0
+  fi
+  [[ -z $rest ]] && is_linux "${E_NAME[i]}" && return 0
+  is_linux "${E_NAME[i]}" && [[ $rest != *'boot.efi'* ]] && return 0
+  return 1
+}
+
+efi_label_for_id() {
+  local id=${1:-} i
+  [[ -n $id ]] || { echo none; return 0; }
+  i=$(efi_idx_by_id "$id" 2>/dev/null || true)
+  [[ -n $i ]] || { echo "unknown (Boot$id)"; return 0; }
+  if efi_is_firmware_idx "$i"; then
+    echo "${E_NAME[i]:-$firmware_name}"
+  elif efi_is_macos_idx "$i"; then
+    echo macOS
+  else
+    echo "${E_NAME[i]:-Boot$id}"
+  fi
+}
+
+efi_write_efivar() {
+  local path=$1 body=$2 tmpf
+  [[ -d $efivars_dir && -w $efivars_dir ]] || return 1
+  if [[ -e $path ]] && command -v chattr >/dev/null 2>&1; then
+    chattr -i "$path" 2>/dev/null || true
+  fi
+  tmpf=$(mktemp)
+  { printf '\007\000\000\000'; cat "$body"; } >"$tmpf"
+  dd if="$tmpf" of="$path" bs=1048576 status=none 2>/dev/null || { rm -f "$tmpf"; return 1; }
+  rm -f "$tmpf"
+}
+
+efi_remove_efivar() {
+  local path=$1
+  [[ -e $path ]] || return 0
+  if command -v chattr >/dev/null 2>&1; then
+    chattr -i "$path" 2>/dev/null || true
+  fi
+  rm -f "$path" 2>/dev/null || true
+}
+
+efi_free_boot_slot() {
+  local slot
+  for slot in 0081 0082 0083 0084 0080 0001 0002 0003 0004 0005; do
+    if ! efi_idx_by_id "$slot" >/dev/null 2>&1; then
+      echo "$slot"
+      return 0
+    fi
+  done
+  return 1
+}
+
+efi_create_macos_from_saved() {
+  local dp="$meta_dir/macos-boot-device.bin"
+  [[ -s $dp ]] || return 1
+  local slot sz lo hi opt
+  slot=$(efi_free_boot_slot) || return 1
+  sz=$(wc -c <"$dp")
+  (( sz > 0 && sz < 65536 )) || return 1
+  lo=$(printf '%02x' $((sz & 0xff)))
+  hi=$(printf '%02x' $(((sz >> 8) & 0xff)))
+  opt=$(mktemp)
+  {
+    # Attributes = LOAD_OPTION_ACTIVE (1), FilePathListLength = sz
+    printf "\001\000\000\000\x${lo}\x${hi}"
+    # UTF-16LE "Mac OS X\0"
+    printf 'M\0a\0c\0 \0O\0S\0 \0X\0\0\0'
+    cat "$dp"
+  } >"$opt"
+  if ! efi_write_efivar "$efivars_dir/Boot${slot}-${GLOBAL_GUID}" "$opt"; then
+    rm -f "$opt"
+    return 1
+  fi
+  rm -f "$opt"
+  echo "$slot"
+}
+
+efi_ensure_firmware_entry() {
+  local -a matches=()
+  local i loader=""
+  for ((i = 0; i < ${#E_ID[@]}; i++)); do
+    efi_is_firmware_idx "$i" && matches+=("${E_ID[i]}")
+  done
+  if ((${#matches[@]} == 1)); then
+    echo "${matches[0]}"
+    return 0
+  fi
+  if ((${#matches[@]} > 1)); then
+    die "more than one UEFI firmware entry found (${matches[*]})"
+  fi
+  [[ -n $esp_disk && -n $esp_part ]] || die "no UEFI entry for SmartRoom Firmware and cannot tell which disk/partition holds $esp_dir"
+  if [[ -f $esp_dir/EFI/BOOT/BOOTX64.EFI ]]; then
+    loader='\EFI\BOOT\BOOTX64.EFI'
+  elif [[ -f $esp_dir/EFI/limine/limine_x64.efi ]]; then
+    loader='\EFI\limine\limine_x64.efi'
+  else
+    die "neither $esp_dir/EFI/BOOT/BOOTX64.EFI nor limine_x64.efi exists"
+  fi
+  "$efibootmgr_bin" --create --disk "$esp_disk" --part "$esp_part" --label "$firmware_name" --loader "$loader" >/dev/null \
+    || die "efibootmgr --create for $firmware_name failed"
+  efi_parse
+  for ((i = 0; i < ${#E_ID[@]}; i++)); do
+    if efi_is_firmware_idx "$i"; then
+      echo "${E_ID[i]}"
+      return 0
+    fi
+  done
+  die "efibootmgr --create ran, but no entry for $firmware_name appeared"
+}
+
+efi_ensure_macos_entry() {
+  local -a matches=()
+  local i slot
+  for ((i = 0; i < ${#E_ID[@]}; i++)); do
+    efi_is_macos_idx "$i" && matches+=("${E_ID[i]}")
+  done
+  if ((${#matches[@]} == 1)); then
+    echo "${matches[0]}"
+    return 0
+  fi
+  if ((${#matches[@]} > 1)); then
+    die "more than one macOS UEFI entry found (${matches[*]}): set SMARTROOM_BOOT_OS_MACOS"
+  fi
+  slot=$(efi_create_macos_from_saved 2>/dev/null || true)
+  [[ -n $slot ]] || die "no macOS BootXXXX entry in NVRAM and no saved $meta_dir/macos-boot-device.bin"
+  efi_parse
+  efi_idx_by_id "$slot" >/dev/null 2>&1 || die "created Boot$slot for macOS, but efibootmgr did not show it"
+  echo "$slot"
+}
+
+efi_sync_apple_vars() { # mode(default|once) who(macos|firmware)
+  local mode=$1 who=$2
+  local xml="$meta_dir/${who}-boot-device.xml"
+  local bin="$meta_dir/${who}-boot-device.bin"
+  local v_dev="$efivars_dir/efi-boot-device-${APPLE_GUID}"
+  local v_data="$efivars_dir/efi-boot-device-data-${APPLE_GUID}"
+  local v_next="$efivars_dir/efi-boot-next-${APPLE_GUID}"
+  local v_ndata="$efivars_dir/efi-boot-next-data-${APPLE_GUID}"
+  if [[ $mode == once ]]; then
+    if [[ -s $xml && ( -e $v_dev || -e $v_next || ${SMARTROOM_BOOT_OS_SYNC_APPLE_VARS:-0} == 1 ) ]]; then
+      efi_write_efivar "$v_next" "$xml" || true
+    fi
+    if [[ -s $bin && ( -e $v_data || -e $v_ndata || ${SMARTROOM_BOOT_OS_SYNC_APPLE_VARS:-0} == 1 ) ]]; then
+      efi_write_efivar "$v_ndata" "$bin" || true
+    fi
+  else
+    efi_remove_efivar "$v_next"
+    efi_remove_efivar "$v_ndata"
+    if [[ -s $xml && ( -e $v_dev || ${SMARTROOM_BOOT_OS_SYNC_APPLE_VARS:-0} == 1 ) ]]; then
+      efi_write_efivar "$v_dev" "$xml" || true
+    fi
+    if [[ -s $bin && ( -e $v_data || ${SMARTROOM_BOOT_OS_SYNC_APPLE_VARS:-0} == 1 ) ]]; then
+      efi_write_efivar "$v_data" "$bin" || true
+    fi
+  fi
+}
+
+run_efibootmgr() {
+  command -v "$efibootmgr_bin" >/dev/null || die "$efibootmgr_bin is not installed (package efibootmgr)"
+  efi_detect_esp
+  efi_parse
+
+  local def_id=""
+  if [[ -n $EFI_ORDER ]]; then
+    def_id=${EFI_ORDER%%,*}
+  elif [[ -n $EFI_CURRENT ]]; then
+    def_id=$EFI_CURRENT
+  fi
+
+  if [[ $target == status ]]; then
+    local -a vols=()
+    local i seen_fw=0 seen_mac=0
+    for ((i = 0; i < ${#E_ID[@]}; i++)); do
+      if efi_is_firmware_idx "$i"; then
+        (( seen_fw )) || vols+=("${E_NAME[i]:-$firmware_name}")
+        seen_fw=1
+      elif efi_is_macos_idx "$i"; then
+        (( seen_mac )) || vols+=("macOS")
+        seen_mac=1
+      fi
+    done
+    if (( ! seen_mac )) && [[ -s $meta_dir/macos-boot-device.bin ]]; then
+      vols+=("macOS (saved)")
+    fi
+    echo "default: $(efi_label_for_id "$def_id")"
+    echo "next:    $(efi_label_for_id "$EFI_NEXT")"
+    echo "volumes: $(printf '"%s" ' "${vols[@]}")"
+    exit 0
+  fi
+
+  local want_id="" want_name=""
+  if [[ $target == firmware ]]; then
+    want_id=$(efi_ensure_firmware_entry)
+    want_name="$firmware_name"
+  else
+    want_id=$(efi_ensure_macos_entry)
+    want_name="macOS"
+  fi
+
+  local what="" got_id=""
+  if (( once )); then
+    "$efibootmgr_bin" --bootnext "$want_id" >/dev/null || die "efibootmgr --bootnext $want_id failed"
+    efi_sync_apple_vars once "$target"
+    efi_parse
+    got_id=$EFI_NEXT
+    what="next start"
+  else
+    local new_order="$want_id" item
+    local -a parts=()
+    IFS=',' read -r -a parts <<<"$EFI_ORDER"
+    for item in "${parts[@]}"; do
+      item=${item//[^0-9A-Fa-f]/}
+      item=${item^^}
+      [[ -n $item && $item != "$want_id" ]] || continue
+      new_order+=",$item"
+    done
+    "$efibootmgr_bin" --bootorder "$new_order" >/dev/null || die "efibootmgr --bootorder $new_order failed"
+    if [[ -n $EFI_NEXT ]]; then
+      "$efibootmgr_bin" --delete-bootnext >/dev/null || die "efibootmgr --delete-bootnext failed"
+    fi
+    efi_sync_apple_vars default "$target"
+    efi_parse
+    [[ -z $EFI_NEXT ]] || die "BootNext ($EFI_NEXT) is still set after clearing it"
+    got_id=${EFI_ORDER%%,*}
+    what="default"
+  fi
+
+  [[ ${got_id^^} == "${want_id^^}" ]] || die "asked for $want_name (Boot$want_id) as the $what, but NVRAM reports Boot${got_id:-none}"
+  echo "$what: $want_name"
+  if (( reboot )); then
+    systemctl reboot
+  fi
+}
+
+case $backend in
+  aurora-bless) run_aurora_bless ;;
+  efibootmgr) run_efibootmgr ;;
+  *) die "unknown SMARTROOM_BOOT_OS_BACKEND: $backend" ;;
+esac

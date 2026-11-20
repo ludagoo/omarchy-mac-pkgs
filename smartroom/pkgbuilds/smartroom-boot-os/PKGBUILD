@@ -1,14 +1,20 @@
 # SmartRoom only: choose the Mac's startup volume (macOS or SmartRoom
-# Firmware) from Linux with Omarchy's aurora-bless (smartroom-boot-os/).
+# Firmware) from Linux.
+# - Apple Silicon: Omarchy's aurora-bless
+# - Intel T2 (Macmini8,1): efibootmgr + efivarfs
 pkgname=smartroom-boot-os
 pkgver=${SMARTROOM_MAC_PKGS_DATE:?set by smartroom/build-packages}
 pkgrel=1
-pkgdesc='Switch an Apple Silicon room Mac between SmartRoom Firmware and macOS (aurora-bless)'
+pkgdesc='Switch a room Mac between SmartRoom Firmware and macOS (aurora-bless / efibootmgr)'
 arch=('any')
 url='https://github.com/ludagoo/omarchy-mac-pkgs'
 license=('MIT')
 makedepends=('git')
-depends=('bash' 'aurora-bless' 'systemd')
+depends=('bash' 'systemd')
+optdepends=(
+  'aurora-bless: Apple Silicon startup target switching'
+  'efibootmgr: Intel T2 UEFI NVRAM startup target switching'
+)
 _commit=${SMARTROOM_MAC_PKGS_COMMIT:?set by smartroom/build-packages}
 source=("omarchy-mac-pkgs::git+https://github.com/ludagoo/omarchy-mac-pkgs.git#commit=${_commit}")
 sha256sums=('SKIP')

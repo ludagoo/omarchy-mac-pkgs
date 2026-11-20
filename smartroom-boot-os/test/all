@@ -1,11 +1,17 @@
 #!/bin/bash
-# smartroom-boot-os against a simulated aurora-bless (its CLI and output as in
-# aurora-bless 0.4.4: --list-volumes, --get-boot [--next], --set-boot NAME
-# [--next] --yes, --clear-next). NVRAM is two files: boot-volume, alt-boot-volume.
+# smartroom-boot-os tests:
+# 1. Simulated aurora-bless (Apple Silicon): --list-volumes, --get-boot [--next],
+#    --set-boot NAME [--next] --yes, --clear-next.
+# 2. Simulated efibootmgr + efivars (Intel T2 Macmini8,1): BootOrder, BootNext,
+#    --create missing firmware entry, recreating missing macOS Boot#### from
+#    /boot/smartroomos/macos-boot-device.bin, syncing Apple efi-boot-* efivars,
+#    status, refusals, and --reboot.
 set -euo pipefail
 here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 t=$(mktemp -d); trap 'rm -rf "$t"' EXIT
 fail() { echo "not ok - $*" >&2; exit 1; }
+
+# ---- Part 1: Apple Silicon (aurora-bless) -----------------------------------
 cat >"$t/bless" <<'SH'
 #!/bin/bash
 s=$STATE; next=0; set_name=""; mode=""
@@ -33,7 +39,6 @@ cat >"$t/systemctl" <<SH
 echo "\$*" >>"$t/systemctl.log"
 SH
 chmod +x "$t/systemctl"
-# root-only check and PATH: run a copy with EUID checks lifted and our systemctl first
 sed -e 's/^(( EUID == 0 )) || die "run as root"$/:/' -e "s|^PATH=/usr/bin:/usr/sbin:/bin|PATH=$t:/usr/bin:/usr/sbin:/bin|" \
   "$here/../smartroom-boot-os" >"$t/sbo"; chmod +x "$t/sbo"
 export STATE=$t/s SMARTROOM_BOOT_OS_BLESS=$t/bless SMARTROOM_BOOT_OS_LIMINE_DEFAULTS=$t/limine
@@ -78,3 +83,148 @@ reset "Macintosh HD" "SmartRoom Firmware" "SmartRoom Firmware"
 "$t/sbo" >/dev/null 2>&1 && fail "no target accepted"
 echo "ok - a renamed macOS; refuses no stub, two stubs and bad usage"
 grep -q '^(( EUID == 0 )) || die "run as root"$' "$here/../smartroom-boot-os" || fail "the root check moved"
+
+# ---- Part 2: Intel T2 Macmini8,1 (efibootmgr + efivars) --------------------
+unset STATE SMARTROOM_BOOT_OS_BLESS
+efi_state=$t/efi_state.json
+efivars=$t/efivars
+esp=$t/esp
+meta=$esp/smartroomos
+mkdir -p "$efivars" "$esp/EFI/BOOT" "$meta"
+: >"$esp/EFI/BOOT/BOOTX64.EFI"
+: >"$t/systemctl.log"
+printf '<array><dict><key>IOMatch</key><dict/></dict></array>\n' >"$meta/macos-boot-device.xml"
+printf '\x04\x04\x18\x00\x31\x00\x00\x00\x7f\xff\x04\x00' >"$meta/macos-boot-device.bin"
+printf '<array><dict><key>Path</key><string>\\EFI\\BOOT\\BOOTX64.EFI</string></dict></array>\n' >"$meta/firmware-boot-device.xml"
+printf '\x04\x01\x2a\x00\x02\x00\x00\x00\x7f\xff\x04\x00' >"$meta/firmware-boot-device.bin"
+
+APPLE_GUID="7c436110-ab2a-4bbb-a880-fe41995c9f82"
+GLOBAL_GUID="8be4df61-93ca-11d2-aa0d-00e098032b8c"
+# Seed initial Apple efi-boot-device files in efivars as Linux efivarfs shows them
+printf '\x07\x00\x00\x00initial' >"$efivars/efi-boot-device-${APPLE_GUID}"
+printf '\x07\x00\x00\x00initial' >"$efivars/efi-boot-device-data-${APPLE_GUID}"
+
+cat >"$t/efibootmgr" <<PY
+#!/usr/bin/python3
+import json, os, pathlib, struct, sys
+
+STATE = "$efi_state"
+EFIVARS = pathlib.Path("$efivars")
+GLOBAL = "$GLOBAL_GUID"
+s = json.load(open(STATE))
+a = sys.argv[1:]
+
+# Pick up any BootXXXX efivars written directly by smartroom-boot-os
+for p in sorted(EFIVARS.glob(f"Boot*-{GLOBAL}")):
+    bid = p.name[4:8].upper()
+    if any(e["id"] == bid for e in s["entries"]):
+        continue
+    raw = p.read_bytes()[4:]  # strip 4-byte efivarfs attributes
+    attr, dp_len = struct.unpack_from("<IH", raw, 0)
+    desc_bytes = raw[6:len(raw) - dp_len]
+    desc = desc_bytes.decode("utf-16le").rstrip("\x00")
+    dp = raw[-dp_len:]
+    rest = r"VenMedia(be74fcf7-0b7c-49f3-9147-01f4042e6842)/File(\\System\\Library\\CoreServices\\boot.efi)"
+    s["entries"].append({"id": bid, "active": bool(attr & 1), "label": desc, "rest": rest, "dp_len": len(dp)})
+    json.dump(s, open(STATE, "w"))
+
+if a == ["-v"]:
+    if s.get("current"): print(f"BootCurrent: {s['current']}")
+    if s.get("next"): print(f"BootNext: {s['next']}")
+    print("BootOrder: " + ",".join(s["order"]))
+    for e in s["entries"]:
+        star = "*" if e.get("active", True) else " "
+        print(f"Boot{e['id']}{star} {e['label']}\t{e['rest']}")
+    sys.exit(0)
+
+if "--bootnext" in a:
+    s["next"] = a[a.index("--bootnext") + 1].upper()
+    json.dump(s, open(STATE, "w")); sys.exit(0)
+if "--delete-bootnext" in a:
+    s["next"] = None
+    json.dump(s, open(STATE, "w")); sys.exit(0)
+if "--bootorder" in a:
+    s["order"] = [x.upper() for x in a[a.index("--bootorder") + 1].split(",") if x]
+    json.dump(s, open(STATE, "w")); sys.exit(0)
+if "--create" in a:
+    label = a[a.index("--label") + 1]
+    loader = a[a.index("--loader") + 1]
+    used = {e["id"] for e in s["entries"]}
+    nid = next(f"{i:04X}" for i in range(0x80, 0x90) if f"{i:04X}" not in used)
+    s["entries"].append({
+        "id": nid, "active": True, "label": label,
+        "rest": f"HD(2,GPT,{s['partuuid']},0x100,0x400)/File({loader})"
+    })
+    s["order"] = [nid] + s["order"]
+    json.dump(s, open(STATE, "w")); sys.exit(0)
+sys.stderr.write(f"fake efibootmgr unexpected args: {a}\n")
+sys.exit(2)
+PY
+chmod +x "$t/efibootmgr"
+
+PARTUUID="2abf9f91-1111-2222-3333-444455556666"
+cat >"$efi_state" <<EOF
+{"current": "0080", "next": null, "order": ["0080"], "partuuid": "$PARTUUID",
+ "entries": [
+   {"id": "0080", "active": true, "label": "SmartRoom Firmware",
+    "rest": "HD(2,GPT,$PARTUUID,0x100,0x400)/File(\\\\EFI\\\\BOOT\\\\BOOTX64.EFI)"}
+ ]}
+EOF
+
+export SMARTROOM_BOOT_OS_BACKEND=efibootmgr
+export SMARTROOM_BOOT_OS_EFIBOOTMGR=$t/efibootmgr
+export SMARTROOM_BOOT_OS_ESP_DIR=$esp
+export SMARTROOM_BOOT_OS_META_DIR=$meta
+export SMARTROOM_BOOT_OS_EFIVARS=$efivars
+export SMARTROOM_BOOT_OS_ESP_PARTUUID=$PARTUUID
+export SMARTROOM_BOOT_OS_ESP_DISK=/dev/nvme0n1
+export SMARTROOM_BOOT_OS_ESP_PART=2
+
+# Scenario A: macOS BootXXXX was overwritten by bless; smartroom-boot-os reconstructs it from saved binary
+st=$("$t/sbo" status)
+grep -qx 'default: SmartRoom Firmware' <<<"$st" || fail "efi initial status default: $st"
+grep -qx 'next:    none' <<<"$st" || fail "efi initial status next: $st"
+grep -q '"macOS (saved)"' <<<"$st" || fail "efi status should show saved macOS: $st"
+
+out=$("$t/sbo" macos --once --reboot) || fail "efi macos --once: $out"
+[[ $out == "next start: macOS" ]] || fail "efi macos --once output: $out"
+[[ $(cat "$t/systemctl.log") == reboot ]] || fail "efi macos --once --reboot did not reboot"
+st=$("$t/sbo" status)
+grep -qx 'default: SmartRoom Firmware' <<<"$st" || fail "efi default changed on --once: $st"
+grep -qx 'next:    macOS' <<<"$st" || fail "efi next not macOS: $st"
+[[ -s $efivars/Boot0081-${GLOBAL_GUID} ]] || fail "did not reconstruct Boot0081 efivar"
+[[ -s $efivars/efi-boot-next-${APPLE_GUID} && -s $efivars/efi-boot-next-data-${APPLE_GUID} ]] \
+  || fail "did not write Apple efi-boot-next* efivars"
+echo "ok - Intel Mini: reconstructed Boot0081 from saved macOS metadata, BootNext + Apple efi-boot-next"
+
+# Scenario B: persistent switch to macOS clears BootNext and Apple efi-boot-next*
+out=$("$t/sbo" macos) || fail "efi macos default: $out"
+[[ $out == "default: macOS" ]] || fail "efi macos output: $out"
+st=$("$t/sbo" status)
+grep -qx 'default: macOS' <<<"$st" || fail "efi default not macOS: $st"
+grep -qx 'next:    none' <<<"$st" || fail "efi next not cleared: $st"
+[[ ! -e $efivars/efi-boot-next-${APPLE_GUID} && ! -e $efivars/efi-boot-next-data-${APPLE_GUID} ]] \
+  || fail "Apple efi-boot-next* not cleared on persistent switch"
+grep -q '^....initial' "$efivars/efi-boot-device-${APPLE_GUID}" && fail "Apple efi-boot-device was not updated"
+echo "ok - Intel Mini: macos persistent updates BootOrder, clears BootNext & Apple next vars"
+
+# Scenario C: firmware recreated if missing from NVRAM, then set as default
+cat >"$efi_state" <<EOF
+{"current": "0000", "next": "0000", "order": ["0000"], "partuuid": "$PARTUUID",
+ "entries": [
+   {"id": "0000", "active": true, "label": "Mac OS X",
+    "rest": "PciRoot(0x0)/VenMedia(be74fcf7-0b7c-49f3-9147-01f4042e6842)/File(\\\\System\\\\Library\\\\CoreServices\\\\boot.efi)"}
+ ]}
+EOF
+out=$("$t/sbo" firmware) || fail "efi firmware recreate: $out"
+[[ $out == "default: SmartRoom Firmware" ]] || fail "efi firmware output: $out"
+st=$("$t/sbo" status)
+grep -qx 'default: SmartRoom Firmware' <<<"$st" || fail "efi recreated firmware not default: $st"
+grep -qx 'next:    none' <<<"$st" || fail "efi recreated firmware left BootNext: $st"
+echo "ok - Intel Mini: creates missing SmartRoom Firmware entry via efibootmgr --create"
+
+# Scenario D: auto-detects efibootmgr on x86_64 without SMARTROOM_BOOT_OS_BACKEND
+printf '#!/bin/bash\necho x86_64\n' >"$t/uname"; chmod +x "$t/uname"
+st=$(env -u SMARTROOM_BOOT_OS_BACKEND "$t/sbo" status)
+grep -qx 'default: SmartRoom Firmware' <<<"$st" || fail "x86_64 auto-detect status failed: $st"
+echo "ok - auto-detects efibootmgr on x86_64 without env override"
