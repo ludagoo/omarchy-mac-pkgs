@@ -184,6 +184,8 @@ make_keyring() {
   rm -rf "$keyring_dir"
   local -a keyrings=(archlinuxarm asahi-alarm)
   [[ ! -f $keyring_import_dir/omarchy.gpg ]] || keyrings+=(omarchy)
+  # A SmartRoom release image signs its own repository with this keyring.
+  [[ ! -f $keyring_import_dir/smartroom.gpg ]] || keyrings+=(smartroom)
   pacman-key --gpgdir "$keyring_dir" --init >>"$log_file" 2>&1 &&
     pacman-key --gpgdir "$keyring_dir" --populate-from "$keyring_import_dir" --populate "${keyrings[@]}" \
       >>"$log_file" 2>&1 || fail "could not create the package keyring"
