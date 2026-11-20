@@ -1,0 +1,37 @@
+# SmartRoom only: update a Studio to a new release as a watchdog-guarded
+# trial, keep it only if the room proves healthy, otherwise let aura boot the
+# previous release (smartroom-release/, design in the smartroom-rollback DESIGN.md).
+pkgname=smartroom-release
+pkgver=${SMARTROOM_MAC_PKGS_DATE:?set by smartroom/build-packages}
+pkgrel=1
+pkgdesc='Trial-boot update and automatic rollback for an Apple Silicon room Mac (aura-try)'
+arch=('any')
+url='https://github.com/ludagoo/omarchy-mac-pkgs'
+license=('MIT')
+makedepends=('git')
+depends=('python' 'btrfs-progs' 'zstd' 'gnupg' 'curl' 'systemd' 'iproute2' 'util-linux')
+checkdepends=('tar')
+_commit=${SMARTROOM_MAC_PKGS_COMMIT:?set by smartroom/build-packages}
+source=("omarchy-mac-pkgs::git+https://github.com/ludagoo/omarchy-mac-pkgs.git#commit=${_commit}")
+sha256sums=('SKIP')
+
+prepare() {
+  [[ $(git -C "$srcdir/omarchy-mac-pkgs" rev-parse HEAD) == "$_commit" ]]
+}
+
+check() {
+  "$srcdir/omarchy-mac-pkgs/smartroom-release/test/all"
+}
+
+package() {
+  local s="$srcdir/omarchy-mac-pkgs/smartroom-release"
+  install -Dm0755 "$s/bin/smartroom-release" "$pkgdir/usr/bin/smartroom-release"
+  install -Dm0644 "$s/share/release-carry.list" "$pkgdir/usr/share/smartroomos/release-carry.list"
+  install -Dm0644 "$s/systemd/smartroom-release-health.service" \
+    "$pkgdir/usr/lib/systemd/system/smartroom-release-health.service"
+  install -Dm0644 "$s/README.md" "$pkgdir/usr/share/doc/$pkgname/README.md"
+  install -Dm0644 "$srcdir/omarchy-mac-pkgs/LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -d "$pkgdir/usr/lib/systemd/system/sysinit.target.wants"
+  ln -s ../smartroom-release-health.service \
+    "$pkgdir/usr/lib/systemd/system/sysinit.target.wants/smartroom-release-health.service"
+}

@@ -1,0 +1,23 @@
+# Runs on every boot. On an ordinary boot it exits at once. On a trial boot
+# (the previous boot ended in an armed smartroom-release trial) it holds the
+# hardware watchdog, checks that the room is healthy, and either keeps the new
+# release (mark-good) or lets the room reboot onto the previous one.
+[Unit]
+Description=SmartRoom release trial: health check and rollback guard
+Documentation=file:///usr/share/doc/smartroom-release/README.md
+DefaultDependencies=no
+After=local-fs.target systemd-remount-fs.service
+RequiresMountsFor=/boot/efi
+Before=sysinit.target
+Conflicts=shutdown.target
+Before=shutdown.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/smartroom-release health-run
+Restart=no
+TimeoutStopSec=20
+KillMode=process
+
+[Install]
+WantedBy=sysinit.target
