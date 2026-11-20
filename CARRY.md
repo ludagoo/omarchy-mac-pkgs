@@ -12,11 +12,15 @@ main plus the hand-off of both t6021 encoders' firmware) and `linux-aurora`
 7.3 from `smartroom/pkgbuilds/linux-aurora` (ludagoo/linux
 `smartroom/edge-kernel-3`: the Aurora encoder stack of `ave/t6021-j475c` on
 aurora-silicon `integration/aurora`, J475c auxiliary DMA blocks left
-disabled, plus the J475c SMC sensor tree from `smc/j475c-sensors` and the
-apple-ave sysfs usage counter from `ave/usage-counter`, cherry-picked onto
-it). Each commit is named once, as `_commit`
-at the top of its PKGBUILD; the aura qualification record gets it from there.
-Both are signed into the SmartRoom repo in place of the channel packages.
+disabled, plus the J475c SMC sensor tree from `smc/j475c-sensors`, the
+apple-ave sysfs usage counter from `ave/usage-counter`, and the J475c
+`dcpext2`/`dcpext3` three-display device-tree wiring (`7.3.0.aurora0sredge4-1`,
+commit `7149d1ac27bf522f1996e9bac69d9daaac04b5ae`)). Each commit is named once,
+as `_commit` at the top of its PKGBUILD; the aura qualification record gets it
+from there. Both are signed into the SmartRoom repo in place of the channel
+packages. See [smartroom/docs/carried-packages.md](smartroom/docs/carried-packages.md)
+for the maintained build, re-sync, upstream PR tracking, and release-pinning
+process for every carried package.
 The kernel is not the omarchy-pkgs#3025 pin `4454eda`: cherry-picking the
 encoder commits onto that tip conflicted in the ave driver, so the package
 builds the ludagoo tree, which has those commits and, in its base, the
