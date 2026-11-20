@@ -1,0 +1,637 @@
+# Maintainer: Christian Heusel <gromit@archlinux.org>
+# Maintainer: Jonathan Grotelüschen <tippfehlr@archlinux.org>
+# Maintainer: DeepChirp <deepchirp@archlinux.org>
+# Contributor: Evangelos Foutras <foutrelis@archlinux.org>
+# Contributor: Pierre Schmitz <pierre@archlinux.de>
+# Contributor: Jan "heftig" Steffens <jan.steffens@gmail.com>
+# Contributor: Daniel J Griffiths <ghost1227@archlinux.us>
+# Contributor: Caleb Maclennan <caleb@alerque.com>
+
+# ALARM: Kevin Mihelich <kevin@archlinuxarm.org>
+#  - let build set march on AArch64
+#  - is_cfi=false, use_gold=false
+#  - clang_use_default_sample_profile=false, AFDO breaks distcc
+#  - disable vaapi, enable v4l2
+
+# SmartRoom (room browser, direct V4L2 decode and encode, no VA-API):
+#  - Arch Linux ARM chromium 157.0.8103.79-1 moved to 158.0.8127.36
+#  - dropped chromium-149-use-of-undeclared-identifier-ERROR.patch and
+#    chromium-157-crubit.patch (both already in 158)
+#  - dropped chromium-157-revert-gn-check-includes.patch: 158's own pinned
+#    gn (git_revision:938087829, gn 2603, linux-arm64 from CIPD) instead of
+#    Arch's older gn
+#  - crubit at 158's CRUBIT_REVISION
+#  - sr-0001..0007: the V4L2 decode fixes and GPU sandbox change prepared
+#    for upstream; sr-0008..0012: room-only encoder patches
+#  - udev rule for the Apple AVD/AVE codec names
+#  - use_thin_lto=false, concurrent_links=1: a ThinLTO link next to the
+#    compile does not fit the 32 GB build host, which also runs a room
+#  - SR_RUST_SYSROOT selects a rustup toolchain instead of pacman's rust;
+#    NINJAFLAGS limits the job count
+
+highmem=1
+buildarch=8
+
+pkgname=chromium-smartroom
+pkgver=158.0.8127.36
+pkgrel=1
+_launcher_ver=8
+_manual_clone=0
+_system_clang=1
+_crubit_rev=d757594f6f7ac27c0cf9c8ea63d9136f8e1f77ae
+_gn_rev=938087829fcbcc8fd87835ee301dd522c7637685
+pkgdesc="Chromium for SmartRoom rooms: Arch Linux ARM build with direct V4L2 video decode and encode"
+arch=('aarch64')
+url="https://www.chromium.org/Home"
+license=('BSD-3-Clause')
+provides=("chromium=$pkgver")
+conflicts=('chromium' 'omarchy-chromium-bin')
+install=chromium-v4l2.install
+depends=(
+  'alsa-lib'
+  'at-spi2-core'
+  'cairo'
+  'dbus'
+  'desktop-file-utils'
+  'expat'
+  'glib2'
+  'glibc'
+  'gtk3'
+  'hicolor-icon-theme'
+  'libcups'
+  'libffi'
+  'libgcc'
+  'libgcrypt'
+  'libpulse'
+  'libstdc++'
+  'libva'
+  'libx11'
+  'libxcb'
+  'libxcomposite'
+  'libxdamage'
+  'libxext'
+  'libxfixes'
+  'libxkbcommon'
+  'libxrandr'
+  'libxss'
+  'mesa'
+  'nspr'
+  'nss'
+  'pango'
+  'pciutils'
+  'systemd'
+  'systemd-libs'
+  'ttf-liberation'
+  'xdg-utils'
+  'zlib'
+)
+makedepends=(
+  'clang'
+  'compiler-rt'
+  'esbuild'
+  'git'
+  'go'
+  'gperf'
+  'java-runtime-headless'
+  'lld'
+  'ninja'
+  'nodejs'
+  'opus'
+  'pipewire'
+  'python'
+  'qt6-base'
+  'rust'
+  'rust-bindgen'
+  'rust-src'
+  'rustc-dev'
+  'typescript'
+  'vulkan-headers'
+)
+optdepends=('pipewire: WebRTC desktop sharing under Wayland'
+            'kdialog: support for native dialogs in Plasma'
+            'gtk4: for --gtk-version=4 (GTK4 IME might work better on Wayland)'
+            'qt6-base: Qt support'
+            'org.freedesktop.secrets: password storage backend on GNOME, KDE and Xfce'
+            'upower: Battery Status API support')
+options=('!lto') # Chromium adds its own flags for ThinLTO
+source=(https://commondatastorage.googleapis.com/chromium-browser-official/chromium-$pkgver-lite.tar.xz
+        "git+https://chromium.googlesource.com/external/github.com/google/crubit.git#commit=$_crubit_rev"
+        https://github.com/foutrelis/chromium-launcher/archive/v$_launcher_ver/chromium-launcher-$_launcher_ver.tar.gz
+        "gn-$_gn_rev-linux-arm64.zip::https://chrome-infra-packages.appspot.com/dl/gn/gn/linux-arm64/+/git_revision:$_gn_rev"
+        chromium-138-nodejs-version-check.patch
+        chromium-145-fix-SYS_SECCOMP.patch
+        chromium-147-rust-1.95-bytemuck.patch
+        chromium-147-simdutf-8.0-base-char.patch
+        chromium-150-revert-avx-flag-change.patch
+        chromium-152-unbundle-minizip-undo-unicode.patch
+        chromium-152-unbundle-opus-devtools.patch
+        chromium-153-hermetic-python.patch
+        chromium-153-iamf-tools-unbundled-opus.patch
+        chromium-155-use-system-esbuild.patch
+        chromium-156-isolatedDeclarations.patch
+        chromium-157-typescript.patch
+        chromium-158-bidi-protocol-import.patch
+        compiler-rt-adjust-paths.patch
+        increase-fortify-level.patch
+        enable-widevine-arm64.patch
+        use-oauth2-client-switches-as-default.patch
+        glibc-2.42-baud-rate-fix.patch
+        0001-Run-blink-bindings-generation-single-threaded.patch
+        0002-Fix-distcc.patch
+        sr-0001-media-gpu-v4l2-Give-single-buffer-P010-a-second-colo.patch
+        sr-0002-media-gpu-v4l2-Size-the-stateless-coded-format-befor.patch
+        sr-0003-media-gpu-v4l2-Support-slice-based-stateless-H.264-d.patch
+        sr-0004-media-gpu-v4l2-Submit-only-reference-pictures-in-a-s.patch
+        sr-0005-media-gpu-v4l2-Decode-multi-slice-H.264-pictures-on-.patch
+        sr-0006-media-gpu-v4l2-Send-HEVC-slice-parameters-to-statele.patch
+        sr-0007-content-gpu-Allow-V4L2-codec-nodes-in-the-desktop-Li.patch
+        sr-0008-room-Build-the-V4L2-encoder-on-desktop-Linux.patch
+        sr-0009-room-Default-AcceleratedVideoDecoder-on-for-V4L2-onl.patch
+        sr-0010-room-Spread-V4L2-encoder-sessions-across-encoder-nod.patch
+        sr-0011-room-Encode-HEVC-with-the-V4L2-stateful-encoder-on-L.patch
+        sr-0012-room-Feed-the-desktop-Linux-V4L2-encoder-CPU-NV12-fr.patch
+        sr-0013-room-Derive-HEVC-chroma-offsets-in-the-V4L2-slice-pa.patch
+        chromium-v4l2.rules)
+noextract=("gn-$_gn_rev-linux-arm64.zip")
+sha256sums=('8a93030a68231ea046479c47d6b26dfae43becef1b5343cf95f8146109291d6d'
+            'fa10e66c8078c2e02cf7e1df0810b7c7d77b89592cc27fca7a756cc4a5ba06cb'
+            '213e50f48b67feb4441078d50b0fd431df34323be15be97c55302d3fdac4483a'
+            '0a23741570936915edec2994d05ed9f4302e4609f3aba6975b1d97ebf54faccb'
+            '11a96ffa21448ec4c63dd5c8d6795a1998d8e5cd5a689d91aea4d2bdd13fb06e'
+            '4fc040a0656a0a524dd8ad090cd129fc5b6cb21adcc66be82080165789e8c13e'
+            'b9e6339221efe03540ffb360c161d93604a1fc93a5a1c53e5e9849066f987d05'
+            '80e445d7a5cbd61d1252ecf46c5eaf0fb4a5e63bd1b9c976261df778a4586640'
+            '5f6ccb7b945c8a13c690493723bad816b36f2f25792d47e677b56f8200907e60'
+            '890e5d98088ef1c7c075a551442f03385d1db266cad8a65576704a22720683f9'
+            '3276453f2ce655b6286476f48d4df837be952d9447afa46583f79ec71f2288c3'
+            'ebf74154266d0b6d6cc957c413f845052c5fcfce7745befb8821595cdf3f7d49'
+            '2ab9fbe653829ce692f83ee780aad07e8c83a6686e51ab9459ad736cfa2850ee'
+            'ded2abcb912ac4b6ad139e56384eea8f3b470cf57ecb0baa2c2d042df7575a23'
+            'f6aefbd3f70dbda9242cf815a1dca56af729632166bc57e5067755b119cc95de'
+            '655a43eaff824ba27f359790c31c43abd9fc4234026b0d039b8f2633dcb057cb'
+            'b56d509b4b2346cd5dce21899fabd22936449833e2e497ac6d3f007214856dae'
+            'ec8e49b7114e2fa2d359155c9ef722ff1ba5fe2c518fa48e30863d71d3b82863'
+            'd634d2ce1fc63da7ac41f432b1e84c59b7cceabf19d510848a7cff40c8025342'
+            '5ee4bb69379ac0cea7946c9f8f4ca9e20e0a9e4ee2ee9121eb0ebbb94dd7e928'
+            '9343afa1a4308a7cfb3317229f5aff7778688debcc03c4a74a85908aa1d0cc3a'
+            '1c1898f263eaacbc069a8e1a3e732852350350d1dad4cb1a6bba430e3b796cd0'
+            '113aeca23adc6641249cf3c601f89c2094b11d6e857574b8aac72e08e0f2653b'
+            'e853af57bd7e8e0ae91b1a6f963c21ca1a8e1e2eb8df9bf348b1fca12b5310c3'
+            '1303e8ee392f8fc93e617631be1d533daff472ecd4d9f02b5f2090269e5ed854'
+            '18bf64e575bfb17ee3cc74cd87b8f65019562c0f8468b2bdf079830b634ff310'
+            'cff9aa2d6b963512587e343fc7a7d51df589d57805b880b3c17e5dbdf4b1aa1b'
+            '19a579edaab1118cc5bce54a9dd5772f971addd3d63fbb86b694637ef5b9c256'
+            'b9ddabc26b61bb05793a3a022a6ff2f75827372e33263b87240e055a77c67231'
+            'af5199172976b543a834833ce21dac655c95033b5795e1839d2855b49089f696'
+            'ab884b338944e94b18b3eec8da2bc1a2e1edd488ba3cb47d8ffc3caf124b8f36'
+            '23f64deebd832a9e457b0e634e3e692ab09066bed730dd88d2d00b3487da1a4a'
+            '3812a544e4cd29e1c89c143f65aaaf5635ddd911c9534bd2f8670b77b112ec6d'
+            'ccd212688d23027f092f5818c3fc14d13b345ce29f865d1ed5adf861439e3903'
+            '3e23e9b3f452f6a95217d4ea8ee8083115bfd88e5c67edc1c81aea4174a0a8e1'
+            'decd3f7e90880fd2bcda64bc7545885a672fa1cd922cc7b45c2e3c4d7febcea1'
+            '374e48755fb0516cd704e8b8035806d17d2056d6e9b02a8b455601f72ec93dfe'
+            '6f804802f4ef24af2e1cf198854cc87560b4fb2085a869b288a4382a6fae865a')
+
+if (( _manual_clone )); then
+  source[0]=fetch-chromium-release
+  sha256sums[0]='2e2f36e3cd1ebc4ad57fd310774a5e5e9db77883d5f9374fedeaabd3c103b819'
+  makedepends+=('python-httplib2' 'python-pyparsing' 'npm' 'rsync')
+fi
+
+# Possible replacements are listed in build/linux/unbundle/replace_gn_files.py
+# Keys are the names in the above script; values are the dependencies in Arch
+declare -gA _system_libs=(
+  [brotli]=brotli
+  [dav1d]=dav1d
+  [double-conversion]=double-conversion
+  #[ffmpeg]=ffmpeg    # YouTube playback stopped working in Chromium 120
+  [flac]=flac
+  [fontconfig]=fontconfig
+  [freetype]=freetype2
+  [harfbuzz]=harfbuzz
+  [highway]=highway
+  #[icu]=icu
+  #[jsoncpp]=jsoncpp  # needs libstdc++
+  #[libaom]=aom
+  #[libavif]=libavif  # needs -DAVIF_ENABLE_EXPERIMENTAL_GAIN_MAP=ON
+  [libdrm]=libdrm
+  [libjpeg]=libjpeg-turbo
+  # [libpng]=libpng
+  #[libvpx]=libvpx
+  [libwebp]=libwebp
+  [libxml]=libxml2
+  # https://gitlab.archlinux.org/archlinux/packaging/packages/libxslt/-/merge_requests/1
+  # unbundle again once the above MR is merged
+  #[libxslt]=libxslt
+  [openh264]=openh264
+  [opus]=opus
+  #[re2]=re2          # needs libstdc++
+  [simdutf]=simdutf
+  #[snappy]=snappy    # needs libstdc++
+  #[woff2]=woff2      # needs libstdc++
+  [zlib]=minizip
+  [zstd]=zstd
+)
+_unwanted_bundled_libs=(
+  $(printf "%s\n" ${!_system_libs[@]} | sed 's/^libjpeg$/&_turbo/')
+)
+depends+=(${_system_libs[@]})
+
+# Google API keys (see https://www.chromium.org/developers/how-tos/api-keys)
+# Note: These are for Arch Linux use ONLY. For your own distribution, please
+# get your own set of keys.
+#
+# Starting with Chromium 89 (2021-03-02) the OAuth2 credentials have been left
+# out: https://archlinux.org/news/chromium-losing-sync-support-in-early-march/
+#  - Arch Linux ARM has obtained permission to use the Arch Linux keys.
+_google_api_key=AIzaSyDwr302FpOSkGRpLlUpPThNTDPbXcIn_FM
+
+prepare() {
+  # rustup install nightly
+
+  if (( _manual_clone )); then
+    ./fetch-chromium-release $pkgver
+  fi
+  cd chromium-$pkgver
+
+  # Allow building against system libraries in official builds
+  sed -i 's/OFFICIAL_BUILD/GOOGLE_CHROME_BUILD/' \
+    tools/generate_shim_headers/generate_shim_headers.py
+
+  # Arch Linux ARM fixes
+  patch -p1 -i ../0001-Run-blink-bindings-generation-single-threaded.patch
+  patch -p1 -i ../0002-Fix-distcc.patch
+  export ALARM_NINJA_JOBS="16"
+  export MAKEFLAGS="-j16"
+
+  # The bundled gn is x86-64. Use 158's pinned gn for linux-arm64.
+  rm buildtools/linux64/gn
+  bsdtar -xf "../gn-$_gn_rev-linux-arm64.zip" -C buildtools/linux64 gn
+  chmod 755 buildtools/linux64/gn
+
+  # https://crbug.com/893950
+  sed -i -e 's/\<xmlMalloc\>/malloc/' -e 's/\<xmlFree\>/free/' \
+         -e '1i #include <cstdlib>' \
+    third_party/blink/renderer/core/xml/*.cc \
+    third_party/blink/renderer/core/xml/parser/xml_document_parser.cc \
+    third_party/libxml/chromium/*.cc
+
+  # Use the --oauth2-client-id= and --oauth2-client-secret= switches for
+  # setting GOOGLE_DEFAULT_CLIENT_ID and GOOGLE_DEFAULT_CLIENT_SECRET at
+  # runtime -- this allows signing into Chromium without baked-in values
+  patch -Np1 -i ../use-oauth2-client-switches-as-default.patch
+
+  # Upstream fixes
+
+  # Fixes from Gentoo
+  patch -Np1 -i ../chromium-138-nodejs-version-check.patch
+
+  # Allow libclang_rt.builtins from compiler-rt >= 16 to be used, but only
+  # where compiler-rt has the old lib/linux layout; with the per-target
+  # layout (lib/aarch64-unknown-linux-gnu) Chromium's own paths are right.
+  if compgen -G "/usr/lib/clang/*/lib/linux/libclang_rt.builtins-*.a" >/dev/null; then
+    patch -Np1 -i ../compiler-rt-adjust-paths.patch
+  fi
+
+  # Increase _FORTIFY_SOURCE level to match Arch's default flags
+  patch -Np1 -i ../increase-fortify-level.patch
+
+  # https://crbug.com/456218403
+  patch -Np1 -i ../chromium-145-fix-SYS_SECCOMP.patch
+
+  patch -Np1 -i ../chromium-147-rust-1.95-bytemuck.patch
+
+  # enable widevine for arm64
+  patch -Np1 -i ../enable-widevine-arm64.patch
+
+  # https://crbug.com/456677057
+  patch -Np1 -i ../glibc-2.42-baud-rate-fix.patch
+
+  # Fix issue about missing AVX functions
+  # Credit: https://github.com/ungoogled-software/ungoogled-chromium/pull/3837
+  patch -Np1 -i ../chromium-150-revert-avx-flag-change.patch
+
+  # To unbundle simdutf
+  patch -Np1 -i ../chromium-147-simdutf-8.0-base-char.patch
+
+  patch -Np1 -i ../chromium-152-unbundle-minizip-undo-unicode.patch
+
+  patch -Np1 -i ../chromium-152-unbundle-opus-devtools.patch
+
+  # Use system python3 instead of the hermetic cpython3 interpreter
+  # https://github.com/ungoogled-software/ungoogled-chromium/pull/3946
+  patch -Np1 -i ../chromium-153-hermetic-python.patch
+
+  # third_party/iamf_tools includes vendored Opus via relative "include/opus.h"
+  # paths that only resolve against a real bundled Opus checkout; fix them up
+  # for the unbundled system Opus build
+  patch -Np1 -i ../chromium-153-iamf-tools-unbundled-opus.patch
+
+  patch -Np1 -i ../chromium-155-use-system-esbuild.patch
+
+  patch -Np1 -i ../chromium-156-isolatedDeclarations.patch
+
+  # Work around TypeScript becoming a build dependency: disable tsgo for the
+  # WebUI and point devtools at the system tsc binary
+  # https://github.com/ungoogled-software/ungoogled-chromium/pull/3966
+  patch -Np1 -i ../chromium-157-typescript.patch
+  # chromium-bidi 158 uses Protocol without importing it; system tsc rejects that
+  patch -Np1 -i ../chromium-158-bidi-protocol-import.patch
+
+  # SmartRoom: V4L2 decode fixes, GPU sandbox, room encoder patches
+  local _p
+  for _p in ../sr-*.patch; do
+    patch -Np1 -i "$_p"
+  done
+
+  # The unbundled brotli doesn't provide brotli:headers
+  sed -i '/brotli:headers/ d' third_party/pdfium/core/fxcodec/BUILD.gn
+
+  # Link to system tools required by the build
+  mkdir -p third_party/node/linux/node-linux-x64/bin \
+           third_party/jdk/current/bin \
+           third_party/rust-toolchain/bin \
+           third_party/dawn/tools/golang/linux-arm64/bin \
+           third_party/rust-toolchain/crubit/lib/third_party/
+
+  ln -s /usr/bin/node third_party/node/linux/node-linux-x64/bin/
+  ln -s /usr/bin/java third_party/jdk/current/bin/
+  if (( !_manual_clone )); then
+    ln -s /usr/bin/rustc third_party/rust-toolchain/bin/
+    ln -s /usr/bin/go third_party/dawn/tools/golang/linux-arm64/bin/
+    ln -s "$srcdir/crubit" third_party/rust-toolchain/crubit/lib/third_party/crubit
+  fi
+
+  # remove x86_64 binary and use our own
+  rm -f third_party/gperf/cipd/bin/gperf
+  ln -s /usr/bin/gperf third_party/gperf/cipd/bin/
+
+  rm -rf third_party/devtools-frontend/src/node_modules/esbuild/
+  ln -s /usr/lib/node_modules/esbuild/ third_party/devtools-frontend/src/node_modules/esbuild
+
+  if (( !_system_clang )); then
+    # Use prebuilt rust as system rust cannot be used due to the error:
+    #   error: the option `Z` is only accepted on the nightly compiler
+    ./tools/rust/update_rust.py
+
+    # To link to rust libraries we need to compile with prebuilt clang
+    ./tools/clang/scripts/update.py
+  fi
+
+  # Remove bundled libraries for which we will use the system copies; this
+  # *should* do what the remove_bundled_libraries.py script does, with the
+  # added benefit of not having to list all the remaining libraries
+  local _lib
+  for _lib in ${_unwanted_bundled_libs[@]}; do
+    # Most bundled libraries live under `third_party/<lib>`, but
+    # `double-conversion` is located under `base/third_party/double_conversion`
+    local _dir="third_party/$_lib"
+    if [[ ! -d "${_dir}" ]]; then
+      _dir="base/third_party/${_lib//-/_}"
+    fi
+
+    find "$_dir" -type f \
+      \! -path "$_dir/chromium/*" \
+      \! -path "$_dir/google/*" \
+      \! -path "third_party/harfbuzz-ng/utils/hb_scoped.h" \
+      \! -regex '.*\.\(gn\|gni\|isolate\)' \
+      -delete
+  done
+
+  ./build/linux/unbundle/replace_gn_files.py \
+    --system-libraries "${!_system_libs[@]}"
+
+  # Generate missing header
+  if (( _manual_clone )); then
+    python3 build/util/lastchange.py -m DAWN_COMMIT_HASH \
+      -s third_party/dawn --revision gpu/webgpu/DAWN_VERSION \
+      --header gpu/webgpu/dawn_commit_hash.h
+  fi
+
+  cd ../crubit
+  cargo fetch --locked --target host-tuple
+}
+
+build() {
+  make -C chromium-launcher-$_launcher_ver
+
+  cd chromium-$pkgver
+
+  if (( _system_clang )); then
+    export CC=clang
+    export CXX=clang++
+    export AR=ar
+    export NM=nm
+  else
+    local _clang_path="$PWD/third_party/llvm-build/Release+Asserts/bin"
+    export CC=$_clang_path/clang
+    export CXX=$_clang_path/clang++
+    export AR=$_clang_path/llvm-ar
+    export NM=$_clang_path/llvm-nm
+  fi
+
+  # /usr for pacman managed rust; SR_RUST_SYSROOT for a rustup toolchain
+  local _rust_sysroot="${SR_RUST_SYSROOT:-/usr}"
+
+  local _flags=(
+    'custom_toolchain="//build/toolchain/linux/unbundle:default"'
+    'host_toolchain="//build/toolchain/linux/unbundle:default"'
+    'clang_use_default_sample_profile=false'
+    'is_official_build=true' # implies is_cfi=true on x86_64
+    'symbol_level=0' # sufficient for backtraces on x86(_64)
+    'is_cfi=false'
+    'treat_warnings_as_errors=false'
+    'fatal_linker_warnings=false'
+    'disable_fieldtrial_testing_config=true'
+    'blink_enable_generated_code_formatting=false'
+    'ffmpeg_branding="Chrome"'
+    'proprietary_codecs=true'
+    'rtc_use_pipewire=true'
+    'link_pulseaudio=true'
+    'use_custom_libcxx=true' # https://github.com/llvm/llvm-project/issues/61705
+    'use_gold=false'
+    'use_sysroot=false'
+    'use_system_libffi=true'
+    'enable_hangout_services_extension=true'
+    'enable_widevine=true'
+    'use_vaapi=false'
+    'use_v4l2_codec=true'
+    'use_av1_hw_decoder=true'
+    'use_qt5=false'
+    'use_qt6=true'
+    'moc_qt6_path="/usr/lib/qt6"'
+    "google_api_key=\"$_google_api_key\""
+    'use_clang_modules=false'
+    'rust_crubit_root="//third_party/rust-toolchain/crubit/"'
+    'use_thin_lto=false'
+    'concurrent_links=1'
+    # rustc's libstd uses these for backtraces; Chromium's list omits them
+    'added_rust_stdlib_libs=["addr2line","adler2","gimli","miniz_oxide"]'
+  )
+
+  if [[ -n ${_system_libs[icu]+set} ]]; then
+    _flags+=('icu_use_data_file=false')
+  fi
+
+  if (( _system_clang )); then
+     local _clang_version=$(
+       clang --version | grep -m1 version | sed 's/.* \([0-9]\+\).*/\1/')
+     local _site_packages=$(python -c "import site; print(site.getsitepackages()[0])")
+
+    _flags+=(
+      'clang_base_path="/usr"'
+      'clang_use_chrome_plugins=false'
+      "clang_version=\"$_clang_version\""
+      'chrome_pgo_phase=0' # needs newer clang to read the bundled PGO profile
+      'v8_metagen_libclang_so="/usr/lib/libclang.so"'
+      "v8_metagen_libclang_bindings_dir=\"$_site_packages\""
+    )
+
+    # Allow the use of nightly features with stable Rust compiler
+    # https://github.com/ungoogled-software/ungoogled-chromium/pull/2696#issuecomment-1918173198
+    export RUSTC_BOOTSTRAP=1
+
+    _flags+=(
+      "rust_sysroot_absolute=\"$_rust_sysroot\""
+      'rust_bindgen_root="/usr"'
+      "rustc_version=\"$(rustc --version | awk '{ print $2 ;}')\""
+    )
+  fi
+
+  # Facilitate deterministic builds (taken from build/config/compiler/BUILD.gn)
+  CFLAGS+='   -Wno-builtin-macro-redefined'
+  CXXFLAGS+=' -Wno-builtin-macro-redefined'
+  CPPFLAGS+=' -D__DATE__=  -D__TIME__=  -D__TIMESTAMP__='
+
+  # Do not warn about unknown warning options
+  CFLAGS+='   -Wno-unknown-warning-option'
+  CXXFLAGS+=' -Wno-unknown-warning-option'
+
+  # Let Chromium set its own symbol level
+  CFLAGS=${CFLAGS/-g }
+  CXXFLAGS=${CXXFLAGS/-g }
+
+  # https://github.com/ungoogled-software/ungoogled-chromium-archlinux/issues/123
+  CFLAGS=${CFLAGS/-fexceptions}
+  CFLAGS=${CFLAGS/-fcf-protection}
+  CXXFLAGS=${CXXFLAGS/-fexceptions}
+  CXXFLAGS=${CXXFLAGS/-fcf-protection}
+
+  # This appears to cause random segfaults when combined with ThinLTO
+  # https://bugs.archlinux.org/task/73518
+  CFLAGS=${CFLAGS/-fstack-clash-protection}
+  CXXFLAGS=${CXXFLAGS/-fstack-clash-protection}
+
+  # https://crbug.com/957519#c122
+  CXXFLAGS=${CXXFLAGS/-Wp,-D_GLIBCXX_ASSERTIONS}
+
+  if [[ $CARCH == aarch64 ]] || [[ $CARCH == riscv64 ]]; then
+    # On aarch64 and riscv64, certain files (e.g. in libvpx and libyuv) needs to
+    # be compiled with additional arch features (e.g. dotprod, sve, sme, rvv)
+    # Having an arch setting in the C(XX)FLAGS overrides those
+    # and causes compilation failure
+    CFLAGS="${CFLAGS/-march=*([^ ]) }"
+    CXXFLAGS="${CXXFLAGS/-march=*([^ ]) }"
+  fi
+
+  (
+    cd ../crubit
+    _rustc_libs="$_rust_sysroot/lib/rustlib/$(rustc --print host-tuple)/lib"
+    export CARGO_TARGET_DIR=target
+    export RUSTC_BOOTSTRAP=1
+    # A rustup toolchain keeps libLLVM in $_rust_sysroot/lib.
+    export RUSTFLAGS+=" -Clink-args=-Wl,-z,origin -Clink-args=-Wl,-rpath,$_rustc_libs -Clink-args=-Wl,-rpath,$_rust_sysroot/lib"
+    cargo build --frozen --release -p cc_bindings_from_rs --bin cc_bindings_from_rs
+    install -Dm755 -t ../chromium-$pkgver/third_party/rust-toolchain/crubit/bin/ target/release/cc_bindings_from_rs
+  )
+  buildtools/linux64/gn gen out/Release --args="${_flags[*]}"
+  ninja ${NINJAFLAGS:-} -C out/Release chrome chrome_sandbox chromedriver.unstripped
+}
+
+package() {
+  cd chromium-launcher-$_launcher_ver
+  make PREFIX=/usr DESTDIR="$pkgdir" install
+  install -Dvm644 LICENSE \
+    "$pkgdir/usr/share/licenses/chromium/LICENSE.launcher"
+
+  cd ../chromium-$pkgver
+
+  install -Dv out/Release/chrome "$pkgdir/usr/lib/chromium/chromium"
+  install -Dv out/Release/chromedriver.unstripped "$pkgdir/usr/bin/chromedriver"
+  install -Dvm4755 out/Release/chrome_sandbox "$pkgdir/usr/lib/chromium/chrome-sandbox"
+
+  install -Dvm644 chrome/installer/linux/common/desktop.template \
+    "$pkgdir/usr/share/applications/chromium.desktop"
+  install -Dvm644 chrome/app/resources/manpage.1.in \
+    "$pkgdir/usr/share/man/man1/chromium.1"
+  sed -i \
+    -e 's/@@MENUNAME/Chromium/g' \
+    -e 's/@@PACKAGE/chromium/g' \
+    -e 's/@@desktop_exec/chromium/g' \
+    -e 's/@@desktop_icon/chromium/g' \
+    -e 's/@@startup_wm_class/chromium/g' \
+    -e 's|@@uri_scheme|x-scheme-handler/chromium;|g' \
+    -e 's/@@extra_desktop_entries//g' \
+    "$pkgdir/usr/share/applications/chromium.desktop" \
+    "$pkgdir/usr/share/man/man1/chromium.1"
+
+  # Fill in common Chrome/Chromium AppData template with Chromium info
+  (
+    tmpl_file=chrome/installer/linux/common/appdata.xml.template
+    info_file=chrome/installer/linux/common/chromium-browser.info
+    . $info_file; PACKAGE=chromium
+    export $(grep -o '^[A-Z_]*' $info_file)
+    sed -E -e 's/@@([A-Z_]*)/\${\1}/g' -e '/<update_contact>/d' $tmpl_file | envsubst
+  ) \
+  | install -Dvm644 /dev/stdin "$pkgdir/usr/share/metainfo/chromium.appdata.xml"
+
+  local toplevel_files=(
+    chrome_100_percent.pak
+    chrome_200_percent.pak
+    chrome_crashpad_handler
+    libqt6_shim.so
+    resources.pak
+    v8_context_snapshot.bin
+
+    # ANGLE
+    libEGL.so
+    libGLESv2.so
+
+    # SwiftShader ICD
+    libvk_swiftshader.so
+    libvulkan.so.1
+    vk_swiftshader_icd.json
+  )
+
+  if [[ -z ${_system_libs[icu]+set} ]]; then
+    toplevel_files+=(icudtl.dat)
+  fi
+
+  cp "${toplevel_files[@]/#/out/Release/}" "$pkgdir/usr/lib/chromium/"
+  install -Dvm644 -t "$pkgdir/usr/lib/chromium/locales" out/Release/locales/*.pak
+
+  for size in 24 48 64 128 256; do
+    install -Dvm644 "chrome/app/theme/chromium/product_logo_$size.png" \
+      "$pkgdir/usr/share/icons/hicolor/${size}x${size}/apps/chromium.png"
+  done
+
+  for size in 16 32; do
+    install -Dvm644 "chrome/app/theme/default_100_percent/chromium/product_logo_$size.png" \
+      "$pkgdir/usr/share/icons/hicolor/${size}x${size}/apps/chromium.png"
+  done
+
+  # chromium uses the icon name "chromium-browser" internally
+  # https://github.com/chromium/chromium/blob/160.0.8155.1/chrome/browser/shell_integration_linux.cc#L604
+  for size in 16 24 32 48 64 128 256; do
+    ln -sv chromium.png \
+      "$pkgdir/usr/share/icons/hicolor/${size}x${size}/apps/chromium-browser.png"
+  done
+
+  # Codec device names for the Apple AVD decoder and AVE encoders
+  install -Dvm644 "$srcdir/chromium-v4l2.rules" \
+    "$pkgdir/usr/lib/udev/rules.d/70-chromium-v4l2.rules"
+
+  install -Dvm644 LICENSE "$pkgdir/usr/share/licenses/chromium/LICENSE"
+}
+
+# vim:set ts=2 sw=2 et:

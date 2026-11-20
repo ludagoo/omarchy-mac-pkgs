@@ -1,0 +1,669 @@
+From 376ba3be4b5068f84d7a9e77d3eefae9fb8ae22a Mon Sep 17 00:00:00 2001
+From: Lucas Goossen <lucas.goossen@hey.com>
+Date: Wed, 18 Nov 2026 18:17:43 -0300
+Subject: [PATCH 05/12] media/gpu/v4l2: Decode multi-slice H.264 pictures on
+ slice-based devices
+
+A slice-based stateless decoder takes one slice per media request. The
+V4L2 stateless API decodes a picture made of several slices by sending
+each slice in its own request and setting
+V4L2_BUF_FLAG_M2M_HOLD_CAPTURE_BUF on every bitstream buffer but the
+last, so all slices write the same CAPTURE buffer. Chromium does not
+use that flag, so after the previous change a multi-slice picture on a
+slice-based device fails. Encoders produce such pictures when asked
+for several slices or a maximum slice size (x264 --slices,
+--slice-max-size), which real-time senders use.
+
+For a slice-based device the delegate now keeps every slice of the
+picture (bytes, slice parameters, prediction weights). At SubmitDecode:
+- one slice: the single-request path is used, as before;
+- several slices: each slice except the last is queued by
+  V4L2DecodeSurfaceHandler::SubmitHeldSlice() on its own request with
+  SPS, PPS, scaling matrix, decode parameters and its slice
+  parameters, and with HOLD_CAPTURE_BUF set. The CAPTURE buffer is
+  queued with the first slice only. The last slice goes on the
+  picture's own request, which releases the CAPTURE buffer.
+
+SubmitHeldSlice() waits until the driver returns the held bitstream
+buffer, so the next slice can reuse one; the CAPTURE buffer stays
+queued. The order of the queue calls follows libva-v4l2-request.
+
+Whether the OUTPUT queue supports the flag is read with
+VIDIOC_CREATE_BUFS(count = 0) after S_FMT, because a driver may only
+advertise V4L2_BUF_CAP_SUPPORTS_M2M_HOLD_CAPTURE_BUF for the selected
+coded format. If it does not, a multi-slice picture fails as before.
+Frame-based devices and single-slice pictures do not change.
+
+Bug: None
+Test: media_unittests --gtest_filter=V4L2H264SliceTest.*
+Test: H.264 High 1080p clips with 4 slices and with 6 to 29 slices
+      per picture (x264) on Apple AVD (Linux arm64): every picture
+      decodes on V4L2VideoDecoder; before, multi-slice pictures were
+      rejected and playback fell back to software
+Assisted-by: Claude:claude-opus-5-5
+---
+ media/gpu/v4l2/v4l2_decode_surface.cc         |  36 +++--
+ media/gpu/v4l2/v4l2_decode_surface.h          |   9 ++
+ media/gpu/v4l2/v4l2_decode_surface_handler.h  |  15 ++
+ media/gpu/v4l2/v4l2_h264_slice.cc             |   6 +
+ media/gpu/v4l2/v4l2_h264_slice.h              |   7 +
+ media/gpu/v4l2/v4l2_h264_slice_unittest.cc    |   7 +
+ media/gpu/v4l2/v4l2_queue.cc                  |  14 ++
+ media/gpu/v4l2/v4l2_queue.h                   |   9 ++
+ .../v4l2_video_decoder_backend_stateless.cc   | 116 ++++++++++++++
+ .../v4l2_video_decoder_backend_stateless.h    |  10 ++
+ .../v4l2/v4l2_video_decoder_delegate_h264.cc  | 143 ++++++++++++++++--
+ 11 files changed, 349 insertions(+), 23 deletions(-)
+
+diff --git a/media/gpu/v4l2/v4l2_decode_surface.cc b/media/gpu/v4l2/v4l2_decode_surface.cc
+index ec89918..503349d 100644
+--- a/media/gpu/v4l2/v4l2_decode_surface.cc
++++ b/media/gpu/v4l2/v4l2_decode_surface.cc
+@@ -73,6 +73,25 @@ void V4L2DecodeSurface::SetReferenceSurfaces(
+   reference_surfaces_ = std::move(ref_surfaces);
+ }
+ 
++bool V4L2DecodeSurface::QueueCaptureBuffer() {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  DCHECK(!capture_queued_);
++
++  bool result = false;
++  switch (output_buffer_.Memory()) {
++    case V4L2_MEMORY_MMAP:
++      result = std::move(output_buffer_).QueueMMap();
++      break;
++    case V4L2_MEMORY_DMABUF:
++      result = std::move(output_buffer_).QueueDMABuf(frame_);
++      break;
++    default:
++      NOTREACHED() << "We should only use MMAP or DMABUF.";
++  }
++  capture_queued_ = result;
++  return result;
++}
++
+ void V4L2DecodeSurface::SetReleaseCallback(base::OnceClosure release_cb) {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+   DCHECK(!release_cb_);
+@@ -131,21 +150,12 @@ bool V4L2RequestDecodeSurface::Submit() {
+     return false;
+   }
+ 
+-  bool result = false;
+-  switch (output_buffer().Memory()) {
+-    case V4L2_MEMORY_MMAP:
+-      result = std::move(output_buffer()).QueueMMap();
+-      break;
+-    case V4L2_MEMORY_DMABUF:
+-      result = std::move(output_buffer()).QueueDMABuf(frame());
+-      break;
+-    default:
+-      NOTREACHED() << "We should only use MMAP or DMABUF.";
++  // A multi-slice picture queues the CAPTURE buffer with its first slice.
++  // Queuing it again makes the driver reject the buffer.
++  if (!capture_queued() && !QueueCaptureBuffer()) {
++    return false;
+   }
+ 
+-  if (!result)
+-    return result;
+-
+   return std::move(request_ref_).Submit().has_value();
+ }
+ 
+diff --git a/media/gpu/v4l2/v4l2_decode_surface.h b/media/gpu/v4l2/v4l2_decode_surface.h
+index 761a7da..0bc97e6 100644
+--- a/media/gpu/v4l2/v4l2_decode_surface.h
++++ b/media/gpu/v4l2/v4l2_decode_surface.h
+@@ -66,6 +66,11 @@ class V4L2DecodeSurface : public base::RefCounted<V4L2DecodeSurface> {
+   // surface.
+   virtual bool Submit() = 0;
+ 
++  // Queue the CAPTURE buffer once. A picture made of several slices queues it
++  // with the first slice, and Submit() must not queue it again.
++  bool QueueCaptureBuffer();
++  bool capture_queued() const { return capture_queued_; }
++
+   bool decoded() const { return decoded_; }
+   V4L2WritableBufferRef& input_buffer() {
+     return input_buffer_;
+@@ -112,6 +117,10 @@ class V4L2DecodeSurface : public base::RefCounted<V4L2DecodeSurface> {
+   // secure world. Used to resolve to the corresponding FD that references the
+   // secure world memory (V4L2 will resolve that fd back to this same value).
+   uint64_t secure_handle_ = 0;
++
++  // True once the CAPTURE buffer has been queued. Later slices of the same
++  // picture reuse it via V4L2_BUF_FLAG_M2M_HOLD_CAPTURE_BUF.
++  bool capture_queued_ = false;
+ };
+ 
+ // An implementation of V4L2DecodeSurface that uses requests to associate
+diff --git a/media/gpu/v4l2/v4l2_decode_surface_handler.h b/media/gpu/v4l2/v4l2_decode_surface_handler.h
+index 3529769..a5dd143 100644
+--- a/media/gpu/v4l2/v4l2_decode_surface_handler.h
++++ b/media/gpu/v4l2/v4l2_decode_surface_handler.h
+@@ -40,6 +40,21 @@ class V4L2DecodeSurfaceHandler
+   // Decode the surface |dec_surface|.
+   virtual void DecodeSurface(scoped_refptr<V4L2DecodeSurface> dec_surface) = 0;
+ 
++  // Queue one slice of a picture on its own media request, with
++  // V4L2_BUF_FLAG_M2M_HOLD_CAPTURE_BUF. |queue_capture| is true only for the
++  // first slice: that is the only time the picture's CAPTURE buffer is queued.
++  // |ctrls| is applied to this slice's request. The bitstream buffer is waited
++  // on and reclaimed before this returns, so the next slice can reuse one.
++  // The last slice of the picture does not come through here. The default
++  // fails so a backend that is not stateless does not pretend to support it.
++  virtual bool SubmitHeldSlice(V4L2DecodeSurface* dec_surface,
++                               const uint8_t* data,
++                               size_t size,
++                               bool queue_capture,
++                               struct v4l2_ext_controls* ctrls) {
++    return false;
++  }
++
+   // Resumes decoding if stalled due to a kTryAgain state, this only occurs
+   // with CENCV1 H264 and VP9 superframe encrypted content.
+   virtual void ResumeDecoding() = 0;
+diff --git a/media/gpu/v4l2/v4l2_h264_slice.cc b/media/gpu/v4l2/v4l2_h264_slice.cc
+index 42d933f..5a3a4da 100644
+--- a/media/gpu/v4l2/v4l2_h264_slice.cc
++++ b/media/gpu/v4l2/v4l2_h264_slice.cc
+@@ -211,4 +211,10 @@ uint32_t H264DpbEntryFlags(bool is_ref, bool long_term, bool slice_based) {
+   return flags;
+ }
+ 
++bool H264PictureUsesHeldSlices(bool slice_based,
++                               bool hold_capture,
++                               size_t slice_count) {
++  return slice_based && hold_capture && slice_count > 1;
++}
++
+ }  // namespace media
+diff --git a/media/gpu/v4l2/v4l2_h264_slice.h b/media/gpu/v4l2/v4l2_h264_slice.h
+index 16750bb..3c13f31 100644
+--- a/media/gpu/v4l2/v4l2_h264_slice.h
++++ b/media/gpu/v4l2/v4l2_h264_slice.h
+@@ -71,6 +71,13 @@ bool FillH264SliceParams(const H264PPS* pps,
+ bool H264DpbEntryIsPacked(bool is_ref, bool slice_based);
+ uint32_t H264DpbEntryFlags(bool is_ref, bool long_term, bool slice_based);
+ 
++// More than one slice uses V4L2_BUF_FLAG_M2M_HOLD_CAPTURE_BUF only when the
++// OUTPUT queue advertises it and the device is slice-based. One slice, and
++// every frame-based picture, stays a single request.
++bool H264PictureUsesHeldSlices(bool slice_based,
++                               bool hold_capture,
++                               size_t slice_count);
++
+ }  // namespace media
+ 
+ #endif  // MEDIA_GPU_V4L2_V4L2_H264_SLICE_H_
+diff --git a/media/gpu/v4l2/v4l2_h264_slice_unittest.cc b/media/gpu/v4l2/v4l2_h264_slice_unittest.cc
+index 640723d..298cc4f 100644
+--- a/media/gpu/v4l2/v4l2_h264_slice_unittest.cc
++++ b/media/gpu/v4l2/v4l2_h264_slice_unittest.cc
+@@ -137,4 +137,11 @@ TEST(V4L2H264SliceTest, FrameBasedDpbKeepsNonReferencesInactive) {
+             slice_ref);
+ }
+ 
++TEST(V4L2H264SliceTest, HeldSlicesOnlyForMultiSliceSliceBased) {
++  EXPECT_FALSE(H264PictureUsesHeldSlices(true, true, 1));
++  EXPECT_FALSE(H264PictureUsesHeldSlices(true, false, 4));
++  EXPECT_FALSE(H264PictureUsesHeldSlices(false, true, 4));
++  EXPECT_TRUE(H264PictureUsesHeldSlices(true, true, 4));
++}
++
+ }  // namespace media
+diff --git a/media/gpu/v4l2/v4l2_queue.cc b/media/gpu/v4l2/v4l2_queue.cc
+index 8c70b96..ec028fc 100644
+--- a/media/gpu/v4l2/v4l2_queue.cc
++++ b/media/gpu/v4l2/v4l2_queue.cc
+@@ -860,6 +860,13 @@ void V4L2WritableBufferRef::SetTimeStamp(const struct timeval& timestamp) {
+   buffer_data_->v4l2_buffer_.timestamp = timestamp;
+ }
+ 
++void V4L2WritableBufferRef::SetFlags(uint32_t flags) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  DCHECK(buffer_data_);
++
++  buffer_data_->v4l2_buffer_.flags |= flags;
++}
++
+ const struct timeval& V4L2WritableBufferRef::GetTimeStamp() const {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+   DCHECK(buffer_data_);
+@@ -1839,6 +1846,13 @@ bool V4L2SubmittedRequestRef::IsCompleted() {
+   return request_->IsCompleted();
+ }
+ 
++bool V4L2SubmittedRequestRef::WaitForCompletion(int poll_timeout_ms) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  DCHECK_NE(request_, nullptr);
++
++  return request_->WaitForCompletion(poll_timeout_ms);
++}
++
+ V4L2RequestsQueue::V4L2RequestsQueue(base::ScopedFD&& media_fd) {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+ 
+diff --git a/media/gpu/v4l2/v4l2_queue.h b/media/gpu/v4l2/v4l2_queue.h
+index 0860e2f..1b9f217 100644
+--- a/media/gpu/v4l2/v4l2_queue.h
++++ b/media/gpu/v4l2/v4l2_queue.h
+@@ -138,6 +138,11 @@ class MEDIA_GPU_EXPORT V4L2WritableBufferRef {
+   void* GetPlaneMapping(const size_t plane);
+   // Set the timestamp field for this buffer.
+   void SetTimeStamp(const struct timeval& timestamp);
++  // OR |flags| into the flags submitted with this buffer. Slice-based
++  // decoders set V4L2_BUF_FLAG_M2M_HOLD_CAPTURE_BUF on every slice but the
++  // last. The flag lives on the writable reference, which is a copy of the
++  // queue's buffer, so it does not stick to the buffer after it is queued.
++  void SetFlags(uint32_t flags);
+   // Return the previously-set timestamp field for this buffer.
+   const struct timeval& GetTimeStamp() const;
+   // Set the number of bytes used for |plane|.
+@@ -325,6 +330,10 @@ class MEDIA_GPU_EXPORT V4L2SubmittedRequestRef : public V4L2RequestRefBase {
+ 
+   // Indicates if the request has completed.
+   [[nodiscard]] bool IsCompleted();
++  // Block until the request completes, or for |poll_timeout_ms|. A held
++  // slice's request completes when its bitstream buffer is returned, before
++  // the capture buffer is done.
++  [[nodiscard]] bool WaitForCompletion(int poll_timeout_ms);
+ 
+  private:
+   friend class V4L2RequestRef;
+diff --git a/media/gpu/v4l2/v4l2_video_decoder_backend_stateless.cc b/media/gpu/v4l2/v4l2_video_decoder_backend_stateless.cc
+index fda80bd..ce54071 100644
+--- a/media/gpu/v4l2/v4l2_video_decoder_backend_stateless.cc
++++ b/media/gpu/v4l2/v4l2_video_decoder_backend_stateless.cc
+@@ -7,6 +7,7 @@
+ 
+ #include <fcntl.h>
+ #include <linux/media.h>
++#include <linux/videodev2.h>
+ #include <sys/ioctl.h>
+ 
+ #include <algorithm>
+@@ -329,6 +330,121 @@ bool V4L2StatelessVideoDecoderBackend::SubmitSlice(
+   return true;
+ }
+ 
++bool V4L2StatelessVideoDecoderBackend::ReapCompletedInputBuffers() {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  if (!input_queue_) {
++    return false;
++  }
++  while (input_queue_->QueuedBuffersCount() > 0) {
++    auto dequeued = input_queue_->DequeueBuffer();
++    if (!dequeued.first) {
++      return false;
++    }
++    // EAGAIN: nothing else is ready. Dropping a dequeued buffer returns it
++    // to the free list.
++    if (!dequeued.second) {
++      break;
++    }
++  }
++  return true;
++}
++
++bool V4L2StatelessVideoDecoderBackend::SubmitHeldSlice(
++    V4L2DecodeSurface* dec_surface,
++    const uint8_t* data,
++    size_t size,
++    bool queue_capture,
++    struct v4l2_ext_controls* ctrls) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  if (!dec_surface || !data || size == 0 || !ctrls || !requests_queue_ ||
++      !input_queue_) {
++    return false;
++  }
++
++  if (!ReapCompletedInputBuffers()) {
++    client_->OnBackendError();
++    return false;
++  }
++  auto input_buf = input_queue_->GetFreeBuffer();
++  if (!input_buf) {
++    VLOGF(1) << "No free bitstream buffer for an H.264 slice";
++    client_->OnBackendError();
++    return false;
++  }
++  std::optional<V4L2RequestRef> request = requests_queue_->GetFreeRequest();
++  if (!request) {
++    VLOGF(1) << "No free media request for an H.264 slice";
++    client_->OnBackendError();
++    return false;
++  }
++
++  const size_t plane_size = input_buf->GetPlaneSize(0);
++  if (size > plane_size) {
++    VLOGF(1) << "H.264 slice (" << size << ") is larger than the bitstream"
++             << " buffer (" << plane_size << ")";
++    client_->OnBackendError();
++    return false;
++  }
++  void* mapping = input_buf->GetPlaneMapping(0);
++  if (!mapping) {
++    client_->OnBackendError();
++    return false;
++  }
++  UNSAFE_TODO(memcpy(mapping, data, size));
++  if (size < plane_size) {
++    const size_t pad = std::min<size_t>(64, plane_size - size);
++    UNSAFE_TODO(memset(static_cast<uint8_t*>(mapping) + size, 0, pad));
++  }
++  input_buf->SetPlaneBytesUsed(0, size);
++  // Same timestamp as the picture's CAPTURE buffer. Reference lists name that
++  // buffer, and every slice of the picture writes it.
++  struct timeval timestamp = {.tv_sec = 0,
++                              .tv_usec = dec_surface->output_record()};
++  input_buf->SetTimeStamp(timestamp);
++  input_buf->SetFlags(V4L2_BUF_FLAG_M2M_HOLD_CAPTURE_BUF);
++
++  if (!request->ApplyCtrls(ctrls) ||
++      device_->Ioctl(VIDIOC_S_EXT_CTRLS, ctrls) != 0) {
++    VPLOGF(1) << "Failed to set controls for a held H.264 slice";
++    client_->OnBackendError();
++    return false;
++  }
++
++  // Match libva-v4l2-request: queue the bitstream, then the CAPTURE buffer
++  // (first slice only), then the media request. Later slices leave the
++  // CAPTURE buffer queued and set V4L2_BUF_FLAG_M2M_HOLD_CAPTURE_BUF.
++  if (!std::move(*input_buf).QueueMMap(&(*request))) {
++    VLOGF(1) << "Failed to queue a held H.264 slice";
++    client_->OnBackendError();
++    return false;
++  }
++  if (queue_capture && !dec_surface->QueueCaptureBuffer()) {
++    VLOGF(1) << "Failed to queue the CAPTURE buffer for the first H.264 slice";
++    client_->OnBackendError();
++    return false;
++  }
++  std::optional<V4L2SubmittedRequestRef> submitted =
++      std::move(*request).Submit();
++  if (!submitted) {
++    VLOGF(1) << "Failed to submit a held H.264 slice request";
++    client_->OnBackendError();
++    return false;
++  }
++  // The driver copies the slice and returns the bitstream buffer without
++  // decoding yet. Wait so the next slice can reuse a buffer. The CAPTURE
++  // buffer stays queued.
++  if (!submitted->WaitForCompletion(500)) {
++    VLOGF(1) << "Held H.264 slice request timed out";
++    client_->OnBackendError();
++    return false;
++  }
++  if (!ReapCompletedInputBuffers()) {
++    client_->OnBackendError();
++    return false;
++  }
++  return true;
++}
++
+ void V4L2StatelessVideoDecoderBackend::DecodeSurface(
+     scoped_refptr<V4L2DecodeSurface> dec_surface) {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+diff --git a/media/gpu/v4l2/v4l2_video_decoder_backend_stateless.h b/media/gpu/v4l2/v4l2_video_decoder_backend_stateless.h
+index afefa34..3b6b63a 100644
+--- a/media/gpu/v4l2/v4l2_video_decoder_backend_stateless.h
++++ b/media/gpu/v4l2/v4l2_video_decoder_backend_stateless.h
+@@ -69,6 +69,11 @@ class V4L2StatelessVideoDecoderBackend : public V4L2VideoDecoderBackend,
+   bool SubmitSlice(V4L2DecodeSurface* dec_surface,
+                    const uint8_t* data,
+                    size_t size) override;
++  bool SubmitHeldSlice(V4L2DecodeSurface* dec_surface,
++                       const uint8_t* data,
++                       size_t size,
++                       bool queue_capture,
++                       struct v4l2_ext_controls* ctrls) override;
+   void DecodeSurface(scoped_refptr<V4L2DecodeSurface> dec_surface) override;
+   void SurfaceReady(scoped_refptr<V4L2DecodeSurface> dec_surface,
+                     int32_t bitstream_id,
+@@ -140,6 +145,11 @@ class V4L2StatelessVideoDecoderBackend : public V4L2VideoDecoderBackend,
+   // Returns whether |profile| is supported by a v4l2 stateless decoder driver.
+   bool IsSupportedProfile(VideoCodecProfile profile);
+ 
++  // Return bitstream buffers the kernel has already finished to the free list.
++  // Held slices complete without the capture buffer, so their OUTPUT buffers
++  // can be reused for the next slice of the same picture.
++  bool ReapCompletedInputBuffers();
++
+   // Create codec-specific AcceleratedVideoDecoder and reset related variables.
+   bool CreateDecoder();
+ 
+diff --git a/media/gpu/v4l2/v4l2_video_decoder_delegate_h264.cc b/media/gpu/v4l2/v4l2_video_decoder_delegate_h264.cc
+index 6e67074..03581c8 100644
+--- a/media/gpu/v4l2/v4l2_video_decoder_delegate_h264.cc
++++ b/media/gpu/v4l2/v4l2_video_decoder_delegate_h264.cc
+@@ -51,6 +51,16 @@ struct DecRefPicMarking {
+   uint32_t long_term_frame_idx;
+   uint32_t max_long_term_frame_idx_plus1;
+ };
++
++// One slice of a picture. Slice-based decoders submit each of these as its
++// own media request when the picture has more than one slice. The bytes are
++// the NAL the driver asked for (raw, or with a 3-byte start code).
++struct PendingH264Slice {
++  std::vector<uint8_t> bytes;
++  struct v4l2_ctrl_h264_slice_params params = {};
++  struct v4l2_ctrl_h264_pred_weights weights = {};
++  bool pred_weights_required = false;
++};
+ }  // namespace
+ 
+ // This struct contains the kernel-specific parts of the H264 acceleration,
+@@ -71,6 +81,16 @@ struct V4L2VideoDecoderDelegateH264Private {
+   int32_t decode_mode = V4L2_STATELESS_H264_DECODE_MODE_FRAME_BASED;
+   int32_t start_code = V4L2_STATELESS_H264_START_CODE_ANNEX_B;
+   bool controls_queried = false;
++  // OUTPUT queue advertises V4L2_BUF_CAP_SUPPORTS_M2M_HOLD_CAPTURE_BUF.
++  // Some drivers set that only when the coded format is selected, so this is
++  // queried from SubmitDecode, after S_FMT.
++  bool hold_capture = false;
++  bool hold_queried = false;
++  struct v4l2_ctrl_h264_sps v4l2_sps = {};
++  struct v4l2_ctrl_h264_pps v4l2_pps = {};
++  struct v4l2_ctrl_h264_scaling_matrix v4l2_scaling = {};
++  bool have_picture_controls = false;
++  std::vector<PendingH264Slice> slices;
+ };
+ 
+ void QueryH264StatelessControls(V4L2Device* device,
+@@ -102,6 +122,61 @@ void QueryH264StatelessControls(V4L2Device* device,
+            << " start_code=" << priv->start_code;
+ }
+ 
++// The hold-capture flag is a property of the coded format, not of the device.
++// Call this after VIDIOC_S_FMT. A count of 0 only reports capabilities.
++void QueryHoldCapture(V4L2Device* device,
++                      V4L2VideoDecoderDelegateH264Private* priv) {
++  if (priv->hold_queried) {
++    return;
++  }
++  struct v4l2_create_buffers create = {};
++  create.count = 0;
++  create.memory = V4L2_MEMORY_MMAP;
++  create.format.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
++  if (device->Ioctl(VIDIOC_CREATE_BUFS, &create) != 0) {
++    VLOGF(1) << "VIDIOC_CREATE_BUFS hold-capture query failed";
++    return;
++  }
++  priv->hold_queried = true;
++  priv->hold_capture =
++      (create.capabilities & V4L2_BUF_CAP_SUPPORTS_M2M_HOLD_CAPTURE_BUF) != 0;
++  VLOGF(1) << "H.264 hold_capture=" << priv->hold_capture
++           << " capabilities=" << create.capabilities;
++}
++
++void AppendExtCtrl(std::vector<struct v4l2_ext_control>* ctrls,
++                   __u32 id,
++                   void* ptr,
++                   __u32 size) {
++  struct v4l2_ext_control ctrl = {};
++  ctrl.id = id;
++  ctrl.ptr = ptr;
++  ctrl.size = size;
++  ctrls->push_back(ctrl);
++}
++
++// Picture-level controls plus this slice. Same set on every slice request:
++// SPS, PPS, scaling matrix, decode params, slice params, and prediction
++// weights when the slice uses them.
++void AppendHeldSliceControls(V4L2VideoDecoderDelegateH264Private* priv,
++                             PendingH264Slice* slice,
++                             std::vector<struct v4l2_ext_control>* ctrls) {
++  AppendExtCtrl(ctrls, V4L2_CID_STATELESS_H264_SPS, &priv->v4l2_sps,
++                sizeof(priv->v4l2_sps));
++  AppendExtCtrl(ctrls, V4L2_CID_STATELESS_H264_PPS, &priv->v4l2_pps,
++                sizeof(priv->v4l2_pps));
++  AppendExtCtrl(ctrls, V4L2_CID_STATELESS_H264_SCALING_MATRIX,
++                &priv->v4l2_scaling, sizeof(priv->v4l2_scaling));
++  AppendExtCtrl(ctrls, V4L2_CID_STATELESS_H264_DECODE_PARAMS,
++                &priv->v4l2_decode_param, sizeof(priv->v4l2_decode_param));
++  AppendExtCtrl(ctrls, V4L2_CID_STATELESS_H264_SLICE_PARAMS, &slice->params,
++                sizeof(slice->params));
++  if (slice->pred_weights_required) {
++    AppendExtCtrl(ctrls, V4L2_CID_STATELESS_H264_PRED_WEIGHTS, &slice->weights,
++                  sizeof(slice->weights));
++  }
++}
++
+ class V4L2H264Picture : public H264Picture {
+  public:
+   explicit V4L2H264Picture(scoped_refptr<V4L2DecodeSurface> dec_surface)
+@@ -293,6 +368,8 @@ V4L2VideoDecoderDelegateH264::SubmitFrameMetadata(
+   priv_->pred_weights = {};
+   priv_->pred_weights_required = false;
+   priv_->have_slice = false;
++  priv_->slices.clear();
++  priv_->have_picture_controls = false;
+   priv_->dpb_pics.clear();
+ 
+   struct v4l2_ext_control ctrl = {};
+@@ -347,6 +424,7 @@ V4L2VideoDecoderDelegateH264::SubmitFrameMetadata(
+   SET_V4L2_SPS_FLAG_IF(direct_8x8_inference_flag,
+                        V4L2_H264_SPS_FLAG_DIRECT_8X8_INFERENCE);
+ #undef SET_V4L2_SPS_FLAG_IF
++  priv_->v4l2_sps = v4l2_sps;
+   ctrl = {};
+   ctrl.id = V4L2_CID_STATELESS_H264_SPS;
+   ctrl.size = sizeof(v4l2_sps);
+@@ -386,6 +464,7 @@ V4L2VideoDecoderDelegateH264::SubmitFrameMetadata(
+   SET_V4L2_PPS_FLAG_IF(pic_scaling_matrix_present_flag,
+                        V4L2_H264_PPS_FLAG_SCALING_MATRIX_PRESENT);
+ #undef SET_V4L2_PPS_FLAG_IF
++  priv_->v4l2_pps = v4l2_pps;
+   ctrl = {};
+   ctrl.id = V4L2_CID_STATELESS_H264_PPS;
+   ctrl.size = sizeof(v4l2_pps);
+@@ -455,6 +534,8 @@ V4L2VideoDecoderDelegateH264::SubmitFrameMetadata(
+     }
+   }
+ 
++  priv_->v4l2_scaling = v4l2_scaling_matrix;
++  priv_->have_picture_controls = true;
+   ctrl = {};
+   ctrl.id = V4L2_CID_STATELESS_H264_SCALING_MATRIX;
+   ctrl.size = sizeof(v4l2_scaling_matrix);
+@@ -650,12 +731,6 @@ H264Decoder::H264Accelerator::Status V4L2VideoDecoderDelegateH264::SubmitSlice(
+   const size_t prefix = H264StartCodePrefixSize(priv_->start_code);
+ 
+   if (slice_based) {
+-    // One media request per picture. A second slice needs its own request
+-    // and a held CAPTURE buffer, which this path does not do.
+-    if (priv_->have_slice) {
+-      VLOGF(1) << "Slice-based H.264 picture has more than one slice";
+-      return Status::kFail;
+-    }
+     v4l2_ctrl_h264_slice_params slice_params = {};
+     v4l2_ctrl_h264_pred_weights weights = {};
+     bool pred_weights_required = false;
+@@ -667,11 +742,24 @@ H264Decoder::H264Accelerator::Status V4L2VideoDecoderDelegateH264::SubmitSlice(
+     priv_->slice_params = slice_params;
+     priv_->pred_weights = weights;
+     priv_->pred_weights_required = pred_weights_required;
++    PendingH264Slice pending;
++    pending.params = slice_params;
++    pending.weights = weights;
++    pending.pred_weights_required = pred_weights_required;
++    pending.bytes.resize(prefix + payload);
++    if (prefix) {
++      pending.bytes[2] = 0x01;
++    }
++    UNSAFE_TODO(memcpy(pending.bytes.data() + prefix, data, payload));
++    priv_->slices.push_back(std::move(pending));
+     priv_->have_slice = true;
++    // The bytes are copied into a bitstream buffer at SubmitDecode. A second
++    // slice cannot share this picture's one request.
++    return Status::kOk;
+   }
+ 
+-  // Frame-based devices concatenate every slice into one buffer, with the
+-  // start code the driver asked for.
++  // Frame-based devices still concatenate every slice into one buffer, with
++  // the start code the driver asked for.
+   const size_t data_copy_size = payload + prefix;
+   auto data_copy = base::HeapArray<uint8_t>::WithSize(data_copy_size);
+   if (prefix) {
+@@ -720,11 +808,45 @@ H264Decoder::H264Accelerator::Status V4L2VideoDecoderDelegateH264::SubmitDecode(
+   QueryH264StatelessControls(device_, priv_.get());
+   const bool slice_based = H264DecodeModeIsSliceBased(priv_->decode_mode);
+   if (slice_based) {
+-    if (!priv_->have_slice) {
++    if (!priv_->have_slice || priv_->slices.empty()) {
+       VLOGF(1) << "Slice-based H.264 frame has no slice parameters";
+       return Status::kFail;
+     }
+-    // The ioctl copies the slice parameters into the picture's request.
++    QueryHoldCapture(device_, priv_.get());
++    // Every slice but the last is its own request and holds the CAPTURE
++    // buffer. The capture buffer is queued with the first of those. One slice
++    // keeps the single-request path. A frame-based device never reaches here.
++    if (priv_->slices.size() > 1) {
++      if (!H264PictureUsesHeldSlices(slice_based, priv_->hold_capture,
++                                     priv_->slices.size()) ||
++          !priv_->have_picture_controls) {
++        VLOGF(1) << "H.264 picture has " << priv_->slices.size()
++                 << " slices and the driver does not advertise hold-capture";
++        return Status::kFail;
++      }
++      VLOGF(1) << "Submitting " << priv_->slices.size()
++               << " H.264 slices, holding the capture buffer until the last";
++      for (size_t i = 0; i + 1 < priv_->slices.size(); ++i) {
++        std::vector<struct v4l2_ext_control> slice_ctrls;
++        AppendHeldSliceControls(priv_.get(), &priv_->slices[i], &slice_ctrls);
++        struct v4l2_ext_controls slice_ext = {};
++        slice_ext.count = slice_ctrls.size();
++        slice_ext.controls = slice_ctrls.data();
++        if (!surface_handler_->SubmitHeldSlice(
++                dec_surface.get(), priv_->slices[i].bytes.data(),
++                priv_->slices[i].bytes.size(), /*queue_capture=*/i == 0,
++                &slice_ext)) {
++          return Status::kFail;
++        }
++      }
++    }
++    const PendingH264Slice& last = priv_->slices.back();
++    if (!surface_handler_->SubmitSlice(dec_surface.get(), last.bytes.data(),
++                                       last.bytes.size())) {
++      return Status::kFail;
++    }
++    // priv_->slice_params is the last slice. The ioctl copies it into the
++    // picture's request before Reset() drops the pending slices.
+     ctrl = {};
+     ctrl.id = V4L2_CID_STATELESS_H264_SLICE_PARAMS;
+     ctrl.size = sizeof(priv_->slice_params);
+@@ -777,6 +899,7 @@ void V4L2VideoDecoderDelegateH264::Reset() {
+   priv_->pred_weights = {};
+   priv_->pred_weights_required = false;
+   priv_->have_slice = false;
++  priv_->slices.clear();
+   priv_->dpb_pics.clear();
+   encrypted_slice_header_offset_ = 0;
+   last_parsed_encrypted_slice_header_.clear();
+-- 
+2.56.0
+

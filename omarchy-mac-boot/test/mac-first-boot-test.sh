@@ -515,6 +515,16 @@ expect_handoff "keyring init"
 grep -Eq -- '--populate archlinuxarm asahi-alarm omarchy$' "$case_dir/pacman-key.log" ||
   fail "the Omarchy release keyring is populated when omarchy-keyring ships it (omarchy-update-keyring requires it)"
 
+new_case keyring-smartroom
+write_esp 'format=1' 'encrypt=0'
+: >"$root/usr/share/pacman/keyrings/omarchy.gpg"
+: >"$root/usr/share/pacman/keyrings/smartroom.gpg"
+expect_handoff "keyring init with the SmartRoom release keyring"
+grep -Eq -- '--populate archlinuxarm asahi-alarm omarchy smartroom$' "$case_dir/pacman-key.log" ||
+  fail "a SmartRoom release image's keyring trusts the key that signs its release repository"
+! grep -Eq -- '--(add|lsign-key)' "$case_dir/pacman-key.log" || fail "the SmartRoom keyring comes only from the image's keyrings"
+echo 'ok - first boot populates the SmartRoom release keyring when the image ships it'
+
 new_case keyring-retry
 write_esp 'format=1' 'encrypt=0' 'lane=edge'
 mv "$root/usr/bin/omarchy-provision-owner" "$case_dir/omarchy-provision-owner"

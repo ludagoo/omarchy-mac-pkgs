@@ -1,0 +1,44 @@
+From 811274c3bdb1df672e1582bf56d659f83b7d62dc Mon Sep 17 00:00:00 2001
+From: Lucas Goossen <lucas.goossen@hey.com>
+Date: Wed, 18 Nov 2026 18:56:35 -0300
+Subject: [PATCH 09/12] room: Default AcceleratedVideoDecoder on for V4L2-only
+ Linux builds
+
+kAcceleratedVideoDecodeLinux ("AcceleratedVideoDecoder") defaults on
+only when USE_VAAPI is set. A V4L2-only desktop build compiles the
+decoder and then leaves the feature off, so playback stays on the
+software decoder unless every caller passes --enable-features. The
+room kiosk enables AcceleratedVideoEncoder and does not pass
+AcceleratedVideoDecoder.
+
+Default the feature on when this binary includes VA-API or V4L2.
+AcceleratedVideoEncoder stays off by default.
+
+Room package only (148 patch 013). Upstream leaves this default alone;
+see CL-B-desktop-v4l2.md.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ media/base/media_switches.cc | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/media/base/media_switches.cc b/media/base/media_switches.cc
+index cba69f6..0d4a79a 100644
+--- a/media/base/media_switches.cc
++++ b/media/base/media_switches.cc
+@@ -1510,9 +1510,11 @@ BASE_FEATURE(kFuchsiaMediacodecVideoEncoder, base::FEATURE_DISABLED_BY_DEFAULT);
+ #if BUILDFLAG(IS_LINUX)
+ // Enable vaapi/v4l2 video decoding on linux. This is already enabled by default
+ // on chromeos, but needs an experiment on linux.
++// On when this build includes VA-API or V4L2. A V4L2-only desktop build
++// otherwise leaves hardware decode disabled even though the decoder is linked.
+ BASE_FEATURE(kAcceleratedVideoDecodeLinux,
+              "AcceleratedVideoDecoder",
+-#if BUILDFLAG(USE_VAAPI)
++#if BUILDFLAG(USE_VAAPI) || BUILDFLAG(USE_V4L2_CODEC)
+              base::FEATURE_ENABLED_BY_DEFAULT);
+ #else
+              base::FEATURE_DISABLED_BY_DEFAULT);
+-- 
+2.56.0
+

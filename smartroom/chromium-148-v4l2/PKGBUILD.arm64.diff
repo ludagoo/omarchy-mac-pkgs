@@ -1,0 +1,15 @@
+diff --git a/PKGBUILD.arm64 b/PKGBUILD.arm64
+index 6e91388..b4095ac 100644
+--- a/PKGBUILD.arm64
++++ b/PKGBUILD.arm64
+@@ -581,7 +581,9 @@ package() {
+   if (( _use_chromium_src )); then
+     cd "$_chromium_upstream_src/src"
+   else
+-    cd ../chromium-$pkgver
++    # makepkg starts package() in $srcdir. The tree is
++    # $srcdir/chromium-$pkgver, not a sibling of $srcdir.
++    cd "$srcdir/chromium-$pkgver"
+   fi
+ 
+   # Install from ARM64 build directory (use cp to preserve binary integrity)

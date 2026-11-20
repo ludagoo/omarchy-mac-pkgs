@@ -1,0 +1,11 @@
+# The chromium-smartroom package the edge image ships, and the recipe that
+# built it. smartroom/test/chromium-smartroom-recipe-test.sh holds PKGBUILD to
+# pkgbuild_sha256 (the .BUILDINFO field makepkg writes), so a recipe change
+# needs a new build and new values here and in the installer's
+# smartroom/room/prebuilt.sha256.
+package=chromium-smartroom-158.0.8127.36-1-aarch64.pkg.tar.xz
+package_sha256=47c6c1d9afdd705a222cc1c82ee22da02aa950cce11c7f8e9233631fd24a2e78
+pkgbuild_sha256=ad1553117ef719ada972d86d99113b1a9c702c730d5a8823e5755095e82daef9
+builddate=1795102440
+built_on=home Studio (j475c), user srbuild, room-158-makepkg.sh prep then build
+rust=rustup 1.99.0-aarch64-unknown-linux-gnu (SR_RUST_SYSROOT)

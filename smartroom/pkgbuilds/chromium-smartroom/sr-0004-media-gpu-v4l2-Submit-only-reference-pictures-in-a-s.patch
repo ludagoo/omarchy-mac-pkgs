@@ -1,0 +1,143 @@
+From 9ab31ed9eeded508dc9369c38d357230e21b6871 Mon Sep 17 00:00:00 2001
+From: Lucas Goossen <lucas.goossen@hey.com>
+Date: Wed, 18 Nov 2026 18:17:10 -0300
+Subject: [PATCH 04/12] media/gpu/v4l2: Submit only reference pictures in a
+ slice-based H.264 DPB
+
+H264DPBToV4L2DPB() packs every picture of the H264DPB into
+v4l2_ctrl_h264_decode_params.dpb[], including non-reference pictures
+that are only waiting to be output. Those are marked VALID without
+ACTIVE.
+
+On a slice-based device the reference lists in the slice parameters
+are indices into that array. A driver that builds its reference table
+from the VALID entries (Apple AVD does) then has more entries than
+references, and a slice index points at the wrong picture or past the
+table. The stream decodes with corrupted inter frames or the request
+is rejected.
+
+In slice-based mode, leave non-reference pictures out of the array, so
+the array is exactly the reference set and each entry is VALID and
+ACTIVE. Frame-based devices do not use the slot numbers and keep
+receiving every picture, ACTIVE only for references, as before.
+
+Bug: None
+Test: media_unittests --gtest_filter=V4L2H264SliceTest.*
+Test: H.264 High 1080p and 2160p clips on Apple AVD (Linux arm64):
+      play to the end on V4L2VideoDecoder; before, the decoder hung
+      once a non-reference picture kept for display sat in front of a
+      reference in the DPB
+Assisted-by: Claude:claude-opus-5-5
+---
+ media/gpu/v4l2/v4l2_h264_slice.cc             | 15 +++++++++++++++
+ media/gpu/v4l2/v4l2_h264_slice.h              |  7 +++++++
+ media/gpu/v4l2/v4l2_h264_slice_unittest.cc    | 19 +++++++++++++++++++
+ .../v4l2/v4l2_video_decoder_delegate_h264.cc  | 13 ++++++++++---
+ 4 files changed, 51 insertions(+), 3 deletions(-)
+
+diff --git a/media/gpu/v4l2/v4l2_h264_slice.cc b/media/gpu/v4l2/v4l2_h264_slice.cc
+index 8a0ea1b..42d933f 100644
+--- a/media/gpu/v4l2/v4l2_h264_slice.cc
++++ b/media/gpu/v4l2/v4l2_h264_slice.cc
+@@ -196,4 +196,19 @@ bool FillH264SliceParams(const H264PPS* pps,
+   return true;
+ }
+ 
++bool H264DpbEntryIsPacked(bool is_ref, bool slice_based) {
++  return !slice_based || is_ref;
++}
++
++uint32_t H264DpbEntryFlags(bool is_ref, bool long_term, bool slice_based) {
++  uint32_t flags = V4L2_H264_DPB_ENTRY_FLAG_VALID;
++  if (slice_based || is_ref) {
++    flags |= V4L2_H264_DPB_ENTRY_FLAG_ACTIVE;
++  }
++  if (long_term) {
++    flags |= V4L2_H264_DPB_ENTRY_FLAG_LONG_TERM;
++  }
++  return flags;
++}
++
+ }  // namespace media
+diff --git a/media/gpu/v4l2/v4l2_h264_slice.h b/media/gpu/v4l2/v4l2_h264_slice.h
+index 0a3cd13..16750bb 100644
+--- a/media/gpu/v4l2/v4l2_h264_slice.h
++++ b/media/gpu/v4l2/v4l2_h264_slice.h
+@@ -64,6 +64,13 @@ bool FillH264SliceParams(const H264PPS* pps,
+                          v4l2_ctrl_h264_pred_weights* weights,
+                          bool* pred_weights_required);
+ 
++// Frame-based: every picture is packed, and ACTIVE only when it is a
++// reference. Slice-based: reference pictures only, each one VALID and ACTIVE.
++// A non-reference kept for display is omitted so the slice's slot numbers
++// match the table the kernel walks.
++bool H264DpbEntryIsPacked(bool is_ref, bool slice_based);
++uint32_t H264DpbEntryFlags(bool is_ref, bool long_term, bool slice_based);
++
+ }  // namespace media
+ 
+ #endif  // MEDIA_GPU_V4L2_V4L2_H264_SLICE_H_
+diff --git a/media/gpu/v4l2/v4l2_h264_slice_unittest.cc b/media/gpu/v4l2/v4l2_h264_slice_unittest.cc
+index d81fe29..640723d 100644
+--- a/media/gpu/v4l2/v4l2_h264_slice_unittest.cc
++++ b/media/gpu/v4l2/v4l2_h264_slice_unittest.cc
+@@ -118,4 +118,23 @@ TEST(V4L2H264SliceTest, ISliceHasNoRefListAndPSliceDoes) {
+   EXPECT_FALSE(pred_weights);
+ }
+ 
++TEST(V4L2H264SliceTest, FrameBasedDpbKeepsNonReferencesInactive) {
++  EXPECT_TRUE(H264DpbEntryIsPacked(/*is_ref=*/false, /*slice_based=*/false));
++  EXPECT_TRUE(H264DpbEntryIsPacked(/*is_ref=*/true, /*slice_based=*/false));
++  EXPECT_FALSE(H264DpbEntryIsPacked(/*is_ref=*/false, /*slice_based=*/true));
++  EXPECT_TRUE(H264DpbEntryIsPacked(/*is_ref=*/true, /*slice_based=*/true));
++
++  const uint32_t frame_nonref =
++      H264DpbEntryFlags(/*is_ref=*/false, /*long_term=*/false,
++                        /*slice_based=*/false);
++  EXPECT_EQ(static_cast<uint32_t>(V4L2_H264_DPB_ENTRY_FLAG_VALID), frame_nonref);
++
++  const uint32_t slice_ref = H264DpbEntryFlags(
++      /*is_ref=*/true, /*long_term=*/true, /*slice_based=*/true);
++  EXPECT_EQ(static_cast<uint32_t>(V4L2_H264_DPB_ENTRY_FLAG_VALID |
++                                  V4L2_H264_DPB_ENTRY_FLAG_ACTIVE |
++                                  V4L2_H264_DPB_ENTRY_FLAG_LONG_TERM),
++            slice_ref);
++}
++
+ }  // namespace media
+diff --git a/media/gpu/v4l2/v4l2_video_decoder_delegate_h264.cc b/media/gpu/v4l2/v4l2_video_decoder_delegate_h264.cc
+index 258a0e8..6e67074 100644
+--- a/media/gpu/v4l2/v4l2_video_decoder_delegate_h264.cc
++++ b/media/gpu/v4l2/v4l2_video_decoder_delegate_h264.cc
+@@ -232,8 +232,17 @@ V4L2VideoDecoderDelegateH264::H264DPBToV4L2DPB(const H264DPB& dpb) {
+   UNSAFE_TODO(memset(priv_->v4l2_decode_param.dpb, 0,
+                      sizeof(priv_->v4l2_decode_param.dpb)));
+   priv_->dpb_pics.clear();
++  QueryH264StatelessControls(device_, priv_.get());
++  const bool slice_based = H264DecodeModeIsSliceBased(priv_->decode_mode);
+   size_t i = 0;
+   for (const auto& pic : dpb) {
++    // Slice-based reference lists index this array. A picture kept only so it
++    // can be displayed is not a reference. Frame-based devices do not use the
++    // slot numbers and still receive every picture, ACTIVE only when it is a
++    // reference.
++    if (!H264DpbEntryIsPacked(pic->ref, slice_based)) {
++      continue;
++    }
+     if (i >= std::size(priv_->v4l2_decode_param.dpb)) {
+       VLOGF(1) << "Invalid DPB size";
+       break;
+@@ -265,9 +274,7 @@ V4L2VideoDecoderDelegateH264::H264DPBToV4L2DPB(const H264DPB& dpb) {
+ 
+     entry.top_field_order_cnt = pic->top_field_order_cnt;
+     entry.bottom_field_order_cnt = pic->bottom_field_order_cnt;
+-    entry.flags = V4L2_H264_DPB_ENTRY_FLAG_VALID |
+-                  (pic->ref ? V4L2_H264_DPB_ENTRY_FLAG_ACTIVE : 0) |
+-                  (pic->long_term ? V4L2_H264_DPB_ENTRY_FLAG_LONG_TERM : 0);
++    entry.flags = H264DpbEntryFlags(pic->ref, pic->long_term, slice_based);
+   }
+ 
+   return ref_surfaces;
+-- 
+2.56.0
+

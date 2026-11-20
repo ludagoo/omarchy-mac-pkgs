@@ -1,0 +1,15 @@
+Restore the type import that ChannelProxy.ts uses at line 174. With the system
+TypeScript (6.0.3) the type check fails: "Cannot find namespace 'Protocol'".
+The other bidiMapper modules import it the same way.
+
+--- a/third_party/chromium-bidi/src/bidiMapper/modules/script/ChannelProxy.ts
++++ b/third_party/chromium-bidi/src/bidiMapper/modules/script/ChannelProxy.ts
+@@ -16,7 +16,7 @@
+  *
+  */
+ 
+-// import {Protocol} from 'devtools-protocol';
++import type {Protocol} from 'devtools-protocol';
+ 
+ import {ChromiumBidi, Script} from '../../../protocol/protocol.js';
+ import {LogType, type LoggerFn} from '../../../utils/log.js';

@@ -1,0 +1,61 @@
+From d7566b263785f2d0c883da3383c2e6910e037913 Mon Sep 17 00:00:00 2001
+From: Lucas Goossen <lucas.goossen@hey.com>
+Date: Wed, 18 Nov 2026 18:56:25 -0300
+Subject: [PATCH 08/12] room: Build the V4L2 encoder on desktop Linux
+
+The V4L2 stateful encoder is compiled and created only on ChromeOS.
+Compile it for Linux too and create it behind AcceleratedVideoEncoder,
+the same runtime gate the VA-API encoder uses on Linux. A V4L2-only
+build selects it through ActiveLinuxVideoDecoderType().
+
+Room package only (from 148 patch 004, without its VA-API hybrid
+parts). Upstream keeps the encoder ChromeOS-only; see
+CL-B-desktop-v4l2.md.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ media/gpu/gpu_video_encode_accelerator_factory.cc | 10 ++++++----
+ media/gpu/v4l2/BUILD.gn                           |  2 +-
+ 2 files changed, 7 insertions(+), 5 deletions(-)
+
+diff --git a/media/gpu/gpu_video_encode_accelerator_factory.cc b/media/gpu/gpu_video_encode_accelerator_factory.cc
+index bf879d5..8079dd4 100644
+--- a/media/gpu/gpu_video_encode_accelerator_factory.cc
++++ b/media/gpu/gpu_video_encode_accelerator_factory.cc
+@@ -58,14 +58,16 @@ namespace media {
+ namespace {
+ #if BUILDFLAG(USE_V4L2_CODEC)
+ std::unique_ptr<VideoEncodeAccelerator> CreateV4L2VEA() {
+-#if BUILDFLAG(IS_CHROMEOS)
++#if BUILDFLAG(IS_LINUX)
++  // Same runtime gate as the VA-API encoder on desktop Linux.
++  if (!base::FeatureList::IsEnabled(kAcceleratedVideoEncodeLinux)) {
++    return nullptr;
++  }
++#endif  // BUILDFLAG(IS_LINUX)
+   // TODO(crbug.com/901264): Encoders use hack for passing offset within
+   // a DMA-buf, which is not supported upstream.
+   return base::WrapUnique<VideoEncodeAccelerator>(
+       new V4L2VideoEncodeAccelerator(base::MakeRefCounted<V4L2Device>()));
+-#else
+-  return nullptr;
+-#endif
+ }
+ #endif
+ 
+diff --git a/media/gpu/v4l2/BUILD.gn b/media/gpu/v4l2/BUILD.gn
+index 47d7ff7..0c0e561 100644
+--- a/media/gpu/v4l2/BUILD.gn
++++ b/media/gpu/v4l2/BUILD.gn
+@@ -89,7 +89,7 @@ source_set("v4l2") {
+     ]
+   }
+ 
+-  if (is_chromeos) {
++  if (is_chromeos || is_linux) {
+     sources += [
+       # TODO(crbug.com/901264): Encoders use hack for passing offset
+       # within a DMA-buf, which is not supported upstream.
+-- 
+2.56.0
+

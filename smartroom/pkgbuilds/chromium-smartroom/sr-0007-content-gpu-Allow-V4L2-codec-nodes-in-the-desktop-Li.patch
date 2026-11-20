@@ -1,0 +1,517 @@
+From b1f87beae99e7ccfcbbaa99662ae4947e1e2d41e Mon Sep 17 00:00:00 2001
+From: Lucas Goossen <lucas.goossen@hey.com>
+Date: Wed, 18 Nov 2026 18:21:58 -0300
+Subject: [PATCH 07/12] content/gpu: Allow V4L2 codec nodes in the desktop
+ Linux GPU sandbox
+
+A Linux build with use_v4l2_codec=true compiles the V4L2 decoder, and
+on Linux V4L2Device looks for it at /dev/videoN and /dev/mediaN. The
+GPU process broker policy, however, allows V4L2 nodes only on ChromeOS
+and Chromecast, and only under the ChromeOS names (/dev/video-decN,
+/dev/media-decN, /dev/video-encN).
+
+Today this rarely shows, because on many desktop GPU stacks the GPU
+seccomp sandbox does not engage at all: GL initialization starts
+driver threads first, and the sandbox logs "InitializeSandbox() called
+with multiple threads in process gpu-process" and leaves the process
+without seccomp, so the broker policy is never applied. That is the
+case on Apple M2 Max with Mesa (asahi), where a stock Arch Linux ARM
+Chromium 157 opens /dev/video0 and /dev/media0 from an unsandboxed GPU
+process. Wherever the sandbox does engage (a GPU stack that initializes
+single-threaded, or --gpu-sandbox-start-early), every open of a codec
+node is denied and decode silently falls back to software. A desktop
+V4L2 build should not depend on the GPU sandbox failing to start.
+
+Find the codec nodes before the sandbox starts and allow exactly
+those. FindV4L2CodecDevicePaths() lists /dev/videoN nodes that are
+memory-to-memory and take (decoder) or produce (encoder) a compressed
+video format, and for decoders the /dev/mediaN controller with the
+same bus_info (or driver, when bus_info is empty), which is how
+V4L2Device pairs them for the request API. Cameras, capture cards and
+v4l2loopback nodes are not memory-to-memory and are never allowed;
+JPEG codecs and image processors are not video codecs. The ChromeOS
+names are allowed as well, so existing udev rules keep working.
+Decoder nodes are only allowed when accelerated video decode is
+enabled, encoder nodes only when accelerated video encode is.
+
+Nothing changes for builds without use_v4l2_codec (official Chrome),
+for ChromeOS, or for Chromecast. With use_vaapi and use_v4l2_codec
+both set, the scan finds nothing on a machine without V4L2 codecs.
+
+Bug: None
+Test: media_unittests --gtest_filter=V4L2CodecNodesTest.*
+Test: Linux arm64 (Apple M2 Max, kernel 7.2, Mesa asahi), with
+      --gpu-sandbox-start-early so that the sandbox engages: the scan
+      allows /dev/video0 + /dev/media0 (AVD) and /dev/video10,
+      /dev/video11 (AVE), not the v4l2loopback cameras
+      /dev/video20-23. The GPU process then exits because it cannot
+      dlopen libEGL.so.1, as stock Chromium 157 does
+Test: same machine, default flags: the sandbox does not engage
+      ("called with multiple threads") and the scan does not run;
+      with the A changes, H.264, HEVC and VP9 play on V4L2VideoDecoder
+Assisted-by: Claude:claude-opus-5-5
+---
+ content/common/gpu_pre_sandbox_hook_linux.cc |  23 ++
+ media/gpu/v4l2/BUILD.gn                      |   3 +
+ media/gpu/v4l2/v4l2_codec_nodes.cc           | 212 +++++++++++++++++++
+ media/gpu/v4l2/v4l2_codec_nodes.h            |  70 ++++++
+ media/gpu/v4l2/v4l2_codec_nodes_unittest.cc  |  82 +++++++
+ 5 files changed, 390 insertions(+)
+ create mode 100644 media/gpu/v4l2/v4l2_codec_nodes.cc
+ create mode 100644 media/gpu/v4l2/v4l2_codec_nodes.h
+ create mode 100644 media/gpu/v4l2/v4l2_codec_nodes_unittest.cc
+
+diff --git a/content/common/gpu_pre_sandbox_hook_linux.cc b/content/common/gpu_pre_sandbox_hook_linux.cc
+index 2e53794..f336597 100644
+--- a/content/common/gpu_pre_sandbox_hook_linux.cc
++++ b/content/common/gpu_pre_sandbox_hook_linux.cc
+@@ -38,6 +38,7 @@
+ #include "sandbox/policy/linux/sandbox_linux.h"
+ 
+ #if BUILDFLAG(USE_V4L2_CODEC)
++#include "media/gpu/v4l2/v4l2_codec_nodes.h"
+ #include "media/gpu/v4l2/v4l2_device.h"
+ #endif
+ 
+@@ -191,6 +192,26 @@ void AddV4L2GpuPermissions(
+   }
+ }
+ 
++// Desktop Linux. Kernels name V4L2 codecs /dev/videoN and /dev/mediaN, the
++// same prefixes as cameras, so the nodes are found by what they are before
++// the sandbox starts. Only memory-to-memory nodes with a compressed video
++// format are allowed, never a camera. The ChromeOS names are allowed too, for
++// distributions whose udev rules publish /dev/video-decN and /dev/video-encN.
++// Without this, a build with use_v4l2_codec finds no decoder or encoder once
++// the GPU sandbox is on.
++void AddLinuxV4L2GpuPermissions(
++    std::vector<BrokerFilePermission>* permissions,
++    const sandbox::policy::SandboxSeccompBPF::Options& options) {
++#if BUILDFLAG(USE_V4L2_CODEC)
++  AddV4L2GpuPermissions(permissions, options);
++  for (const std::string& path : media::FindV4L2CodecDevicePaths(
++           options.accelerated_video_decode_enabled,
++           options.accelerated_video_encode_enabled)) {
++    permissions->push_back(BrokerFilePermission::ReadWrite(path));
++  }
++#endif
++}
++
+ void AddArmMaliGpuPermissions(std::vector<BrokerFilePermission>* permissions) {
+   // Device file needed by the ARM GPU userspace.
+   static const char kMali0Path[] = "/dev/mali0";
+@@ -666,6 +687,8 @@ std::vector<BrokerFilePermission> FilePermissionsForGpu(
+       AddChromecastArmGpuPermissions(&permissions);
+       return permissions;
+     }
++  } else if (UseV4L2Codec(options)) {
++    AddLinuxV4L2GpuPermissions(&permissions, options);
+   }
+ 
+   AddStandardGpuPermissions(&permissions);
+diff --git a/media/gpu/v4l2/BUILD.gn b/media/gpu/v4l2/BUILD.gn
+index 408fde7..47d7ff7 100644
+--- a/media/gpu/v4l2/BUILD.gn
++++ b/media/gpu/v4l2/BUILD.gn
+@@ -18,6 +18,8 @@ source_set("v4l2") {
+     "legacy/v4l2_video_decode_accelerator.h",
+     "legacy/v4l2_video_decoder_backend_stateful.cc",
+     "legacy/v4l2_video_decoder_backend_stateful.h",
++    "v4l2_codec_nodes.cc",
++    "v4l2_codec_nodes.h",
+     "v4l2_decode_surface.cc",
+     "v4l2_decode_surface.h",
+     "v4l2_decode_surface_handler.h",
+@@ -157,6 +159,7 @@ source_set("v4l2_status") {
+ source_set("unit_test") {
+   testonly = true
+   sources = [
++    "v4l2_codec_nodes_unittest.cc",
+     "v4l2_h264_slice_unittest.cc",
+     "v4l2_utils_unittest.cc",
+     "v4l2_vp9_helpers_unittest.cc",
+diff --git a/media/gpu/v4l2/v4l2_codec_nodes.cc b/media/gpu/v4l2/v4l2_codec_nodes.cc
+new file mode 100644
+index 0000000..0a111d7
+--- /dev/null
++++ b/media/gpu/v4l2/v4l2_codec_nodes.cc
+@@ -0,0 +1,212 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "media/gpu/v4l2/v4l2_codec_nodes.h"
++
++#include <fcntl.h>
++#include <linux/media.h>
++#include <linux/videodev2.h>
++#include <sys/ioctl.h>
++
++#include <algorithm>
++#include <utility>
++
++#include "base/files/file_enumerator.h"
++#include "base/files/file_path.h"
++#include "base/files/scoped_file.h"
++#include "base/logging.h"
++#include "base/posix/eintr_wrapper.h"
++#include "base/strings/string_util.h"
++
++namespace media {
++
++namespace {
++
++bool IsStillImageFormat(uint32_t fourcc) {
++  return fourcc == V4L2_PIX_FMT_JPEG || fourcc == V4L2_PIX_FMT_MJPEG;
++}
++
++bool HasCompressedVideoFormat(base::span<const V4L2FormatDesc> formats) {
++  return std::ranges::any_of(formats, [](const V4L2FormatDesc& f) {
++    return f.compressed && !IsStillImageFormat(f.fourcc);
++  });
++}
++
++bool HasCompressedFormat(base::span<const V4L2FormatDesc> formats) {
++  return std::ranges::any_of(
++      formats, [](const V4L2FormatDesc& f) { return f.compressed; });
++}
++
++// The kernel's fixed-size strings are NUL-terminated unless they fill the
++// array.
++template <typename T, size_t N>
++std::string KernelString(const T (&chars)[N]) {
++  base::span<const T> s(chars);
++  return std::string(s.begin(), std::ranges::find(s, T{0}));
++}
++
++std::vector<V4L2FormatDesc> EnumerateFormats(int fd, v4l2_buf_type type) {
++  std::vector<V4L2FormatDesc> formats;
++  for (uint32_t index = 0; index < 64; ++index) {
++    struct v4l2_fmtdesc desc = {};
++    desc.index = index;
++    desc.type = type;
++    if (HANDLE_EINTR(ioctl(fd, VIDIOC_ENUM_FMT, &desc)) != 0) {
++      break;
++    }
++    formats.push_back(
++        {desc.pixelformat, (desc.flags & V4L2_FMT_FLAG_COMPRESSED) != 0});
++  }
++  return formats;
++}
++
++struct VideoNode {
++  std::string path;
++  V4L2CodecNodeKind kind = V4L2CodecNodeKind::kNone;
++  std::string driver;
++  std::string bus_info;
++};
++
++// Only the kernel's own names. Symlinks such as /dev/video-dec0 are
++// allowed separately by the sandbox hook.
++bool IsNumberedNode(const base::FilePath& path, std::string_view prefix) {
++  const std::string name = path.BaseName().value();
++  if (!name.starts_with(prefix) || name.size() == prefix.size()) {
++    return false;
++  }
++  return std::ranges::all_of(name.substr(prefix.size()),
++                             [](char c) { return base::IsAsciiDigit(c); });
++}
++
++std::vector<VideoNode> FindVideoNodes() {
++  std::vector<VideoNode> nodes;
++  base::FileEnumerator enumerator(base::FilePath("/dev"), /*recursive=*/false,
++                                  base::FileEnumerator::FILES,
++                                  "video*");
++  for (base::FilePath path = enumerator.Next(); !path.empty();
++       path = enumerator.Next()) {
++    if (!IsNumberedNode(path, "video")) {
++      continue;
++    }
++    base::ScopedFD fd(HANDLE_EINTR(
++        open(path.value().c_str(), O_RDWR | O_NONBLOCK | O_CLOEXEC)));
++    if (!fd.is_valid()) {
++      continue;
++    }
++    struct v4l2_capability caps = {};
++    if (HANDLE_EINTR(ioctl(fd.get(), VIDIOC_QUERYCAP, &caps)) != 0) {
++      continue;
++    }
++    const uint32_t device_caps = (caps.capabilities & V4L2_CAP_DEVICE_CAPS)
++                                     ? caps.device_caps
++                                     : caps.capabilities;
++    if (!(device_caps & (V4L2_CAP_VIDEO_M2M_MPLANE | V4L2_CAP_VIDEO_M2M))) {
++      // Do not enumerate formats on cameras.
++      continue;
++    }
++    const bool mplane = device_caps & V4L2_CAP_VIDEO_M2M_MPLANE;
++    const std::vector<V4L2FormatDesc> output_formats = EnumerateFormats(
++        fd.get(), mplane ? V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE
++                         : V4L2_BUF_TYPE_VIDEO_OUTPUT);
++    const std::vector<V4L2FormatDesc> capture_formats = EnumerateFormats(
++        fd.get(), mplane ? V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE
++                         : V4L2_BUF_TYPE_VIDEO_CAPTURE);
++    VideoNode node;
++    node.kind = ClassifyV4L2Node(device_caps, output_formats, capture_formats);
++    if (node.kind == V4L2CodecNodeKind::kNone) {
++      continue;
++    }
++    node.path = path.value();
++    node.driver = KernelString(caps.driver);
++    node.bus_info = KernelString(caps.bus_info);
++    nodes.push_back(std::move(node));
++  }
++  return nodes;
++}
++
++}  // namespace
++
++V4L2CodecNodeKind ClassifyV4L2Node(
++    uint32_t device_caps,
++    base::span<const V4L2FormatDesc> output_formats,
++    base::span<const V4L2FormatDesc> capture_formats) {
++  if (!(device_caps & (V4L2_CAP_VIDEO_M2M_MPLANE | V4L2_CAP_VIDEO_M2M))) {
++    return V4L2CodecNodeKind::kNone;
++  }
++  if (HasCompressedVideoFormat(output_formats) &&
++      !HasCompressedFormat(capture_formats)) {
++    return V4L2CodecNodeKind::kDecoder;
++  }
++  if (HasCompressedVideoFormat(capture_formats) &&
++      !HasCompressedFormat(output_formats)) {
++    return V4L2CodecNodeKind::kEncoder;
++  }
++  return V4L2CodecNodeKind::kNone;
++}
++
++bool V4L2MediaNodeMatches(std::string_view video_driver,
++                          std::string_view video_bus_info,
++                          std::string_view media_driver,
++                          std::string_view media_bus_info) {
++  if (video_driver.empty() || video_driver != media_driver) {
++    return false;
++  }
++  if (!video_bus_info.empty() && !media_bus_info.empty()) {
++    return video_bus_info == media_bus_info;
++  }
++  return true;
++}
++
++std::vector<std::string> FindV4L2CodecDevicePaths(bool decoders,
++                                                  bool encoders) {
++  std::vector<std::string> paths;
++  if (!decoders && !encoders) {
++    return paths;
++  }
++  const std::vector<VideoNode> nodes = FindVideoNodes();
++  bool have_decoder = false;
++  for (const auto& node : nodes) {
++    if ((decoders && node.kind == V4L2CodecNodeKind::kDecoder) ||
++        (encoders && node.kind == V4L2CodecNodeKind::kEncoder)) {
++      VLOG(1) << "V4L2 codec node for the GPU sandbox: " << node.path;
++      paths.push_back(node.path);
++      have_decoder |= node.kind == V4L2CodecNodeKind::kDecoder;
++    }
++  }
++  if (!have_decoder) {
++    return paths;
++  }
++
++  base::FileEnumerator enumerator(base::FilePath("/dev"), /*recursive=*/false,
++                                  base::FileEnumerator::FILES,
++                                  "media*");
++  for (base::FilePath path = enumerator.Next(); !path.empty();
++       path = enumerator.Next()) {
++    if (!IsNumberedNode(path, "media")) {
++      continue;
++    }
++    base::ScopedFD fd(
++        HANDLE_EINTR(open(path.value().c_str(), O_RDWR | O_CLOEXEC)));
++    if (!fd.is_valid()) {
++      continue;
++    }
++    struct media_device_info info = {};
++    if (HANDLE_EINTR(ioctl(fd.get(), MEDIA_IOC_DEVICE_INFO, &info)) != 0) {
++      continue;
++    }
++    const bool matches = std::ranges::any_of(nodes, [&](const VideoNode& n) {
++      return n.kind == V4L2CodecNodeKind::kDecoder &&
++             V4L2MediaNodeMatches(n.driver, n.bus_info,
++                                  KernelString(info.driver),
++                                  KernelString(info.bus_info));
++    });
++    if (matches) {
++      VLOG(1) << "V4L2 media node for the GPU sandbox: " << path.value();
++      paths.push_back(path.value());
++    }
++  }
++  return paths;
++}
++
++}  // namespace media
+diff --git a/media/gpu/v4l2/v4l2_codec_nodes.h b/media/gpu/v4l2/v4l2_codec_nodes.h
+new file mode 100644
+index 0000000..6ad1eac
+--- /dev/null
++++ b/media/gpu/v4l2/v4l2_codec_nodes.h
+@@ -0,0 +1,70 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef MEDIA_GPU_V4L2_V4L2_CODEC_NODES_H_
++#define MEDIA_GPU_V4L2_V4L2_CODEC_NODES_H_
++
++#include <stdint.h>
++
++#include <string>
++#include <string_view>
++#include <vector>
++
++#include "base/containers/span.h"
++#include "media/gpu/media_gpu_export.h"
++
++namespace media {
++
++enum class V4L2CodecNodeKind {
++  kNone,
++  kDecoder,
++  kEncoder,
++};
++
++// One entry of VIDIOC_ENUM_FMT.
++struct V4L2FormatDesc {
++  uint32_t fourcc;
++  // V4L2_FMT_FLAG_COMPRESSED.
++  bool compressed;
++};
++
++// Classifies a /dev/videoN node. |device_caps| is VIDIOC_QUERYCAP's
++// device_caps (or capabilities when V4L2_CAP_DEVICE_CAPS is not set).
++// |output_formats| and |capture_formats| are what VIDIOC_ENUM_FMT lists on
++// the OUTPUT and CAPTURE queues.
++//
++// A decoder is a memory-to-memory node that takes a compressed video format
++// on OUTPUT and produces no compressed format on CAPTURE. An encoder is the
++// reverse. Cameras, capture cards and v4l2loopback nodes are not
++// memory-to-memory, and JPEG codecs and image processors are not video
++// codecs, so they are all kNone.
++MEDIA_GPU_EXPORT V4L2CodecNodeKind
++ClassifyV4L2Node(uint32_t device_caps,
++                 base::span<const V4L2FormatDesc> output_formats,
++                 base::span<const V4L2FormatDesc> capture_formats);
++
++// True when the media controller described by MEDIA_IOC_DEVICE_INFO
++// (|media_driver|, |media_bus_info|) belongs to the video node described by
++// VIDIOC_QUERYCAP (|video_driver|, |video_bus_info|). Stateless decoders need
++// that /dev/mediaN for the request API. bus_info is compared only when both
++// are set, because some drivers leave it empty on one of the two.
++MEDIA_GPU_EXPORT bool V4L2MediaNodeMatches(std::string_view video_driver,
++                                           std::string_view video_bus_info,
++                                           std::string_view media_driver,
++                                           std::string_view media_bus_info);
++
++// Lists the /dev/videoN codec nodes (decoders if |decoders|, encoders if
++// |encoders|) and, for decoders, the /dev/mediaN nodes of the same devices.
++// It opens and queries device nodes, so it must run before the GPU process
++// sandbox is engaged. Desktop Linux uses it to allow exactly those paths in
++// the GPU broker: kernels name codec nodes /dev/videoN, next to cameras, and
++// the ChromeOS names (/dev/video-decN, /dev/video-encN) exist only when a
++// udev rule creates them.
++MEDIA_GPU_EXPORT std::vector<std::string> FindV4L2CodecDevicePaths(
++    bool decoders,
++    bool encoders);
++
++}  // namespace media
++
++#endif  // MEDIA_GPU_V4L2_V4L2_CODEC_NODES_H_
+diff --git a/media/gpu/v4l2/v4l2_codec_nodes_unittest.cc b/media/gpu/v4l2/v4l2_codec_nodes_unittest.cc
+new file mode 100644
+index 0000000..57821d0
+--- /dev/null
++++ b/media/gpu/v4l2/v4l2_codec_nodes_unittest.cc
+@@ -0,0 +1,82 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "media/gpu/v4l2/v4l2_codec_nodes.h"
++
++#include <linux/videodev2.h>
++
++#include <vector>
++
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace media {
++namespace {
++
++constexpr uint32_t kM2MMplane =
++    V4L2_CAP_VIDEO_M2M_MPLANE | V4L2_CAP_STREAMING | V4L2_CAP_DEVICE_CAPS;
++
++const std::vector<V4L2FormatDesc> kRaw = {{V4L2_PIX_FMT_NV12, false},
++                                          {V4L2_PIX_FMT_NV12M, false}};
++
++TEST(V4L2CodecNodesTest, StatelessAndStatefulDecoders) {
++  const std::vector<V4L2FormatDesc> stateless = {
++      {V4L2_PIX_FMT_H264_SLICE, true},
++      {V4L2_PIX_FMT_HEVC_SLICE, true},
++      {V4L2_PIX_FMT_VP9_FRAME, true}};
++  EXPECT_EQ(V4L2CodecNodeKind::kDecoder,
++            ClassifyV4L2Node(kM2MMplane, stateless, kRaw));
++
++  const std::vector<V4L2FormatDesc> stateful = {{V4L2_PIX_FMT_H264, true}};
++  EXPECT_EQ(V4L2CodecNodeKind::kDecoder,
++            ClassifyV4L2Node(V4L2_CAP_VIDEO_M2M, stateful, kRaw));
++}
++
++TEST(V4L2CodecNodesTest, Encoder) {
++  const std::vector<V4L2FormatDesc> coded = {{V4L2_PIX_FMT_H264, true},
++                                             {V4L2_PIX_FMT_HEVC, true}};
++  EXPECT_EQ(V4L2CodecNodeKind::kEncoder,
++            ClassifyV4L2Node(kM2MMplane, kRaw, coded));
++}
++
++TEST(V4L2CodecNodesTest, CamerasAndLoopbackAreNotCodecs) {
++  // A UVC camera that streams H.264 is a capture device, not M2M.
++  const std::vector<V4L2FormatDesc> uvc = {{V4L2_PIX_FMT_H264, true},
++                                           {V4L2_PIX_FMT_YUYV, false}};
++  EXPECT_EQ(V4L2CodecNodeKind::kNone,
++            ClassifyV4L2Node(V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_STREAMING,
++                             {}, uvc));
++  // v4l2loopback advertises capture and output, but not M2M.
++  EXPECT_EQ(V4L2CodecNodeKind::kNone,
++            ClassifyV4L2Node(V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_VIDEO_OUTPUT,
++                             kRaw, kRaw));
++}
++
++TEST(V4L2CodecNodesTest, JpegCodecsAndImageProcessorsAreNotVideoCodecs) {
++  const std::vector<V4L2FormatDesc> jpeg = {{V4L2_PIX_FMT_JPEG, true}};
++  EXPECT_EQ(V4L2CodecNodeKind::kNone,
++            ClassifyV4L2Node(kM2MMplane, jpeg, kRaw));
++  EXPECT_EQ(V4L2CodecNodeKind::kNone,
++            ClassifyV4L2Node(kM2MMplane, kRaw, jpeg));
++  EXPECT_EQ(V4L2CodecNodeKind::kNone, ClassifyV4L2Node(kM2MMplane, kRaw, kRaw));
++  // A transcoder (coded on both queues) is neither.
++  const std::vector<V4L2FormatDesc> coded = {{V4L2_PIX_FMT_H264, true}};
++  EXPECT_EQ(V4L2CodecNodeKind::kNone,
++            ClassifyV4L2Node(kM2MMplane, coded, coded));
++}
++
++TEST(V4L2CodecNodesTest, MediaNodeMatchesTheDecoder) {
++  // Apple AVD: /dev/video0 and /dev/media0 both say avd, platform:avd.
++  EXPECT_TRUE(
++      V4L2MediaNodeMatches("avd", "platform:avd", "avd", "platform:avd"));
++  // Two instances of one driver are told apart by bus_info.
++  EXPECT_FALSE(V4L2MediaNodeMatches("rkvdec", "platform:fdc38100.video-codec",
++                                    "rkvdec", "platform:fdc40000.video-codec"));
++  // An empty bus_info on either side falls back to the driver name.
++  EXPECT_TRUE(V4L2MediaNodeMatches("cedrus", "", "cedrus", "platform:cedrus"));
++  EXPECT_FALSE(V4L2MediaNodeMatches("hantro-vpu", "", "uvcvideo", ""));
++  EXPECT_FALSE(V4L2MediaNodeMatches("", "", "", ""));
++}
++
++}  // namespace
++}  // namespace media
+-- 
+2.56.0
+

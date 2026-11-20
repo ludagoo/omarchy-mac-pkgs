@@ -1,7 +1,8 @@
 # SmartRoom carry on omarchy-mac-pkgs
 
-`smartroom/edge` (this branch) is `smartroom/main` at `9540b55` plus the edge
-boot packages and an offline `aura-try` prototype. `smartroom/main` stays the
+`smartroom/edge` (this branch) is `smartroom/main` at `ef30f9d` (the carry on
+omacom main `95b0dd9`, synced 2026-11-20) plus the edge boot packages and an
+offline `aura-try` prototype. `smartroom/main` stays the
 stable line. Do not merge this branch back into `smartroom/main`.
 
 `omarchy-apple-silicon-boot-check` already accepts `aura` as the bootloader
@@ -31,18 +32,49 @@ is the omarchy-pkgs#3025 (edgeB2) recipe, unchanged: omacom/mesa
 both from the SmartRoom repo by name. Drop it when the edge channel
 publishes that Mesa or a newer one.
 
+### What an edge room runs that only we maintain
+
+Each row is a full build of ours that the edge image installs from the signed
+SmartRoom repo instead of the channel's package. The recipe is in this repo,
+so every one can be rebuilt; the commit each builds is `_commit` in its
+PKGBUILD.
+
+| Package | Source we build | Why not the channel's | Drop when |
+| --- | --- | --- | --- |
+| `linux-aurora` 7.3 | ludagoo/linux `smartroom/edge-kernel-3` `d77dde4a` (`smartroom/pkgbuilds/linux-aurora`) | The edge channel is still 7.2.11; the t6021 encoder stack, the J475c SMC sensor tree and the apple-ave usage counter are not upstream | Omarchy's edge channel publishes 7.3 (edgeB2) with the encoder stack, and our sensor and counter patches are upstream or dropped |
+| `aura` | ludagoo/aura `13fb8688` (`smartroom/pkgbuilds/aura`) | The channel ships m1n1-aurora, not aura, and not the t6021 encoder firmware hand-off | Omarchy publishes aura as the Mac boot loader with the t6021 hand-off |
+| `mesa-aurora`, `vulkan-aurora` | omacom/mesa `carry/edgeB-7.3` `23791c134af` (`smartroom/pkgbuilds/mesa-aurora`, the omarchy-pkgs#3025 recipe unchanged) | The published edge Mesa opens only `asahi`; the 7.3 kernel's GPU is `aurora`, so Hyprland cannot start | The edge channel publishes that Mesa or a newer one |
+| `chromium-smartroom` 158 | Arch Linux ARM's chromium PKGBUILD plus `sr-0001`..`sr-0013` (`smartroom/pkgbuilds/chromium-smartroom`; `BUILT` names the package the image pins) | Omarchy's Chromium has no direct V4L2 decode and encode for AVD and AVE | Omarchy's Chromium carries V4L2 decode and encode for AVD/AVE (the `sr-0001`..`sr-0007` changes are prepared for Chromium main) |
+
+`chromium-smartroom` is a long compile (hours on a Studio), so the installer's
+`smartroom/build-packages` copies the built file (`room/prebuilt.sha256`)
+instead of building it. `smartroom/test/chromium-smartroom-recipe-test.sh`
+fails when the recipe here is not the one that built that file
+(`.BUILDINFO`'s `pkgbuild_sha256sum`). `smartroom/chromium-148-v4l2/` records
+the earlier 148 attempt, which never shipped.
+
+How each of these reaches a room: the installer's `smartroom/build-packages`
+builds it from the `_commit` here (or `copy-prebuilt` copies the pinned
+`chromium-smartroom` file), signed with the SmartRoom package key, into the
+SmartRoom repo. A release build (`smartroom/build-image` without `--dev`)
+records it, with its version and sha256, in that release's `PACKAGES` and
+serves it from the release's signed `[smartroom-release]` repository. A room
+takes a new build only when it switches to the release that contains it
+(`smartroomos-release switch`); nothing pulls it from a live repository.
+
 `smartroom/aura-try/` is the first rollback prototype from the design in
 `~/smartroom-rollback/DESIGN.md`. It arms a marker, checks health on a fake
 clock, marks good by write-beside, and rolls back by leaving the configured
 file alone. `smartroom/aura-try/test-all.sh` runs offline. It does not touch
 a real EFI partition and it does not reboot.
 
-`user4k.patch` in the omarchy-mac-boot recipe is still the upstream console
-change. Its test hunk is retargeted so it applies after the panic=10 case,
-and that case checks user4k leaves `panic=10` on the default command line.
+`user4k.patch` in the omarchy-mac-boot recipe is the stable line's (see
+Base): the upstream console change, its cases after upstream's M4 cases,
+and one more that checks user4k leaves `panic=10` on the default command line.
 The Limine boot test reports an Asahi kernel for the one console-leaf call
 that has no boot-update environment; Aurora's user4k cases stay in the
-console test.
+console test. `smartroom/pkgbuilds/omarchy-mac-boot/recipe-test.sh` applies
+the patch as the recipe does and runs the patched console test.
 
 `omarchy-apple-silicon-boot-check` still requires a blake2 hash on a Limine
 entry. It skips that compare only when the last `ENABLE_VERIFICATION` is
@@ -62,8 +94,9 @@ is copied unchanged.
 
 | | |
 | --- | --- |
-| Base commit | `63a6941c698e75213e219205c656c83850c951e8` (omacom/omarchy-mac-pkgs main, "Merge pull request #154 … package-resolution-aurora-names") |
-| Stable channel today | `omarchy-mac-boot 20261104-1` = omarchy-mac-pkgs `7e50e937` + `user4k.patch` (omacom/omarchy-pkgs recipe). Our base differs from it only in `bin/omarchy-apple-silicon-boot-check` and tests. |
+| Base commit | `95b0dd9776c7e24e687b62665d152e885a453777` (omacom/omarchy-mac-pkgs main, "Merge pull request #164 … docs/manual-hardware-truth") |
+| Last sync | 2026-11-20 (from `63a6941`, 23 commits: the M4 display switches in `setup/grub-console.sh`, `update-verify`'s owner-managed boot chains, the Limine sync skip after a snapper cleanup, the integration fixtures). Sync at least once a month and whenever omacom touches a file this carry patches. |
+| Stable channel today | `omarchy-mac-boot 20261104-1` = omarchy-mac-pkgs `7e50e937` + `user4k.patch` (omacom/omarchy-pkgs recipe). Our base is newer than that pin: it also has the changes listed under "Last sync". `user4k.patch` (omacom/omarchy-mac-pkgs#46, still open) is carried onto our base: the same `grub-console.sh` change, its test cases after upstream's M4 cases. |
 
 ## Carried patches
 
@@ -107,7 +140,10 @@ smartroom/sync-upstream.sh --rebase   # rebase smartroom/main locally, print the
 smartroom/sync-upstream.sh --push     # tag sr/prev-<date> and force-push
 ```
 
-After a sync: run `omarchy-mac-boot/test/all` and
+After a sync: check that `smartroom/pkgbuilds/omarchy-mac-boot/user4k.patch`
+still applies (`patch -d omarchy-mac-boot --dry-run -Np2 <…/user4k.patch`)
+and run the console test on the patched copy, update "Base commit" and "Last
+sync" above, run `omarchy-mac-boot/test/all` and
 `OMARCHY_TEST_RUNTIME=<omarchy checkout at the tag in smartroom-omarchy-helpers/SOURCE> smartroom-omarchy-helpers/test/all`;
 when omacom/omarchy-pkgs moves its `omarchy-mac-boot` recipe, diff it against
 `smartroom/pkgbuilds/omarchy-mac-boot/PKGBUILD`; when the stable channel moves
@@ -115,7 +151,23 @@ to a new Omarchy release, run `smartroom-omarchy-helpers/sync-from-runtime`.
 Then rebuild with ludagoo/omarchy-mac-installer `smartroom/build-packages`.
 
 GitHub Actions are disabled on this fork (no inherited workflow can publish
-anything); sync by hand with the script.
+anything); sync by hand with the script. `.github/workflows/smartroom-ci.yml`
+(ours) runs every package's `test/all` and `smartroom/test/all` in upstream
+`tests.yml`'s pinned Arch container on pushes to `smartroom/main`,
+`smartroom/edge` and `fix/**`, read-only and without secrets;
+`smartroom-omarchy-helpers` is compared with omacom/omarchy at its `SOURCE`
+commit. It runs once Lucas enables Actions. To enable: turn Actions on, then
+at once disable every inherited workflow except `SmartRoom checks`
+(`gh workflow disable`), because their files on `main` would otherwise run on
+upstream's triggers.
+
+`omarchy-mac-first-boot` also populates the `smartroom` keyring when the
+image ships `/usr/share/pacman/keyrings/smartroom.gpg`: a SmartRoom release
+image (ludagoo/omarchy-mac-installer, PROGRAM decision 4) takes every package
+from one repository signed with the SmartRoom package key, and each Mac's
+first boot makes its keyring from that directory. Stock images ship no such
+file and populate what they did before (`mac-first-boot-test.sh`,
+`keyring-smartroom`).
 
 ## Rules
 

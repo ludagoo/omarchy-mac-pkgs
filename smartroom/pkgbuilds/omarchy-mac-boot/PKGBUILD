@@ -23,13 +23,13 @@ replaces=('omarchy-apple-boot' 'omarchy-first-boot')
 install=omarchy-mac-boot.install
 # SmartRoom: an exact ludagoo/omarchy-mac-pkgs smartroom/main commit.
 _commit=${SMARTROOM_MAC_PKGS_COMMIT:?set by smartroom/build-packages}
-# user4k.patch is omacom/omarchy-mac-pkgs#46. The grub-console change is
-# the upstream one. The test hunk is retargeted past SmartRoom's panic=10
-# case: GNU patch 2.8 will not apply an end-of-file hunk once lines follow it.
+# user4k.patch is omacom/omarchy-mac-pkgs#46. The grub-console change is the
+# upstream one, on this fork's base; its test cases follow upstream's M4 cases
+# at the end of the console test, which leave an M4 device tree behind.
 source=("omarchy-mac-pkgs::git+https://github.com/ludagoo/omarchy-mac-pkgs.git#commit=${_commit}"
         user4k.patch)
 sha256sums=('SKIP'
-            '994974fb0e9ccfb85cc18f5588a6663aad31269945e5f786709614365d9b11cb')
+            '7b46477969914e5e30a9df2292a622fd0e827253e8c82b9669c1ed2b88887270')
 
 prepare() {
   rm -rf "$srcdir/boot"

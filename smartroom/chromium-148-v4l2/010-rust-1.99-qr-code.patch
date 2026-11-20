@@ -1,0 +1,13 @@
+Use u8::MAX in the vendored qr_code crate.
+Rust 1.99 deprecates u8::max_value(), and this crate denies warnings.
+--- a/third_party/rust/chromium_crates_io/vendor/qr_code-v2/src/structured.rs
++++ b/third_party/rust/chromium_crates_io/vendor/qr_code-v2/src/structured.rs
+@@ -130,7 +130,7 @@
+             return Err(Structured(StructuredWrongEnc));
+         }
+ 
+-        let (length, from) = if value.len() < u8::max_value() as usize + 4 {
++        let (length, from) = if value.len() < u8::MAX as usize + 4 {
+             // 4 is header size, TODO recheck boundary
+             (value[3] as u16, 4usize)
+         } else {

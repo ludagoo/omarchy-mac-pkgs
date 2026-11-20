@@ -1,0 +1,201 @@
+From cf33110409fe21b84cb2a93632d55bf549268246 Mon Sep 17 00:00:00 2001
+From: Lucas Goossen <lucas.goossen@hey.com>
+Date: Wed, 18 Nov 2026 18:15:21 -0300
+Subject: [PATCH 02/12] media/gpu/v4l2: Size the stateless coded format before
+ probing it
+
+SetupInputFormat() calls S_FMT on the OUTPUT (coded) queue with an
+empty size. A stateless driver cannot parse the size from the stream,
+so it keeps its minimum, 64x64 on some drivers. SetExtCtrlsInit() then
+sends an H.264 SPS for the real picture to make the driver list its
+CAPTURE formats, and the driver rejects that SPS as larger than the
+coded format. No CAPTURE format is reported and decoder init fails.
+
+The probe SPS also had no macroblock size and no frame_mbs_only_flag.
+A driver that validates the SPS against the coded format, or that does
+not decode interlaced streams, refused it for the same reason.
+
+Pass the picture size to S_FMT for the stateless coded formats only,
+and fill the probe SPS from that size and mark it progressive. The
+first real frame still sends the SPS the parser read. Stateful
+decoders parse the size themselves and keep the empty size.
+
+Bug: None
+Test: media_unittests --gtest_filter=V4L2UtilsTest.*
+Test: H.264 playback on a stateless decoder whose minimum coded size
+      is 64x64 (Apple AVD, Linux arm64); init failed before
+Assisted-by: Claude:claude-opus-5-5
+---
+ media/gpu/v4l2/v4l2_utils.cc          | 33 +++++++++++++++++++++++++
+ media/gpu/v4l2/v4l2_utils.h           | 14 +++++++++++
+ media/gpu/v4l2/v4l2_utils_unittest.cc | 35 +++++++++++++++++++++++++++
+ media/gpu/v4l2/v4l2_video_decoder.cc  | 16 +++++++-----
+ 4 files changed, 92 insertions(+), 6 deletions(-)
+
+diff --git a/media/gpu/v4l2/v4l2_utils.cc b/media/gpu/v4l2/v4l2_utils.cc
+index a562c08..98d4678 100644
+--- a/media/gpu/v4l2/v4l2_utils.cc
++++ b/media/gpu/v4l2/v4l2_utils.cc
+@@ -5,6 +5,7 @@
+ #include "media/gpu/v4l2/v4l2_utils.h"
+ 
+ #include <fcntl.h>
++#include <linux/v4l2-controls.h>
+ #include <sys/ioctl.h>
+ 
+ #include <algorithm>
+@@ -647,6 +648,38 @@ std::optional<SupportedVideoDecoderConfigs> GetSupportedV4L2DecoderConfigs() {
+   return supported_media_configs;
+ }
+ 
++bool IsV4L2StatelessCodedFormat(uint32_t pix_fmt) {
++  switch (pix_fmt) {
++    case V4L2_PIX_FMT_H264_SLICE:
++    case V4L2_PIX_FMT_HEVC_SLICE:
++    case V4L2_PIX_FMT_VP8_FRAME:
++    case V4L2_PIX_FMT_VP9_FRAME:
++    case V4L2_PIX_FMT_AV1_FRAME:
++      return true;
++    default:
++      return false;
++  }
++}
++
++void FillH264ProbeSps(::v4l2_ctrl_h264_sps* sps,
++                      const gfx::Size& size,
++                      uint8_t bit_depth) {
++  CHECK(sps);
++  *sps = {};
++  sps->bit_depth_luma_minus8 = (bit_depth == 10u) ? 2 : 0;
++  sps->bit_depth_chroma_minus8 = (bit_depth == 10u) ? 2 : 0;
++  sps->chroma_format_idc = 1;  // 4:2:0
++  // Progressive. A driver that rejects an SPS which does not say so never
++  // enumerates capture formats.
++  sps->flags = V4L2_H264_SPS_FLAG_FRAME_MBS_ONLY;
++  if (!size.IsEmpty()) {
++    sps->pic_width_in_mbs_minus1 =
++        static_cast<__u16>((size.width() + 15) / 16 - 1);
++    sps->pic_height_in_map_units_minus1 =
++        static_cast<__u16>((size.height() + 15) / 16 - 1);
++  }
++}
++
+ bool IsV4L2DecoderStateful() {
+   auto device_fd = V4L2Device::OpenFDForType(V4L2Device::Type::kDecoder);
+   if (!device_fd.is_valid()) {
+diff --git a/media/gpu/v4l2/v4l2_utils.h b/media/gpu/v4l2/v4l2_utils.h
+index feadeca..902d1f3 100644
+--- a/media/gpu/v4l2/v4l2_utils.h
++++ b/media/gpu/v4l2/v4l2_utils.h
+@@ -81,6 +81,20 @@ size_t GetNumPlanesOfV4L2PixFmt(uint32_t pix_fmt);
+ std::optional<VideoFrameLayout> V4L2FormatToVideoFrameLayout(
+     const struct v4l2_format& format);
+ 
++// True for the coded formats of the stateless (request API) decoders:
++// H264_SLICE, HEVC_SLICE, VP8_FRAME, VP9_FRAME and AV1_FRAME.
++bool IsV4L2StatelessCodedFormat(uint32_t pix_fmt);
++
++// Sequence header used to make a stateless driver enumerate capture formats.
++// The coded queue is sized to |size|, and the probe SPS must describe that
++// same picture. An empty |size| leaves the macroblock fields at 0. Progressive
++// is set because a driver that refuses an interlaced sequence otherwise
++// reports no capture format. Each real frame still sends the SPS the parser
++// read.
++void FillH264ProbeSps(::v4l2_ctrl_h264_sps* sps,
++                      const gfx::Size& size,
++                      uint8_t bit_depth);
++
+ // Query the driver to see what scalability modes are supported for the driver.
+ std::vector<SVCScalabilityMode> GetSupportedScalabilityModesForV4L2Codec(
+     const IoctlAsCallback& ioctl_cb,
+diff --git a/media/gpu/v4l2/v4l2_utils_unittest.cc b/media/gpu/v4l2/v4l2_utils_unittest.cc
+index cc5a471..a2eb21b 100644
+--- a/media/gpu/v4l2/v4l2_utils_unittest.cc
++++ b/media/gpu/v4l2/v4l2_utils_unittest.cc
+@@ -4,6 +4,8 @@
+ 
+ #include "media/gpu/v4l2/v4l2_utils.h"
+ 
++#include <linux/v4l2-controls.h>
++
+ #include <cstring>
+ #include <sstream>
+ #include <vector>
+@@ -129,6 +131,39 @@ TEST(V4L2UtilsTest, V4L2FormatToVideoFrameLayoutP010) {
+           kNoModifierStr + ")");
+ }
+ 
++TEST(V4L2UtilsTest, IsV4L2StatelessCodedFormat) {
++  EXPECT_TRUE(IsV4L2StatelessCodedFormat(V4L2_PIX_FMT_H264_SLICE));
++  EXPECT_TRUE(IsV4L2StatelessCodedFormat(V4L2_PIX_FMT_HEVC_SLICE));
++  EXPECT_TRUE(IsV4L2StatelessCodedFormat(V4L2_PIX_FMT_VP8_FRAME));
++  EXPECT_TRUE(IsV4L2StatelessCodedFormat(V4L2_PIX_FMT_VP9_FRAME));
++  // Stateful coded formats keep an empty coded size on S_FMT.
++  EXPECT_FALSE(IsV4L2StatelessCodedFormat(V4L2_PIX_FMT_H264));
++  EXPECT_FALSE(IsV4L2StatelessCodedFormat(V4L2_PIX_FMT_HEVC));
++  EXPECT_FALSE(IsV4L2StatelessCodedFormat(V4L2_PIX_FMT_VP9));
++  EXPECT_FALSE(IsV4L2StatelessCodedFormat(V4L2_PIX_FMT_NV12));
++}
++
++TEST(V4L2UtilsTest, FillH264ProbeSpsMatchesThePicture) {
++  struct v4l2_ctrl_h264_sps sps = {};
++  FillH264ProbeSps(&sps, gfx::Size(1920, 1080), 8);
++  EXPECT_EQ(0u, sps.bit_depth_luma_minus8);
++  EXPECT_EQ(1u, sps.chroma_format_idc);
++  EXPECT_EQ(static_cast<decltype(sps.flags)>(V4L2_H264_SPS_FLAG_FRAME_MBS_ONLY),
++            sps.flags);
++  EXPECT_EQ(119u, sps.pic_width_in_mbs_minus1);
++  EXPECT_EQ(67u, sps.pic_height_in_map_units_minus1);
++
++  FillH264ProbeSps(&sps, gfx::Size(1920, 1080), 10);
++  EXPECT_EQ(2u, sps.bit_depth_luma_minus8);
++  EXPECT_EQ(2u, sps.bit_depth_chroma_minus8);
++
++  FillH264ProbeSps(&sps, gfx::Size(), 8);
++  EXPECT_EQ(0u, sps.pic_width_in_mbs_minus1);
++  EXPECT_EQ(0u, sps.pic_height_in_map_units_minus1);
++  EXPECT_EQ(static_cast<decltype(sps.flags)>(V4L2_H264_SPS_FLAG_FRAME_MBS_ONLY),
++            sps.flags);
++}
++
+ // Test V4L2FormatToVideoFrameLayout with NV12M pixelformat, which has two
+ // buffers and two color planes.
+ TEST(V4L2UtilsTest, V4L2FormatToVideoFrameLayoutNV12M) {
+diff --git a/media/gpu/v4l2/v4l2_video_decoder.cc b/media/gpu/v4l2/v4l2_video_decoder.cc
+index 97211bb..35dafad 100644
+--- a/media/gpu/v4l2/v4l2_video_decoder.cc
++++ b/media/gpu/v4l2/v4l2_video_decoder.cc
+@@ -602,9 +602,16 @@ bool V4L2VideoDecoder::SetupInputFormat() {
+     input_size = GetInputBufferSizeForResolution(max_size);
+   }
+ 
+-  // Setup the input format.
++  // A stateless driver cannot parse the coded size from the bitstream, so
++  // the coded queue is given the picture size. An empty size leaves the
++  // driver's minimum (64x64 on some stateless decoders), and the SPS sent by
++  // SetExtCtrlsInit() is then rejected as larger than the coded format.
++  // Stateful drivers parse the size themselves and keep an empty size.
++  const gfx::Size coded_size = IsV4L2StatelessCodedFormat(input_format_fourcc_)
++                                   ? current_resolution_
++                                   : gfx::Size();
+   auto format =
+-      input_queue_->SetFormat(input_format_fourcc_, gfx::Size(), input_size);
++      input_queue_->SetFormat(input_format_fourcc_, coded_size, input_size);
+   if (!format) {
+     VPLOGF(1) << "Failed to call IOCTL to set input format.";
+     return false;
+@@ -776,10 +783,7 @@ CroStatus V4L2VideoDecoder::SetExtCtrlsInit(const gfx::Size& size,
+   if (input_format_fourcc_ == V4L2_PIX_FMT_H264_SLICE) {
+     // For H264 the SPS data is sent in to indicate bit_depth content.
+     VLOGF(1) << "Setting EXT_CTRLS for H264";
+-    v4l2_h264_sps = {};
+-    v4l2_h264_sps.bit_depth_luma_minus8 = (bit_depth == 10u) ? 2 : 0;
+-    v4l2_h264_sps.bit_depth_chroma_minus8 = (bit_depth == 10u) ? 2 : 0;
+-    v4l2_h264_sps.chroma_format_idc = 1;  // 4:2:0
++    FillH264ProbeSps(&v4l2_h264_sps, size, bit_depth);
+ 
+     ctrl.id = V4L2_CID_STATELESS_H264_SPS;
+     ctrl.size = sizeof(v4l2_h264_sps);
+-- 
+2.56.0
+
