@@ -53,6 +53,15 @@ fails when the recipe here is not the one that built that file
 (`.BUILDINFO`'s `pkgbuild_sha256sum`). `smartroom/chromium-148-v4l2/` records
 the earlier 148 attempt, which never shipped.
 
+How each of these reaches a room: the installer's `smartroom/build-packages`
+builds it from the `_commit` here (or `copy-prebuilt` copies the pinned
+`chromium-smartroom` file), signed with the SmartRoom package key, into the
+SmartRoom repo. A release build (`smartroom/build-image` without `--dev`)
+records it, with its version and sha256, in that release's `PACKAGES` and
+serves it from the release's signed `[smartroom-release]` repository. A room
+takes a new build only when it switches to the release that contains it
+(`smartroomos-release switch`); nothing pulls it from a live repository.
+
 `smartroom/aura-try/` is the first rollback prototype from the design in
 `~/smartroom-rollback/DESIGN.md`. It arms a marker, checks health on a fake
 clock, marks good by write-beside, and rolls back by leaving the configured
