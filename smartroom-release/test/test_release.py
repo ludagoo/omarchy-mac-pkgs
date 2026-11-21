@@ -951,6 +951,9 @@ class Cli(unittest.TestCase):
         self.assertIn("/var/lib/smartroomos", entries)         # the first-boot latch
         self.assertIn("/etc/machine-id", entries)
         self.assertIn("/etc/ssh/ssh_host_*", entries)
+        self.assertIn("/etc/systemd/system/smartroom-agent.service", entries)
+        self.assertIn("/opt/smartroom/agent", entries)
+        self.assertNotIn("/etc/systemd/system/smartroom-agent.service.d", entries)
 
 
 if __name__ == "__main__":

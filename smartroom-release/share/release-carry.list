@@ -9,6 +9,15 @@
 /etc/localtime
 /etc/ssh/ssh_host_*
 /etc/smartroomos/unique-id
+# The Room Controller (/opt/smartroom/agent + venv + systemd unit) is installed
+# by firstboot and self-updates independently of OS images; carry the program
+# and its install-unit drop-ins while letting the new OS release supply its own
+# snapshot-helper.conf, no-wayland-wait.conf, and serial-uucp.conf.
+/etc/systemd/system/smartroom-agent.service
+/etc/systemd/system/multi-user.target.wants/smartroom-agent.service
+/etc/systemd/system/smartroom-agent.service.d/clear-wayland-wait.conf
+/etc/systemd/system/smartroom-agent.service.d/kiosk-user.conf
+/etc/systemd/system/smartroom-agent.service.d/serial-groups.conf
 /etc/systemd/system/smartroom-agent.service.d/server-url.conf
 /etc/NetworkManager/system-connections
 /var/lib/NetworkManager
@@ -22,6 +31,11 @@
 /var/lib/omarchy/mac-first-boot/install.conf
 /var/lib/omarchy/mac-first-boot/keyring
 /var/lib/omarchy/vendor-firmware.stamp
+/opt/smartroom/agent
+/opt/smartroom/agent-prev
+/opt/smartroom/bin
+/opt/smartroom/install
+/opt/smartroom/venv
 /opt/smartroom/config
 /opt/smartroom/state
 /opt/smartroom/chrome-profiles
