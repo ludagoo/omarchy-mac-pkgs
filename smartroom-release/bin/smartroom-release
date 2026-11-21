@@ -316,36 +316,71 @@ def boot_store_has(host: Host, release: str) -> bool:
     return uki is not None
 
 
-def resolve_boot_files(host: Host, entry: dict) -> tuple[Path, Optional[Path]]:
-    """Locate UKI (+ stage2) for a kept release: ESP path, legacy ESP store, then btrfs store."""
+def _shared_esp_slots(layout: BootLayout) -> set[str]:
+    """ESP paths that rotate between releases; never treat as one release's archive."""
+    return {p for p in (
+        layout.configured_uki, layout.previous_uki, layout.trial_uki,
+        layout.configured_boot, layout.previous_boot, layout.trial_boot,
+        CONFIGURED_UKI, PREVIOUS_UKI, TRIAL_UKI,
+        CONFIGURED_BOOT, PREVIOUS_BOOT, TRIAL_BOOT,
+    ) if p}
+
+
+def resolve_boot_files(host: Host, entry: dict,
+                       state: Optional[dict] = None) -> tuple[Path, Optional[Path]]:
+    """Locate UKI (+ stage2) for a kept release.
+
+    Prefer btrfs boot-store and the legacy named ESP store. Shared ESP slots
+    (configured/previous/trial) are only used when this entry currently owns
+    that slot — otherwise history would pick up another release's bytes.
+    """
     layout = host.layout()
     esp = host.esp()
     release = entry.get("release") or ""
+    shared = _shared_esp_slots(layout)
     uki_src: Optional[Path] = None
     boot_src: Optional[Path] = None
-    if entry.get("uki") and (esp / entry["uki"]).is_file():
-        uki_src = esp / entry["uki"]
+    conf = ((state or {}).get("configured") or {}).get("release")
+    prev = ((state or {}).get("previous") or {}).get("release")
+
+    stored_u, stored_b = boot_store_paths(host, release)
+    if stored_u is not None:
+        uki_src, boot_src = stored_u, stored_b
+
     if uki_src is None:
         legacy = esp / STATE_DIR / "uki" / f"{release}.efi"
         if legacy.is_file():
             uki_src = legacy
-    if uki_src is None:
-        stored_u, stored_b = boot_store_paths(host, release)
-        if stored_u is not None:
-            uki_src = stored_u
-            boot_src = stored_b
+
+    if uki_src is None and entry.get("uki"):
+        rel = entry["uki"]
+        path = esp / rel
+        if path.is_file():
+            if rel not in shared:
+                uki_src = path
+            elif rel in (layout.configured_uki, CONFIGURED_UKI) and conf == release:
+                uki_src = path
+            elif rel in (layout.previous_uki, PREVIOUS_UKI) and prev == release:
+                uki_src = path
+
     if uki_src is None:
         raise Fail(f"the release {release}'s UKI is gone", "not-found")
+
     if layout.uses_aura:
-        if boot_src is None and entry.get("boot") and (esp / entry["boot"]).is_file():
-            boot_src = esp / entry["boot"]
         if boot_src is None:
             legacy_b = esp / STATE_DIR / "boot" / f"{release}.bin"
             if legacy_b.is_file():
                 boot_src = legacy_b
-        if boot_src is None:
-            _, stored_b = boot_store_paths(host, release)
-            boot_src = stored_b
+        if boot_src is None and entry.get("boot"):
+            rel = entry["boot"]
+            path = esp / rel
+            if path.is_file():
+                if rel not in shared:
+                    boot_src = path
+                elif rel in (layout.configured_boot, CONFIGURED_BOOT) and conf == release:
+                    boot_src = path
+                elif rel in (layout.previous_boot, PREVIOUS_BOOT) and prev == release:
+                    boot_src = path
         if boot_src is None:
             raise Fail(f"the release {release}'s boot files are gone", "not-found")
     return uki_src, boot_src
@@ -488,14 +523,15 @@ def ingest_esp_hold(host: Host, state: dict, hold: Optional[Path] = None) -> lis
     return actions
 
 
-def ensure_entry_in_boot_store(host: Host, entry: Optional[dict]) -> None:
+def ensure_entry_in_boot_store(host: Host, entry: Optional[dict],
+                               state: Optional[dict] = None) -> None:
     if not entry or not entry.get("release"):
         return
     release = entry["release"]
     if boot_store_has(host, release):
         return
     try:
-        uki, boot = resolve_boot_files(host, entry)
+        uki, boot = resolve_boot_files(host, entry, state=state)
     except Fail:
         return
     boot_store_put(host, release, uki, boot)
@@ -511,10 +547,10 @@ def esp_offload_non_essential(host: Host, state: dict, for_trial: bool = False) 
     layout = host.layout()
     esp = host.esp()
     # Ensure configured + previous + history are durable on btrfs.
-    ensure_entry_in_boot_store(host, state.get("configured"))
-    ensure_entry_in_boot_store(host, state.get("previous"))
+    ensure_entry_in_boot_store(host, state.get("configured"), state=state)
+    ensure_entry_in_boot_store(host, state.get("previous"), state=state)
     for entry in state.get("history") or []:
-        ensure_entry_in_boot_store(host, entry)
+        ensure_entry_in_boot_store(host, entry, state=state)
     # While staging/arming a trial, previous ESP slots are not needed for fallback
     # (aura/Limine fall back to configured). Free them for the trial + promote reserve.
     trial = state.get("trial")
@@ -575,7 +611,7 @@ def restore_previous_to_esp(host: Host, state: dict) -> None:
     esp = host.esp()
     if layout.previous_uki and (esp / layout.previous_uki).is_file():
         return
-    uki, boot = resolve_boot_files(host, prev)
+    uki, boot = resolve_boot_files(host, prev, state=state)
     copy_atomic(uki, esp / layout.previous_uki)
     if layout.uses_aura and boot is not None and layout.previous_boot:
         copy_atomic(boot, esp / layout.previous_boot)
@@ -1935,7 +1971,7 @@ def promote_previous_as_trial(host: Host, state: dict, entry: Optional[dict] = N
     esp = host.esp()
     # Ensure durable store is populated from any legacy ESP copies first.
     esp_offload_non_essential(host, state, for_trial=True)
-    uki_src, boot_src = resolve_boot_files(host, prev)
+    uki_src, boot_src = resolve_boot_files(host, prev, state=state)
     with host.top() as top:
         if prev["root"] and not subvol_exists(top, prev["root"]):
             raise Fail(f"the previous root {prev['root']} is gone", "not-found")
