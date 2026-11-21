@@ -115,6 +115,13 @@ in `smartroom/aura-try/` (which stays as the design reference and its own test).
   `ROOT_SUBVOLUME_PATH` / `ROOT_SNAPSHOTS_PATH` to the live `@r-<id>` so
   limine-snapper-sync keeps working after the first promote. Firmware side:
   `smartroomcontrollerfirmware` `docs/disk-drift.md`.
+- **WS13c (home + export + never-forget).** On stage: if the outgoing root has
+  drift, `smartroomos-integrity archive-outgoing` writes
+  `/var/lib/smartroomos/drift-archive/<old>-<time>/` (last 5; never blocks;
+  never re-applies). On promote: also take a home as-installed snapper
+  snapshot (`-c home`, nested `/home/.snapshots` on `@home` so it survives
+  root replace). Home runtime IGNORE list and layout extras: see
+  `docs/disk-drift.md`.
 
 `user4k.patch` in the omarchy-mac-boot recipe is the stable line's (see
 Base): the upstream console change, its cases after upstream's M4 cases,

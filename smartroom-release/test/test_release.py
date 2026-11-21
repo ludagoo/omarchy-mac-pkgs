@@ -1086,6 +1086,52 @@ class Ws13SnapperAndKey(unittest.TestCase):
         self.assertEqual(data.get("kind"), "as-installed")
         self.assertIn("as installed", data.get("description") or "")
 
+    def test_promote_writes_home_as_installed_marker(self):
+        """WS13c: home as-installed marker beside root marker."""
+        w = World(self)
+        (w.prefix / "home").mkdir(parents=True, exist_ok=True)
+        w.run("update", str(w.release()), "--unsigned")
+        w.trial_boot()
+        self.assertEqual(w.run("health-run")[0], 0)
+        marker = w.prefix / "var/lib/smartroomos/integrity/as-installed-home.json"
+        self.assertTrue(marker.is_file(), "home as-installed marker missing after promote")
+        data = json.loads(marker.read_text())
+        self.assertEqual(data.get("kind"), "as-installed")
+        self.assertIn("as installed", data.get("description") or "")
+
+    def test_stage_archives_outgoing_drift_when_present(self):
+        """WS13c: stage archives outgoing drift via integrity archive-outgoing."""
+        w = World(self)
+        tool = w.prefix / "usr/local/sbin/smartroomos-integrity"
+        tool.parent.mkdir(parents=True, exist_ok=True)
+        tool.write_text(
+            "#!/bin/bash\n"
+            "set -e\n"
+            "root=\"${SMARTROOMOS_ROOT:-/}\"\n"
+            "if [[ \"$1\" == archive-outgoing ]]; then\n"
+            "  id=\"old-20261121T000000Z\"\n"
+            "  d=\"$root/var/lib/smartroomos/drift-archive/$id\"\n"
+            "  mkdir -p \"$d\" \"$root/var/lib/smartroomos/integrity\"\n"
+            "  echo archived >\"$d/README.md\"\n"
+            "  printf '%s\\n' '{\"archives\":[{\"id\":\"old-20261121T000000Z\",\"acked\":false,\"count\":1,\"paths\":[\"/etc/x\"],\"old_release\":\"old\",\"new_release\":\"2026.11.21-2\"}]}' "
+            ">\"$root/var/lib/smartroomos/integrity/hand-changes-pending.json\"\n"
+            "  exit 0\n"
+            "fi\n"
+            "exit 0\n"
+        )
+        tool.chmod(0o755)
+        w.run("update", str(w.release()), "--unsigned")
+        w.trial_boot()
+        self.assertEqual(w.run("health-run")[0], 0)
+        rel = w.release(name="2026.11.21-2")
+        rc, out, err = w.run("stage", str(rel), "--unsigned")
+        self.assertEqual(rc, 0, err or out)
+        pending = w.prefix / "var/lib/smartroomos/integrity/hand-changes-pending.json"
+        self.assertTrue(pending.is_file(), "hand-changes-pending missing after stage")
+        self.assertTrue(
+            (w.prefix / "var/lib/smartroomos/drift-archive/old-20261121T000000Z/README.md").is_file()
+        )
+
     def test_promote_snapshot_after_edits_leaves_zero_limine_drift(self):
         """WS13b: as-installed is taken after limine finalize + record_integrity."""
         w = World(self)

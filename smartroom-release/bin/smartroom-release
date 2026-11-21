@@ -1112,6 +1112,82 @@ def take_as_installed_snapshot(host: Host, release: str) -> Optional[int]:
     return num
 
 
+def take_as_installed_home_snapshot(host: Host, release: str) -> Optional[int]:
+    """Read-only snapper snapshot of @home at promote (WS13c).
+
+    Lives under /home/.snapshots on the @home subvolume, so it survives when
+    the release root is replaced. Same userdata as the root as-installed.
+    """
+    if host.prefix:
+        marker = host.p("/var/lib/smartroomos/integrity/as-installed-home.json")
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        home = host.p("/home")
+        home.mkdir(parents=True, exist_ok=True)
+        marker.write_text(json.dumps({
+            "snapshot": 1, "uuid": None, "kind": "as-installed",
+            "path": str(home),
+            "description": f"release {release} as installed",
+            "note": None,
+        }) + "\n")
+        return 1
+    if not host.p("/home").is_dir():
+        return None
+    repair = host.p("/usr/local/sbin/smartroomos-snapper-repair")
+    if repair.is_file():
+        host.run([str(repair)], check=False)
+    desc = f"release {release} as installed"
+    userdata = f"release={release},purpose=as-installed"
+    done = host.run([
+        "snapper", "--no-dbus", "-c", "home", "create",
+        "--type", "single", "--read-only",
+        "--description", desc,
+        "--cleanup-algorithm", "",
+        "--userdata", userdata,
+        "--print-number",
+    ], check=False)
+    num = _snapper_print_number(done)
+    if num is None:
+        return None
+    marker = host.p("/var/lib/smartroomos/integrity/as-installed-home.json")
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    path = f"/home/.snapshots/{num}/snapshot"
+    write_atomic(marker, (json.dumps({
+        "snapshot": num, "uuid": None, "kind": "as-installed", "path": path,
+        "description": desc, "note": None,
+    }, indent=2) + "\n").encode(), mode=0o644)
+    return num
+
+
+def archive_outgoing_drift(host: Host, state: dict, new_release: str) -> None:
+    """If the current room has drift, export it before installing a new release.
+
+    Never blocks the update and never re-applies the changes (WS13c).
+    """
+    if host.prefix:
+        # Scratch: call the integrity tool against the fake root when present.
+        tool = host.p("/usr/local/sbin/smartroomos-integrity")
+        if not tool.is_file():
+            return
+        old = (state.get("configured") or {}).get("release") or "unknown"
+        env = os.environ.copy()
+        env["SMARTROOMOS_ROOT"] = str(host.p("/"))
+        # Honour the shebang (python or a test stub shell script).
+        subprocess.run(
+            [str(tool), "archive-outgoing",
+             "--old-release", str(old), "--new-release", str(new_release)],
+            check=False, env=env,
+        )
+        return
+    tool = Path("/usr/local/sbin/smartroomos-integrity")
+    if not tool.is_file():
+        return
+    old = (state.get("configured") or {}).get("release") or "unknown"
+    host.run([
+        str(tool), "archive-outgoing",
+        "--old-release", str(old), "--new-release", str(new_release),
+    ], check=False)
+
+
 def new_root_cmdline(new_root: Path, fallback: str) -> str:
     path = new_root / "etc/default/limine"
     if path.is_file():
@@ -1367,6 +1443,9 @@ def stage_release(host: Host, state: dict, directory: Path, unsigned: bool, kind
     roles = {item["role"]: item for item in manifest["boot"]}
     subvol = subvol_name(release)
     cmdline = None
+    # WS13c: save hand changes from the outgoing root before we replace it.
+    # Never blocks; never re-applies. Banner stays until ack.
+    archive_outgoing_drift(host, state, release)
     prune(host, state)                 # roots left by failed trials are dead weight; free their space first
     with host.top() as top:
         if subvol_exists(top, subvol):
@@ -1818,6 +1897,8 @@ def promote(host: Host, state: dict) -> None:
     # algorithm so snapper-cleanup never deletes it; prune of the release root
     # removes the nested .snapshots with the root. Last step on purpose.
     take_as_installed_snapshot(host, conf_now["release"])
+    # Home as-installed on @home (survives the next root replace). WS13c.
+    take_as_installed_home_snapshot(host, conf_now["release"])
 
 
 def prune(host: Host, state: dict) -> None:
