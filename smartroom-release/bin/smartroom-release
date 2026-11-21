@@ -900,6 +900,9 @@ def fix_root_files(host: Host, new_root: Path, subvol: str, release: str) -> Non
     # Put the SmartRoom release signing key into pacman's keyring so
     # `pacman -Q` stops asking to import it on rooms that carried an older gnupg.
     import_release_pacman_key(host, new_root)
+    # Precompile our Python so the live room never writes __pycache__ at runtime
+    # (a planted .pyc must still show as drift; do not IGNORE __pycache__).
+    precompile_smartroom_python(new_root)
 
 
 def ensure_nested_snapshots(host: Host, root: Path) -> None:
@@ -949,8 +952,60 @@ def import_release_pacman_key(host: Host, root: Path) -> None:
     )
 
 
+def precompile_smartroom_python(root: Path) -> None:
+    """Write __pycache__ for our shipped Python so runtime imports create no new .pyc."""
+    import compileall
+    targets = [
+        root / "usr/local/lib/smartroomos",
+        root / "usr/local/sbin",
+        root / "usr/local/bin",
+        root / "usr/bin",
+    ]
+    for path in targets:
+        if path.is_dir():
+            compileall.compile_dir(str(path), quiet=1, force=False, legacy=False)
+        elif path.is_file() and path.suffix == ".py":
+            compileall.compile_file(str(path), quiet=1, force=False)
+
+
+def finalize_promoted_root(host: Host, release: str, subvol: str) -> None:
+    """Last root edits before the as-installed snapshot (WS13b).
+
+    Re-normalize /etc/default/limine to the configured cmdline (no trial-only
+    params) so the snapshot matches what promote leaves on disk.
+    """
+    path = host.p("/etc/default/limine")
+    if path.is_file():
+        text = path.read_text()
+
+        def one(match: re.Match[str]) -> str:
+            rel = None if release == INSTALLED else release
+            return match.group(1) + with_subvol(match.group(2), subvol, rel) + match.group(3)
+
+        new = re.sub(r'^(KERNEL_CMDLINE\[[^\]]*\]=")([^"]*)(")', one, text, flags=re.M)
+        if new != text:
+            write_atomic(path, new.encode(), mode=path.stat().st_mode & 0o7777)
+    precompile_smartroom_python(host.p("/"))
+
+
+def exclude_as_installed_from_limine_sync(host: Host, snap_num: int) -> None:
+    """Drop the ESP UKI copy limine-snapper-sync made for an as-installed snapshot.
+
+    As-installed snapshots are drift references, not boot targets. They are
+    created as snapper type=post so EXCLUDE_SNAPSHOT_TYPES=post skips them;
+    limine-snapper-remove cleans any copy that still landed (older configs).
+    """
+    if host.prefix or snap_num is None or snap_num < 1:
+        return
+    host.run(["limine-snapper-remove", str(snap_num)], check=False)
+
+
 def take_as_installed_snapshot(host: Host, release: str) -> Optional[int]:
-    """Read-only snapper snapshot of the running root after promote. No cleanup algorithm."""
+    """Read-only snapper snapshot of the running root after promote. No cleanup algorithm.
+
+    Type=post so limine-snapper-sync's EXCLUDE_SNAPSHOT_TYPES=post skips the
+    ESP UKI copy (as-installed is a reference, not a boot target).
+    """
     if host.prefix:
         # Scratch tests: create a marker file the integrity tool can find.
         marker = host.p("/var/lib/smartroomos/integrity/as-installed.json")
@@ -967,20 +1022,33 @@ def take_as_installed_snapshot(host: Host, release: str) -> Optional[int]:
         host.run([str(repair)], check=False)
     desc = f"release {release} as installed"
     userdata = f"release={release},purpose=as-installed"
+    # type=post: excluded by EXCLUDE_SNAPSHOT_TYPES=post (ESP budget). pre-number
+    # 0 is a sentinel; snapper accepts it for an orphan post with no cleanup.
     done = host.run([
         "snapper", "--no-dbus", "-c", "root", "create",
-        "--type", "single", "--read-only",
+        "--type", "post", "--pre-number", "0", "--read-only",
         "--description", desc,
         "--cleanup-algorithm", "",
         "--userdata", userdata,
         "--print-number",
     ], check=False)
     if done.returncode != 0:
+        # Older snapper: fall back to single, then remove any ESP copy.
+        done = host.run([
+            "snapper", "--no-dbus", "-c", "root", "create",
+            "--type", "single", "--read-only",
+            "--description", desc,
+            "--cleanup-algorithm", "",
+            "--userdata", userdata,
+            "--print-number",
+        ], check=False)
+    if done.returncode != 0:
         return None
     try:
         num = int(done.stdout.decode().strip().splitlines()[-1])
     except (ValueError, IndexError):
         return None
+    exclude_as_installed_from_limine_sync(host, num)
     marker = host.p("/var/lib/smartroomos/integrity/as-installed.json")
     marker.parent.mkdir(parents=True, exist_ok=True)
     path = f"/.snapshots/{num}/snapshot"
@@ -1113,12 +1181,20 @@ def status_doc(host: Host, state: dict) -> dict:
     conf = state.get("configured") or {}
     prev = state.get("previous")
     layout = host.layout()
-    on_trial = bool(host.dt_trial()) if layout.uses_aura else (
-        bool(trial_state) and trial_state.get("phase") in ("booting", "armed")
-        and root == trial_state.get("root"))
-    # Prefer the cmdline / root fact for Mini once userspace is up.
-    if not layout.uses_aura and trial_state and root == trial_state.get("root") and release == trial_state.get("release"):
-        on_trial = True
+    # Studio: aurora,trial stays in the device tree until reboot. After a
+    # committed promote on this boot, trust state (trial is None) so status
+    # does not keep saying "trial boot" (WS13b / same class as trial_pending).
+    if layout.uses_aura:
+        on_trial = bool(host.dt_trial()) and bool(trial_state)
+        if trial_state is None and (state.get("last_result") or {}).get("result") == "committed":
+            on_trial = False
+    else:
+        on_trial = (
+            bool(trial_state) and trial_state.get("phase") in ("booting", "armed")
+            and root == trial_state.get("root"))
+        # Prefer the cmdline / root fact for Mini once userspace is up.
+        if trial_state and root == trial_state.get("root") and release == trial_state.get("release"):
+            on_trial = True
     last = state.get("last_result")
     number = 0
     for entry in [conf, prev or {}] + list(state.get("history") or []):
@@ -1677,14 +1753,18 @@ def promote(host: Host, state: dict) -> None:
     save_state(host, state)
     clear_trial_files(host, state)
     prune(host, state)
-    # Frozen "as installed" reference for full-disk drift (WS13). No cleanup
-    # algorithm so snapper-cleanup never deletes it; prune of the release root
-    # removes the nested .snapshots with the root.
-    take_as_installed_snapshot(host, state["configured"]["release"])
-    # Ensure the release signing key is in the live pacman keyring even when
-    # this root was staged by an older smartroom-release (carry alone is not enough).
+    # Every promotion edit on the live root must finish BEFORE the as-installed
+    # snapshot (WS13b): limine defaults, pacman key, integrity manifest/store.
+    # Taking the snapshot earlier left /etc/default/limine and the manifest as
+    # permanent drift after every update.
+    conf_now = state["configured"]
+    finalize_promoted_root(host, conf_now["release"], conf_now["root"] or "@")
     import_release_pacman_key(host, host.p("/"))
     host.record_integrity()
+    # Frozen "as installed" reference for full-disk drift (WS13). No cleanup
+    # algorithm so snapper-cleanup never deletes it; prune of the release root
+    # removes the nested .snapshots with the root. Last step on purpose.
+    take_as_installed_snapshot(host, conf_now["release"])
 
 
 def prune(host: Host, state: dict) -> None:

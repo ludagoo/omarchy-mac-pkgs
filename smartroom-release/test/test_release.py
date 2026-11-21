@@ -1086,6 +1086,75 @@ class Ws13SnapperAndKey(unittest.TestCase):
         self.assertEqual(data.get("kind"), "as-installed")
         self.assertIn("as installed", data.get("description") or "")
 
+    def test_promote_snapshot_after_edits_leaves_zero_limine_drift(self):
+        """WS13b: as-installed is taken after limine finalize + record_integrity."""
+        w = World(self)
+        # Seed a limine defaults file the promote path rewrites.
+        limine = w.prefix / "etc/default/limine"
+        limine.parent.mkdir(parents=True, exist_ok=True)
+        limine.write_text(
+            'TARGET_OS_NAME="SmartRoom Firmware"\n'
+            f'KERNEL_CMDLINE[default]="{CMDLINE} smartroom.release=old watchdog.handle_boot_enabled=0"\n'
+        )
+        # Fake integrity tool records a stamp under MANIFEST_DIR so we can see
+        # it lands before the as-installed marker path is written.
+        tool = w.prefix / "usr/local/sbin/smartroomos-integrity"
+        tool.parent.mkdir(parents=True, exist_ok=True)
+        tool.write_text(
+            "#!/bin/bash\n"
+            "set -e\n"
+            "root=\"${SMARTROOMOS_ROOT:-/}\"\n"
+            "d=\"$root/usr/local/lib/smartroomos/integrity\"\n"
+            "mkdir -p \"$d/store\"\n"
+            "echo recorded >\"$d/manifest.json\"\n"
+            "echo blob >\"$d/store/deadbeef\"\n"
+            "exit 0\n"
+        )
+        tool.chmod(0o755)
+        # Also ship a tiny .py so precompile creates __pycache__ in the root.
+        lib = w.prefix / "usr/local/lib/smartroomos"
+        lib.mkdir(parents=True, exist_ok=True)
+        (lib / "hello_ws13b.py").write_text("x = 1\n")
+        w.run("update", str(w.release()), "--unsigned")
+        # Carry limine into the new root the way stage does for a real room.
+        new = w.prefix / "top" / "@r-2026.11.21-1"
+        (new / "etc/default").mkdir(parents=True, exist_ok=True)
+        (new / "etc/default/limine").write_text(limine.read_text())
+        (new / "usr/local/lib/smartroomos").mkdir(parents=True, exist_ok=True)
+        (new / "usr/local/lib/smartroomos/hello_ws13b.py").write_text("x = 1\n")
+        (new / "usr/local/sbin").mkdir(parents=True, exist_ok=True)
+        # Live root after trial boot is the new subvol content via prefix=/
+        # World uses prefix as /; trial_boot only rewrites cmdline. Promote
+        # edits host.p("/etc/default/limine") which is the prefix copy.
+        w.trial_boot()
+        self.assertEqual(w.run("health-run")[0], 0)
+        # After promote: limine has no trial-only param; release kept.
+        text = limine.read_text()
+        self.assertNotIn("watchdog.handle_boot_enabled", text)
+        self.assertIn("smartroom.release=2026.11.21-1", text)
+        # Manifest/store recorded (record_integrity ran before snapshot marker).
+        self.assertTrue((w.prefix / "usr/local/lib/smartroomos/integrity/manifest.json").is_file())
+        self.assertTrue((w.prefix / "usr/local/lib/smartroomos/integrity/store/deadbeef").is_file())
+        # Precompile left bytecode for our module.
+        pyc = list((w.prefix / "usr/local/lib/smartroomos").rglob("hello_ws13b*.pyc"))
+        self.assertTrue(pyc, "stage/promote must precompile smartroom Python")
+        # Status must not say trial boot after committed promote (dt still set).
+        doc = json.loads(w.run("status", "--json")[1])
+        self.assertIsNone(doc.get("trial"))
+        self.assertEqual(doc["release"]["boot"], "configured")
+        self.assertEqual(doc["release"]["configured"], "2026.11.21-1")
+
+    def test_status_not_trial_after_promote_while_dt_trial_lingers(self):
+        w = World(self)
+        w.run("update", str(w.release()), "--unsigned")
+        w.trial_boot()
+        self.assertEqual(w.run("health-run")[0], 0)
+        # Device-tree trial marker still present (no reboot yet).
+        self.assertTrue((w.prefix / "proc/device-tree/chosen/aurora,trial").is_file())
+        doc = json.loads(w.run("status", "--json")[1])
+        self.assertEqual(doc["release"]["boot"], "configured")
+        self.assertFalse(doc["running"]["trial"])
+
 
 class MiniLine(unittest.TestCase):
     def test_detects_mini_layout(self):
