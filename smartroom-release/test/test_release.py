@@ -1154,6 +1154,18 @@ class MiniLine(unittest.TestCase):
         self.assertEqual(w.run("health-run")[0], 0)
         self.assertEqual(w.state()["last_result"]["reason"], "lost-before-userspace")
 
+    def test_vm_marker_counts_as_connected(self):
+        w = MiniWorld(self)
+        host = sr.Host(str(w.prefix))
+        os.environ["SMARTROOM_RELEASE_VM"] = "1"
+        self.addCleanup(lambda: os.environ.pop("SMARTROOM_RELEASE_VM", None))
+        self.assertFalse(host.agent_connected())
+        (w.prefix / "etc/smartroomos").mkdir(parents=True, exist_ok=True)
+        (w.prefix / "etc/smartroomos/release-vm-healthy").write_text("1\n")
+        self.assertTrue(host.agent_connected())
+        (w.prefix / "etc/smartroomos/release-vm-healthy").unlink()
+        self.assertFalse(host.agent_connected())
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=1)

@@ -360,6 +360,14 @@ class Host:
     # health signals ------------------------------------------------------------
     def agent_connected(self) -> bool:
         """The Room Controller holds a live TCP connection to its server."""
+        # Offline Intel VM scenarios cannot open a real Room Controller session.
+        # When SMARTROOM_RELEASE_VM=1, a root-owned marker means "pretend connected"
+        # so promote/fallback paths can be exercised without a server.
+        if os.environ.get("SMARTROOM_RELEASE_VM") == "1":
+            for rel in ("/run/smartroomos/release-vm-healthy",
+                        "/etc/smartroomos/release-vm-healthy"):
+                if self.p(rel).is_file():
+                    return True
         conf = self.p("/opt/smartroom/config/agent.json")
         try:
             url = json.loads(conf.read_text()).get("serverUrl", "")
