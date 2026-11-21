@@ -1750,6 +1750,13 @@ def cmd_health_run(host: Host, args) -> int:
         reason = "lost-after-userspace" if trial.get("reached") else "lost-before-userspace"
         finish_failed_trial(host, state, reason)
         return 0
+    # Bad UKI / firmware hang: rebooted (new boot_id) onto some other root
+    # (e.g. factory @) while a trial is still armed. Clear it so the next
+    # update/migrate is not blocked by "a trial boot is already pending".
+    if trial.get("armed_boot_id") and trial["armed_boot_id"] != host.boot_id():
+        reason = "lost-after-userspace" if trial.get("reached") else "lost-before-userspace"
+        finish_failed_trial(host, state, reason)
+        return 0
     return 0
 
 

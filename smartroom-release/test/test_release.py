@@ -1154,6 +1154,27 @@ class MiniLine(unittest.TestCase):
         self.assertEqual(w.run("health-run")[0], 0)
         self.assertEqual(w.state()["last_result"]["reason"], "lost-before-userspace")
 
+    def test_lost_before_userspace_when_mini_lands_on_wrong_root(self):
+        """Bad UKI + reset can land on factory @ while configured is @r-…."""
+        w = MiniWorld(self)
+        (w.prefix / "etc/smartroomos").mkdir(parents=True, exist_ok=True)
+        (w.prefix / "etc/smartroomos/release.conf").write_text(
+            "quiet_seconds=30\nlimit_seconds=60\nsample_seconds=5\n")
+        w.host._conf = None
+        name = "2026.11.21-mini"
+        self.assertEqual(w.run("update", str(w.release(name=name)), "--unsigned")[0], 0)
+        w.trial_boot(name)
+        self.assertEqual(w.run("health-run")[0], 0)
+        # Promote left configured on @r-name. Arm a second trial, then land on @.
+        self.assertEqual(w.run("update", str(w.release(name="2026.11.21-bad", uki=b"BAD")), "--unsigned")[0], 0)
+        (w.prefix / "proc/cmdline").write_text(sr.with_subvol(MINI_CMDLINE, "@", None) + "\n")
+        (w.prefix / "proc/sys/kernel/random/boot_id").write_text("boot-after-reset\n")
+        self.assertEqual(w.run("health-run")[0], 0)
+        st = w.state()
+        self.assertIsNone(st.get("trial"))
+        self.assertEqual(st["last_result"]["reason"], "lost-before-userspace")
+        self.assertEqual(st["configured"]["release"], name)
+
     def test_vm_marker_counts_as_connected(self):
         w = MiniWorld(self)
         host = sr.Host(str(w.prefix))
