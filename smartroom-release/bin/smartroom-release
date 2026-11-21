@@ -268,9 +268,14 @@ class Host:
         return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(self.now()))
 
     # commands --------------------------------------------------------------
-    def run(self, argv: list[str], check: bool = True, input: Optional[bytes] = None) -> subprocess.CompletedProcess:
+    def run(self, argv: list[str], check: bool = True, input: Optional[bytes] = None,
+            env: Optional[dict] = None) -> subprocess.CompletedProcess:
+        run_env = None
+        if env:
+            run_env = os.environ.copy()
+            run_env.update(env)
         try:
-            done = subprocess.run(argv, input=input, capture_output=True, check=False)
+            done = subprocess.run(argv, input=input, capture_output=True, check=False, env=run_env)
         except FileNotFoundError:
             raise Fail(f"{argv[0]} is not installed")
         if check and done.returncode != 0:
@@ -911,7 +916,12 @@ def ensure_nested_snapshots(host: Host, root: Path) -> None:
 
 
 def import_release_pacman_key(host: Host, root: Path) -> None:
-    """pacman-key --add + --lsign-key for /usr/share/smartroomos/release-keyring.gpg."""
+    """pacman-key --add + --lsign-key for /usr/share/smartroomos/release-keyring.gpg.
+
+    Runs after carry_into (gnupg is carried from the old room) during stage, and
+    again at promote on the live root so a room staged by an older
+    smartroom-release still stops asking to import the key.
+    """
     keyring = root / "usr/share/smartroomos/release-keyring.gpg"
     gnupg = root / "etc/pacman.d/gnupg"
     if not keyring.is_file():
@@ -926,8 +936,17 @@ def import_release_pacman_key(host: Host, root: Path) -> None:
         return
     if not gnupg.is_dir():
         return
-    host.run(["pacman-key", "--gpgdir", str(gnupg), "--add", str(keyring)], check=False)
-    host.run(["pacman-key", "--gpgdir", str(gnupg), "--lsign-key", fpr], check=False)
+    # GNUPGHOME must point at the target keyring; otherwise a host agent can
+    # leave the carried pubring untouched (seen on the home Studio trial).
+    env_add = {"GNUPGHOME": str(gnupg)}
+    host.run(
+        ["pacman-key", "--gpgdir", str(gnupg), "--add", str(keyring)],
+        check=False, env=env_add,
+    )
+    host.run(
+        ["pacman-key", "--gpgdir", str(gnupg), "--lsign-key", fpr],
+        check=False, env=env_add,
+    )
 
 
 def take_as_installed_snapshot(host: Host, release: str) -> Optional[int]:
@@ -1662,6 +1681,9 @@ def promote(host: Host, state: dict) -> None:
     # algorithm so snapper-cleanup never deletes it; prune of the release root
     # removes the nested .snapshots with the root.
     take_as_installed_snapshot(host, state["configured"]["release"])
+    # Ensure the release signing key is in the live pacman keyring even when
+    # this root was staged by an older smartroom-release (carry alone is not enough).
+    import_release_pacman_key(host, host.p("/"))
     host.record_integrity()
 
 

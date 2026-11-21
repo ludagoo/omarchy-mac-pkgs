@@ -1059,6 +1059,22 @@ class Ws13SnapperAndKey(unittest.TestCase):
         self.assertTrue((new_root / "var/lib/smartroomos/release-key-imported").is_file())
         self.assertIn("26436A50", (new_root / "var/lib/smartroomos/release-key-imported").read_text())
 
+    def test_promote_imports_key_after_carry(self):
+        """Promote re-imports even when only the old carried gnupg is present."""
+        w = World(self)
+        # Simulate a carried gnupg with no release key stamp yet.
+        (w.prefix / "etc/pacman.d/gnupg").mkdir(parents=True)
+        (w.prefix / "etc/pacman.d/gnupg/pubring.gpg").write_text("ROOM-GPG")
+        (w.prefix / "usr/share/smartroomos").mkdir(parents=True)
+        (w.prefix / "usr/share/smartroomos/release-keyring.gpg").write_bytes(b"\x99fake")
+        stamp = w.prefix / "var/lib/smartroomos/release-key-imported"
+        if stamp.exists():
+            stamp.unlink()
+        w.run("update", str(w.release()), "--unsigned")
+        w.trial_boot()
+        self.assertEqual(w.run("health-run")[0], 0)
+        self.assertTrue(stamp.is_file(), "promote must import the release key on the live root")
+
     def test_promote_writes_as_installed_marker(self):
         w = World(self)
         w.run("update", str(w.release()), "--unsigned")
