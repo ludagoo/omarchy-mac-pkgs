@@ -968,11 +968,32 @@ def precompile_smartroom_python(root: Path) -> None:
             compileall.compile_file(str(path), quiet=1, force=False)
 
 
+def _set_limine_snapper_root_paths(text: str, subvol: str) -> str:
+    """Point limine-snapper-sync at the live release subvol (@ or @r-<id>).
+
+    Without this, after the first promote limine-snapper-sync refuses to run
+    (`ROOT_SUBVOLUME_PATH="/@" does not match .../@r-...`) and pacman snapshot
+    boot entries stop updating. As-installed stays excluded via type=post.
+    """
+    root = "/" + subvol.lstrip("/")
+    snaps = f"{root}/.snapshots"
+    for key, value in (
+        ("ROOT_SUBVOLUME_PATH", f'"{root}"'),
+        ("ROOT_SNAPSHOTS_PATH", f'"{snaps}"'),
+    ):
+        if re.search(rf"^{key}=", text, flags=re.M):
+            text = re.sub(rf"^{key}=.*$", f"{key}={value}", text, flags=re.M)
+        else:
+            text = text.rstrip() + f"\n{key}={value}\n"
+    return text
+
+
 def finalize_promoted_root(host: Host, release: str, subvol: str) -> None:
     """Last root edits before the as-installed snapshot (WS13b).
 
     Re-normalize /etc/default/limine to the configured cmdline (no trial-only
-    params) so the snapshot matches what promote leaves on disk.
+    params) so the snapshot matches what promote leaves on disk. Also point
+    limine-snapper-sync at this release's subvol so it keeps working on @r-*.
     """
     path = host.p("/etc/default/limine")
     if path.is_file():
@@ -983,28 +1004,50 @@ def finalize_promoted_root(host: Host, release: str, subvol: str) -> None:
             return match.group(1) + with_subvol(match.group(2), subvol, rel) + match.group(3)
 
         new = re.sub(r'^(KERNEL_CMDLINE\[[^\]]*\]=")([^"]*)(")', one, text, flags=re.M)
+        new = _set_limine_snapper_root_paths(new, subvol)
         if new != text:
             write_atomic(path, new.encode(), mode=path.stat().st_mode & 0o7777)
+    sync_conf = host.p("/etc/limine-snapper-sync.conf")
+    if sync_conf.is_file():
+        text = sync_conf.read_text()
+        new = _set_limine_snapper_root_paths(text, subvol)
+        if new != text:
+            write_atomic(sync_conf, new.encode(), mode=sync_conf.stat().st_mode & 0o7777)
     precompile_smartroom_python(host.p("/"))
 
 
-def exclude_as_installed_from_limine_sync(host: Host, snap_num: int) -> None:
-    """Drop the ESP UKI copy limine-snapper-sync made for an as-installed snapshot.
+def exclude_as_installed_from_limine_sync(host: Host, *snap_nums: int) -> None:
+    """Drop ESP UKI copies limine-snapper-sync made for as-installed snaps.
 
-    As-installed snapshots are drift references, not boot targets. They are
-    created as snapper type=post so EXCLUDE_SNAPSHOT_TYPES=post skips them;
-    limine-snapper-remove cleans any copy that still landed (older configs).
+    As-installed is a drift reference, not a boot target: created as snapper
+    type=post so EXCLUDE_SNAPSHOT_TYPES=post skips it. The paired pre (needed
+    because snapper rejects orphan --pre-number 0) can still get a UKI copy;
+    limine-snapper-remove cleans pre and any post copy that still landed.
     """
-    if host.prefix or snap_num is None or snap_num < 1:
+    if host.prefix:
         return
-    host.run(["limine-snapper-remove", str(snap_num)], check=False)
+    for snap_num in snap_nums:
+        if snap_num is None or snap_num < 1:
+            continue
+        host.run(["limine-snapper-remove", str(snap_num)], check=False)
+
+
+def _snapper_print_number(done) -> Optional[int]:
+    if done is None or done.returncode != 0:
+        return None
+    try:
+        return int(done.stdout.decode().strip().splitlines()[-1])
+    except (ValueError, IndexError, AttributeError):
+        return None
 
 
 def take_as_installed_snapshot(host: Host, release: str) -> Optional[int]:
     """Read-only snapper snapshot of the running root after promote. No cleanup algorithm.
 
     Type=post so limine-snapper-sync's EXCLUDE_SNAPSHOT_TYPES=post skips the
-    ESP UKI copy (as-installed is a reference, not a boot target).
+    ESP UKI copy (as-installed is a reference, not a boot target). Snapper
+    requires a real pre for every post; we pair a throwaway pre, then remove
+    any ESP UKI the pre may have received.
     """
     if host.prefix:
         # Scratch tests: create a marker file the integrity tool can find.
@@ -1022,18 +1065,29 @@ def take_as_installed_snapshot(host: Host, release: str) -> Optional[int]:
         host.run([str(repair)], check=False)
     desc = f"release {release} as installed"
     userdata = f"release={release},purpose=as-installed"
-    # type=post: excluded by EXCLUDE_SNAPSHOT_TYPES=post (ESP budget). pre-number
-    # 0 is a sentinel; snapper accepts it for an orphan post with no cleanup.
-    done = host.run([
+    pre_desc = f"as-installed pair for {release}"
+    pre_done = host.run([
         "snapper", "--no-dbus", "-c", "root", "create",
-        "--type", "post", "--pre-number", "0", "--read-only",
-        "--description", desc,
+        "--type", "pre", "--read-only",
+        "--description", pre_desc,
         "--cleanup-algorithm", "",
-        "--userdata", userdata,
         "--print-number",
     ], check=False)
-    if done.returncode != 0:
-        # Older snapper: fall back to single, then remove any ESP copy.
+    pre_num = _snapper_print_number(pre_done)
+    num: Optional[int] = None
+    if pre_num is not None:
+        done = host.run([
+            "snapper", "--no-dbus", "-c", "root", "create",
+            "--type", "post", "--pre-number", str(pre_num), "--read-only",
+            "--description", desc,
+            "--cleanup-algorithm", "",
+            "--userdata", userdata,
+            "--print-number",
+        ], check=False)
+        num = _snapper_print_number(done)
+    if num is None:
+        # Older snapper or pre create failed: fall back to single, then remove
+        # any ESP copy (EXCLUDE_SNAPSHOT_TYPES=post does not apply to single).
         done = host.run([
             "snapper", "--no-dbus", "-c", "root", "create",
             "--type", "single", "--read-only",
@@ -1042,19 +1096,18 @@ def take_as_installed_snapshot(host: Host, release: str) -> Optional[int]:
             "--userdata", userdata,
             "--print-number",
         ], check=False)
-    if done.returncode != 0:
+        num = _snapper_print_number(done)
+        pre_num = None
+    if num is None:
         return None
-    try:
-        num = int(done.stdout.decode().strip().splitlines()[-1])
-    except (ValueError, IndexError):
-        return None
-    exclude_as_installed_from_limine_sync(host, num)
+    exclude_as_installed_from_limine_sync(host, *([pre_num] if pre_num else []), num)
     marker = host.p("/var/lib/smartroomos/integrity/as-installed.json")
     marker.parent.mkdir(parents=True, exist_ok=True)
     path = f"/.snapshots/{num}/snapshot"
     write_atomic(marker, (json.dumps({
         "snapshot": num, "uuid": None, "kind": "as-installed", "path": path,
         "description": desc, "note": None,
+        "pre_snapshot": pre_num,
     }, indent=2) + "\n").encode(), mode=0o644)
     return num
 

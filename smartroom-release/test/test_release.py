@@ -1155,6 +1155,84 @@ class Ws13SnapperAndKey(unittest.TestCase):
         self.assertEqual(doc["release"]["boot"], "configured")
         self.assertFalse(doc["running"]["trial"])
 
+    def test_as_installed_uses_pre_post_pair_and_removes_esp_uki(self):
+        """WS13b: snapper needs a real pre; post is excluded; remove cleans pre UKI."""
+        calls = []
+
+        class FakeDone:
+            def __init__(self, rc, out):
+                self.returncode = rc
+                self.stdout = out.encode() if isinstance(out, str) else out
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "var/lib/smartroomos/integrity").mkdir(parents=True)
+
+            class FakeHost:
+                prefix = None
+
+                def p(self, path):
+                    return root / path.lstrip("/")
+
+                def run(self, argv, check=False):
+                    calls.append(list(argv))
+                    if argv and argv[0] == "limine-snapper-remove":
+                        return FakeDone(0, "")
+                    if argv and argv[0] == "snapper" and "--type" in argv:
+                        t = argv[argv.index("--type") + 1]
+                        if t == "pre":
+                            return FakeDone(0, "10\n")
+                        if t == "post":
+                            assert "--pre-number" in argv
+                            assert argv[argv.index("--pre-number") + 1] == "10"
+                            return FakeDone(0, "11\n")
+                    return FakeDone(1, "")
+
+            with mock.patch.object(
+                sr, "write_atomic",
+                lambda path, data, mode=0o644: Path(path).write_bytes(data),
+            ):
+                num = sr.take_as_installed_snapshot(FakeHost(), "2026.11.21-t")
+            self.assertEqual(num, 11)
+            types = [
+                c[c.index("--type") + 1]
+                for c in calls
+                if c and c[0] == "snapper" and "--type" in c
+            ]
+            self.assertEqual(types, ["pre", "post"])
+            remove_nums = [c[1] for c in calls if c and c[0] == "limine-snapper-remove"]
+            self.assertEqual(remove_nums, ["10", "11"])
+            marker = json.loads(
+                (root / "var/lib/smartroomos/integrity/as-installed.json").read_text()
+            )
+            self.assertEqual(marker["snapshot"], 11)
+            self.assertEqual(marker["pre_snapshot"], 10)
+
+    def test_finalize_sets_limine_snapper_root_paths_for_release_subvol(self):
+        w = World(self)
+        limine = w.prefix / "etc/default/limine"
+        limine.parent.mkdir(parents=True, exist_ok=True)
+        limine.write_text(
+            'TARGET_OS_NAME="SmartRoom Firmware"\n'
+            f'KERNEL_CMDLINE[default]="{CMDLINE}"\n'
+            'ROOT_SUBVOLUME_PATH="/@"\n'
+            'ROOT_SNAPSHOTS_PATH="/@/.snapshots"\n'
+            'EXCLUDE_SNAPSHOT_TYPES="post"\n'
+        )
+        sync = w.prefix / "etc/limine-snapper-sync.conf"
+        sync.write_text(
+            'LIMIT_USAGE_PERCENT=70\n'
+            'ROOT_SUBVOLUME_PATH="/@"\n'
+            'ROOT_SNAPSHOTS_PATH="/@/.snapshots"\n'
+            'EXCLUDE_SNAPSHOT_TYPES="post"\n'
+        )
+        host = sr.Host(prefix=str(w.prefix))
+        sr.finalize_promoted_root(host, "2026.11.21-1", "@r-2026.11.21-1")
+        for path in (limine, sync):
+            text = path.read_text()
+            self.assertIn('ROOT_SUBVOLUME_PATH="/@r-2026.11.21-1"', text)
+            self.assertIn('ROOT_SNAPSHOTS_PATH="/@r-2026.11.21-1/.snapshots"', text)
+
 
 class MiniLine(unittest.TestCase):
     def test_detects_mini_layout(self):

@@ -109,8 +109,11 @@ in `smartroom/aura-try/` (which stays as the design reference and its own test).
   (`compileall`) so runtime writes no `__pycache__`. On promote: finalize
   limine defaults, re-import the key, run `smartroomos-integrity record`, then
   take a read-only snapper snapshot `release <id> as installed` as type=post
-  (no cleanup algorithm; `EXCLUDE_SNAPSHOT_TYPES=post` so limine-snapper-sync
-  does not copy a UKI to the ESP). Firmware side:
+  paired with a throwaway pre (snapper rejects orphan posts; no cleanup
+  algorithm; `EXCLUDE_SNAPSHOT_TYPES=post` skips the post UKI;
+  `limine-snapper-remove` clears the pre's UKI). Also rewrite
+  `ROOT_SUBVOLUME_PATH` / `ROOT_SNAPSHOTS_PATH` to the live `@r-<id>` so
+  limine-snapper-sync keeps working after the first promote. Firmware side:
   `smartroomcontrollerfirmware` `docs/disk-drift.md`.
 
 `user4k.patch` in the omarchy-mac-boot recipe is the stable line's (see
