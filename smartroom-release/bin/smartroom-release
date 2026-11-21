@@ -889,6 +889,87 @@ def fix_root_files(host: Host, new_root: Path, subvol: str, release: str) -> Non
     info = new_root / "usr/share/smartroomos"
     info.mkdir(parents=True, exist_ok=True)
     write_atomic(info / "release-id", (release + "\n").encode(), mode=0o644)
+    # Nested .snapshots so snapper works the first time this root is booted
+    # (per-root nested subvolume; see docs/disk-drift.md).
+    ensure_nested_snapshots(host, new_root)
+    # Put the SmartRoom release signing key into pacman's keyring so
+    # `pacman -Q` stops asking to import it on rooms that carried an older gnupg.
+    import_release_pacman_key(host, new_root)
+
+
+def ensure_nested_snapshots(host: Host, root: Path) -> None:
+    """Create root/.snapshots as a btrfs subvolume when missing."""
+    snap = root / ".snapshots"
+    if snap.exists():
+        return
+    if host.prefix:
+        snap.mkdir(parents=True, exist_ok=True)
+        return
+    done = host.run(["btrfs", "subvolume", "create", str(snap)], check=False)
+    if done.returncode != 0:
+        snap.mkdir(parents=True, exist_ok=True)
+
+
+def import_release_pacman_key(host: Host, root: Path) -> None:
+    """pacman-key --add + --lsign-key for /usr/share/smartroomos/release-keyring.gpg."""
+    keyring = root / "usr/share/smartroomos/release-keyring.gpg"
+    gnupg = root / "etc/pacman.d/gnupg"
+    if not keyring.is_file():
+        return
+    # Fingerprint of the SmartRoom package signing key (studio-build).
+    fpr = "26436A50BDD17118770DE9185FDA1532DC448891"
+    if host.prefix:
+        # Tests: record that we would import; do not need a real keyring.
+        stamp = root / "var/lib/smartroomos/release-key-imported"
+        stamp.parent.mkdir(parents=True, exist_ok=True)
+        stamp.write_text(fpr + "\n")
+        return
+    if not gnupg.is_dir():
+        return
+    host.run(["pacman-key", "--gpgdir", str(gnupg), "--add", str(keyring)], check=False)
+    host.run(["pacman-key", "--gpgdir", str(gnupg), "--lsign-key", fpr], check=False)
+
+
+def take_as_installed_snapshot(host: Host, release: str) -> Optional[int]:
+    """Read-only snapper snapshot of the running root after promote. No cleanup algorithm."""
+    if host.prefix:
+        # Scratch tests: create a marker file the integrity tool can find.
+        marker = host.p("/var/lib/smartroomos/integrity/as-installed.json")
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(json.dumps({
+            "snapshot": 1, "uuid": None, "kind": "as-installed",
+            "path": str(host.p("/")),
+            "description": f"release {release} as installed",
+            "note": None,
+        }) + "\n")
+        return 1
+    repair = host.p("/usr/local/sbin/smartroomos-snapper-repair")
+    if repair.is_file():
+        host.run([str(repair)], check=False)
+    desc = f"release {release} as installed"
+    userdata = f"release={release},purpose=as-installed"
+    done = host.run([
+        "snapper", "--no-dbus", "-c", "root", "create",
+        "--type", "single", "--read-only",
+        "--description", desc,
+        "--cleanup-algorithm", "",
+        "--userdata", userdata,
+        "--print-number",
+    ], check=False)
+    if done.returncode != 0:
+        return None
+    try:
+        num = int(done.stdout.decode().strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        return None
+    marker = host.p("/var/lib/smartroomos/integrity/as-installed.json")
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    path = f"/.snapshots/{num}/snapshot"
+    write_atomic(marker, (json.dumps({
+        "snapshot": num, "uuid": None, "kind": "as-installed", "path": path,
+        "description": desc, "note": None,
+    }, indent=2) + "\n").encode(), mode=0o644)
+    return num
 
 
 def new_root_cmdline(new_root: Path, fallback: str) -> str:
@@ -1577,6 +1658,10 @@ def promote(host: Host, state: dict) -> None:
     save_state(host, state)
     clear_trial_files(host, state)
     prune(host, state)
+    # Frozen "as installed" reference for full-disk drift (WS13). No cleanup
+    # algorithm so snapper-cleanup never deletes it; prune of the release root
+    # removes the nested .snapshots with the root.
+    take_as_installed_snapshot(host, state["configured"]["release"])
     host.record_integrity()
 
 

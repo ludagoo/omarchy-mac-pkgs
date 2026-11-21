@@ -1042,6 +1042,35 @@ class MiniWorld(World):
         self.host.saved = None
 
 
+
+class Ws13SnapperAndKey(unittest.TestCase):
+    """WS13: nested .snapshots, as-installed on promote, release key stamp."""
+
+    def test_fix_root_creates_snapshots_and_imports_key(self):
+        w = World(self)
+        new_root = w.prefix / "top" / "@r-2026.11.21-ws13"
+        new_root.mkdir(parents=True)
+        (new_root / "etc").mkdir()
+        (new_root / "usr/share/smartroomos").mkdir(parents=True)
+        (new_root / "usr/share/smartroomos/release-keyring.gpg").write_bytes(b"\x99fake")
+        (new_root / "etc/fstab").write_text("UUID=x / btrfs subvol=/@ 0 0\n")
+        sr.fix_root_files(w.host, new_root, "@r-2026.11.21-ws13", "2026.11.21-ws13")
+        self.assertTrue((new_root / ".snapshots").is_dir())
+        self.assertTrue((new_root / "var/lib/smartroomos/release-key-imported").is_file())
+        self.assertIn("26436A50", (new_root / "var/lib/smartroomos/release-key-imported").read_text())
+
+    def test_promote_writes_as_installed_marker(self):
+        w = World(self)
+        w.run("update", str(w.release()), "--unsigned")
+        w.trial_boot()
+        self.assertEqual(w.run("health-run")[0], 0)
+        marker = w.prefix / "var/lib/smartroomos/integrity/as-installed.json"
+        self.assertTrue(marker.is_file(), "as-installed marker missing after promote")
+        data = json.loads(marker.read_text())
+        self.assertEqual(data.get("kind"), "as-installed")
+        self.assertIn("as installed", data.get("description") or "")
+
+
 class MiniLine(unittest.TestCase):
     def test_detects_mini_layout(self):
         w = MiniWorld(self)
