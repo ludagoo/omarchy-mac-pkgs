@@ -122,6 +122,16 @@ in `smartroom/aura-try/` (which stays as the design reference and its own test).
   snapshot (`-c home`, nested `/home/.snapshots` on `@home` so it survives
   root replace). Home runtime IGNORE list and layout extras: see
   `docs/disk-drift.md`.
+- **WS14 (ESP budget).** The ESP holds only the configured boot set and one
+  fallback (previous, or trial while a trial is staged). Kept-release UKI and
+  stage2 copies live on btrfs at `/var/lib/smartroomos/boot-store/<id>/` with
+  sha256 in `meta.json`; `rollback` / `restore` / `smartroom-rollback to`
+  copy them back to the ESP trial slots. Stage computes the worst-case bytes
+  promote will need, offloads the legacy ESP `smartroom-release/uki` store
+  first, and refuses with `esp-full` in status JSON when it still does not
+  fit. Promote failure is recovered to a bootable release (`promote-failed`).
+  `smartroom-release esp-migrate` cleans rooms that still have the old ESP
+  store or WS13d `esp-hold` park files.
 
 `user4k.patch` in the omarchy-mac-boot recipe is the stable line's (see
 Base): the upstream console change, its cases after upstream's M4 cases,

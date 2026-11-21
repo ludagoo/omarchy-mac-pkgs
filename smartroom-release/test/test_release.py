@@ -22,6 +22,31 @@ from unittest import mock
 HERE = Path(__file__).resolve().parent
 TOOL = HERE.parent / "bin" / "smartroom-release"
 
+# Scratch ESP images are hundreds of MiB. Mini /tmp is tmpfs — never put them there.
+# Prefer TMPDIR when it is already off /tmp; otherwise use <job>/tmp or ./tmp beside pkgs.
+def _prefer_disk_tmpdir() -> None:
+    cur = Path(os.environ.get("TMPDIR") or tempfile.gettempdir()).resolve()
+    if not (str(cur) == "/tmp" or str(cur).startswith("/tmp/")):
+        return
+    for candidate in (
+        HERE.parents[3] / "tmp",                 # .../smartroom-fw-ws14/tmp
+        HERE.parents[2] / "tmp",                 # .../pkgs/tmp
+        Path.home() / "smartroom-fw-ws14" / "tmp",
+    ):
+        try:
+            candidate.mkdir(parents=True, exist_ok=True)
+            probe = candidate / f".srel-tmpdir-{os.getpid()}"
+            probe.write_bytes(b"ok")
+            probe.unlink()
+        except OSError:
+            continue
+        os.environ["TMPDIR"] = str(candidate)
+        tempfile.tempdir = None
+        return
+
+
+_prefer_disk_tmpdir()
+
 loader = importlib.machinery.SourceFileLoader("smartroom_release", str(TOOL))
 spec = importlib.util.spec_from_loader("smartroom_release", loader)
 sr = importlib.util.module_from_spec(spec)
@@ -808,19 +833,30 @@ class Promotion(unittest.TestCase):
 
     def test_a_failure_while_copying_the_previous_set_changes_nothing_that_boots(self):
         w = self.build()
-        before = w.limine()
+        before_path, before_cmd = sr.kernel_entry(w.limine())
         real = sr.copy_atomic
-        calls = {"n": 0}
 
         def failing(src, dst, expect=None):
-            calls["n"] += 1
-            raise sr.Fail("disk full")
+            # Fail the ESP previous-UKI copy (boot-store puts on btrfs still succeed).
+            if str(dst).endswith(sr.PREVIOUS_UKI) or str(dst).endswith(sr.PREVIOUS_UKI + ".new"):
+                raise sr.Fail("ESP full writing previous UKI", "esp-full")
+            return real(src, dst, expect)
+
         with mock.patch.object(sr, "copy_atomic", failing):
-            with self.assertRaises(sr.Fail):
+            with self.assertRaises(sr.Fail) as raised:
                 sr.promote(w.host, sr.load_state(w.host))
-        self.assertEqual(w.limine(), before)
+        self.assertEqual(raised.exception.code, "promote-failed")
+        # WS14: promote-failed is a defined state — fall back to configured, strip trial.
+        path, cmd = sr.kernel_entry(w.limine())
+        self.assertEqual(path, before_path)
+        self.assertEqual(cmd, before_cmd)
+        self.assertNotIn("Release Trial", w.limine())
         self.entry_ok(w)
         self.assertEqual((w.esp / "m1n1/boot.bin").read_bytes(), b"stage2-installed")
+        st = w.state()
+        self.assertEqual(st["last_result"]["reason"], "promote-failed")
+        self.assertIsNone(st.get("promoting"))
+        self.assertIsNone(st.get("trial"))
 
     def test_discard_refuses_a_trial_in_progress_and_cleans_a_staged_one(self):
         w = World(self)
@@ -1391,6 +1427,222 @@ class MiniLine(unittest.TestCase):
         w.back_on_configured(root="@", boot_id="boot-9")
         self.assertEqual(w.run("health-run")[0], 0)
         self.assertEqual(w.state()["last_result"]["reason"], "lost-before-userspace")
+
+
+class EspBudgetWS14(unittest.TestCase):
+    """WS14: ESP holds current + one fallback; history lives on btrfs boot-store.
+
+    Scratch ESP sized like the home Studio (499 MiB) with real-ish UKI/boot sizes.
+    """
+
+    UKI = 59 * 1024 * 1024
+    BOOT = 14 * 1024 * 1024
+    ESP_TOTAL = 499 * 1024 * 1024
+    # Non-boot firmware on the Studio ESP (vendorfw/aurora/asahi/limine/…);
+    # UKI + boot.bin live in EFI/ and m1n1/ and are counted via real files.
+    FIXED = 80 * 1024 * 1024
+
+    def _uki(self, tag: bytes) -> bytes:
+        # Distinct content per release; padded to real Studio UKI size.
+        body = tag + b"\0" * (self.UKI - len(tag))
+        return body[: self.UKI]
+
+    def _boot(self, tag: bytes) -> bytes:
+        body = tag + b"\0" * (self.BOOT - len(tag))
+        return body[: self.BOOT]
+
+    def _accounted_usage(self, w):
+        """Mock disk_usage: 499 MiB ESP minus bytes of files under the ESP + fixed."""
+        used = self.FIXED
+        for path in w.esp.rglob("*"):
+            if path.is_file():
+                used += path.stat().st_size
+        free = max(0, self.ESP_TOTAL - used)
+        return mock.Mock(total=self.ESP_TOTAL, used=used, free=free)
+
+    def _patch_esp_usage(self, w):
+        return mock.patch.object(shutil, "disk_usage", lambda p: self._accounted_usage(w))
+
+    def _quiet(self, w):
+        (w.prefix / "etc/smartroomos").mkdir(parents=True, exist_ok=True)
+        (w.prefix / "etc/smartroomos/release.conf").write_text(
+            "quiet_seconds=30\nlimit_seconds=60\nsample_seconds=5\n")
+        w.host._conf = None
+
+    def _promote_cycle(self, w, name, i):
+        code, _, err = w.run(
+            "update",
+            str(w.release(name=name, uki=self._uki(f"uki-{name}".encode()),
+                          stage2=self._boot(f"boot-{name}".encode()))),
+            "--unsigned",
+        )
+        self.assertEqual(code, 0, err)
+        w.trial_boot(name)
+        if i > 1:
+            (w.prefix / "proc/cmdline").write_text(
+                sr.trial_cmdline(CMDLINE, f"@r-{name}", name) + "\n")
+            (w.prefix / "proc/sys/kernel/random/boot_id").write_text(f"boot-{i + 1}\n")
+        self.assertEqual(w.run("health-run")[0], 0, name)
+        (w.prefix / "proc/cmdline").write_text(
+            sr.with_subvol(CMDLINE, f"@r-{name}", name) + "\n")
+        with contextlib.suppress(FileNotFoundError):
+            (w.prefix / "proc/device-tree/chosen/aurora,trial").unlink()
+
+    def test_five_releases_fit_on_499mb_esp_and_rollback_oldest(self):
+        w = World(self)
+        self._quiet(w)
+        names = [f"2026.11.2{i}-esp" for i in range(1, 6)]
+        with self._patch_esp_usage(w):
+            for i, name in enumerate(names, 1):
+                self._promote_cycle(w, name, i)
+                # ESP must not keep a growing UKI store (history is on btrfs).
+                legacy = list((w.esp / "smartroom-release/uki").glob("*.efi")) \
+                    if (w.esp / "smartroom-release/uki").is_dir() else []
+                self.assertEqual(legacy, [], f"legacy ESP UKI store after {name}: {legacy}")
+                store = w.prefix / "var/lib/smartroomos/boot-store"
+                self.assertTrue((store / name / "uki.efi").is_file(), name)
+                usage = self._accounted_usage(w)
+                self.assertLess(usage.used, self.ESP_TOTAL, f"ESP overflow after {name}")
+            st = w.state()
+            self.assertEqual(st["configured"]["release"], names[-1])
+            self.assertLessEqual(len(st.get("history") or []), 4)
+            oldest = names[0]
+            # History still has the oldest (5 kept = configured + 4).
+            hist_ids = {h["release"] for h in st.get("history") or []}
+            self.assertIn(oldest, hist_ids | {st["previous"]["release"]})
+            # Rollback to oldest kept via restore number.
+            rows = sr.release_rows(st)
+            oldest_row = next(r for r in rows if r["release"] == oldest)
+            code, out, err = w.run("restore", str(oldest_row["number"]), "--no-reboot")
+            self.assertEqual(code, 0, err)
+            self.assertEqual(w.state()["trial"]["release"], oldest)
+            self.assertTrue((w.esp / sr.TRIAL_UKI).is_file())
+            self.assertEqual((w.esp / sr.TRIAL_UKI).read_bytes()[:12], self._uki(f"uki-{oldest}".encode())[:12])
+
+    def test_stage_refused_when_esp_cannot_fit_is_in_status_json(self):
+        w = World(self)
+        self._quiet(w)
+        # Fill the ESP so even after offload there is no room for trial+reserve.
+        filler = w.esp / "vendorfw" / "blob.bin"
+        filler.parent.mkdir(parents=True, exist_ok=True)
+        # Leave only ~40 MiB free on a 499 MiB ESP (need is ~3*59+margin >> 40).
+        fill = self.ESP_TOTAL - self.FIXED - 40 * 1024 * 1024
+        filler.write_bytes(b"F" * max(0, fill))
+        d = w.release(name="2026.11.21-no-fit", uki=self._uki(b"uki-nofit"),
+                      stage2=self._boot(b"boot-nofit"))
+        with self._patch_esp_usage(w):
+            code, out, err = w.run("--json", "stage", str(d), "--unsigned")
+        self.assertEqual(code, 1)
+        self.assertIn("esp-full", out + err)
+        self.assertFalse((w.esp / sr.TRIAL_UKI).exists())
+        st = w.state()
+        self.assertEqual(st["configured"]["release"], "installed")
+        self.assertIsNone(st.get("trial"))
+        self.assertEqual(st["last_result"]["result"], "refused")
+        self.assertEqual(st["last_result"]["reason"], "esp-full")
+        doc = json.loads(w.run("status", "--json")[1])
+        self.assertEqual(doc["release"]["last_result"]["reason"], "esp-full")
+
+    def test_esp_migrate_moves_legacy_store_and_ws13d_hold(self):
+        w = World(self)
+        # Seed legacy ESP UKI store + previous-sized files.
+        uki_dir = w.esp / "smartroom-release/uki"
+        boot_dir = w.esp / "smartroom-release/boot"
+        uki_dir.mkdir(parents=True)
+        boot_dir.mkdir(parents=True)
+        uki = self._uki(b"uki-legacy")
+        boot = self._boot(b"boot-legacy")
+        (uki_dir / "2026.11.21-legacy.efi").write_bytes(uki)
+        (boot_dir / "2026.11.21-legacy.bin").write_bytes(boot)
+        hold = w.prefix / "var/lib/srbuild/esp-hold"
+        hold.mkdir(parents=True)
+        (hold / "ws13d-promote-omarchy_linux-aurora-previous.efi").write_bytes(uki)  # duplicate
+        (hold / "ws13d-promote-boot-previous.bin").write_bytes(boot)
+        (hold / "ws6-orig").mkdir()
+        (hold / "ws6-orig" / "keep.efi").write_bytes(b"safety")
+        (hold / "ws13-pre").mkdir()
+        code, out, err = w.run("esp-migrate", "--esp-hold", str(hold))
+        self.assertEqual(code, 0, err)
+        store = w.prefix / "var/lib/smartroomos/boot-store/2026.11.21-legacy"
+        self.assertTrue((store / "uki.efi").is_file())
+        self.assertEqual(sha((store / "uki.efi").read_bytes()), sha(uki))
+        self.assertFalse((uki_dir / "2026.11.21-legacy.efi").exists())
+        # duplicate hold file removed; safety folders untouched
+        self.assertFalse((hold / "ws13d-promote-omarchy_linux-aurora-previous.efi").exists())
+        self.assertTrue((hold / "ws6-orig" / "keep.efi").is_file())
+        self.assertTrue((hold / "ws13-pre").is_dir())
+
+    def test_fault_injection_esp_full_at_each_promote_copy(self):
+        """ESP full at each promote copy: room ends bootable with promote-failed or committed."""
+        # Targets match the ESP copies in _promote_steps (skip boot-store puts on btrfs).
+        targets = (
+            sr.PREVIOUS_UKI,
+            sr.PREVIOUS_BOOT,
+            sr.CONFIGURED_BOOT,
+            sr.CONFIGURED_UKI,
+        )
+        for target in targets:
+            w = World(self)
+            self._quiet(w)
+            tag = target.replace("/", "_")
+            name = f"2026.11.21-{tag[-12:]}"
+            w.run("update", str(w.release(name=name, uki=f"uki-{tag}".encode(),
+                                          stage2=f"boot-{tag}".encode())), "--unsigned")
+            w.trial_boot(name)
+            st = sr.load_state(w.host)
+            real = sr.copy_atomic
+
+            def flaky(src, dst, expect=None, _t=target):
+                if str(dst).endswith(_t) or str(dst).endswith(_t + ".new"):
+                    raise sr.Fail(f"ESP full writing {_t}", "esp-full")
+                return real(src, dst, expect)
+
+            with mock.patch.object(sr, "copy_atomic", flaky):
+                with self.assertRaises(sr.Fail):
+                    sr.promote(w.host, st)
+            path, cmd = sr.kernel_entry(w.limine())
+            uki = path.split("boot():/", 1)[1]
+            self.assertTrue((w.esp / uki).is_file(), f"target={target} missing {uki}")
+            subvol = __import__("re").search(r"subvol=(\S+?)(?:,|\s|$)", cmd).group(1)
+            self.assertTrue((w.prefix / "top" / subvol).is_dir() or subvol == "@")
+            st2 = w.state()
+            self.assertIsNone(st2.get("promoting"), target)
+            self.assertIn(st2["last_result"]["result"], ("rolled-back", "committed"), target)
+
+    def test_power_loss_between_promote_steps_via_scratch_harness(self):
+        """Existing resumable steps still finish after a cut; ESP never half-switched."""
+        w = World(self)
+        self._quiet(w)
+        name = "2026.11.21-cut"
+        w.run("update", str(w.release(name=name, uki=b"uki-cut", stage2=b"stage2-cut")), "--unsigned")
+        w.trial_boot(name)
+        real_save = sr.save_state
+        for cut in (2, 4):
+            w2 = World(self)
+            self._quiet(w2)
+            w2.run("update", str(w2.release(name=f"{name}-{cut}", uki=f"uki-{cut}".encode(),
+                                            stage2=f"boot-{cut}".encode())), "--unsigned")
+            w2.trial_boot(f"{name}-{cut}")
+            counter = {"n": 0}
+
+            def cutting(host, state, _cut=cut, _c=counter):
+                real_save(host, state)
+                if state.get("promoting"):
+                    _c["n"] += 1
+                    if _c["n"] == _cut:
+                        raise KeyboardInterrupt("power loss")
+
+            with mock.patch.object(sr, "save_state", cutting):
+                with self.assertRaises(KeyboardInterrupt):
+                    sr.promote(w2.host, sr.load_state(w2.host))
+            path, cmd = sr.kernel_entry(w2.limine())
+            uki = path.split("boot():/", 1)[1]
+            self.assertTrue((w2.esp / uki).is_file())
+            (w2.prefix / "proc/sys/kernel/random/boot_id").write_text(f"boot-cut-{cut}\n")
+            with mock.patch.object(sr, "save_state", real_save):
+                self.assertEqual(w2.run("health-run")[0], 0)
+            self.assertEqual(w2.state()["configured"]["release"], f"{name}-{cut}")
+            self.assertIsNone(w2.state().get("promoting"))
 
 
 if __name__ == "__main__":
