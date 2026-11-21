@@ -105,9 +105,13 @@ in `smartroom/aura-try/` (which stays as the design reference and its own test).
   package key (the public key is `/usr/share/smartroomos/release-keyring.gpg`).
 - **WS13 (drift).** On stage: create a nested `.snapshots` under the new root and
   `pacman-key --add` + `--lsign-key` the release keyring into that root's gnupg so
-  pacman stops asking to import it. On promote: take a read-only snapper snapshot
-  `release <id> as installed` (no cleanup algorithm) for full-disk drift. Firmware
-  side: `smartroomcontrollerfirmware` `docs/disk-drift.md`.
+  pacman stops asking to import it; precompile shipped SmartRoom Python
+  (`compileall`) so runtime writes no `__pycache__`. On promote: finalize
+  limine defaults, re-import the key, run `smartroomos-integrity record`, then
+  take a read-only snapper snapshot `release <id> as installed` as type=post
+  (no cleanup algorithm; `EXCLUDE_SNAPSHOT_TYPES=post` so limine-snapper-sync
+  does not copy a UKI to the ESP). Firmware side:
+  `smartroomcontrollerfirmware` `docs/disk-drift.md`.
 
 `user4k.patch` in the omarchy-mac-boot recipe is the stable line's (see
 Base): the upstream console change, its cases after upstream's M4 cases,
