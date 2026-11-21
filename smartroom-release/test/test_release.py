@@ -956,5 +956,204 @@ class Cli(unittest.TestCase):
         self.assertNotIn("/etc/systemd/system/smartroom-agent.service.d", entries)
 
 
+# --------------------------------------------------------------------------
+# Intel Mini line (Limine one-shot + iTCO/softdog; no aura-try)
+
+
+MINI_LIMINE = """\
+timeout: 0
+quiet: yes
+hash_mismatch_panic: no
+
+/+SmartRoom Firmware
+comment: machine-id=e4c6
+  //linux-t2
+  comment: Kernel version: 7.2.15-arch1-1-t2
+  protocol: efi
+  path: boot():/EFI/Linux/smartroomos_linux-t2.efi
+  cmdline: root=UUID=4f4d rw rootflags=subvol=@ quiet panic=10 intel_iommu=on
+"""
+MINI_CMDLINE = "root=UUID=4f4d rw rootflags=subvol=@ quiet panic=10 intel_iommu=on"
+
+
+class MiniWorld(World):
+    def build_room(self):
+        p = self.prefix
+        (self.esp / "EFI/Linux").mkdir(parents=True)
+        (self.esp / "limine.conf").write_text(MINI_LIMINE)
+        (self.esp / "EFI/Linux/smartroomos_linux-t2.efi").write_bytes(b"uki-mini-installed")
+        (p / "proc/sys/kernel/random").mkdir(parents=True)
+        (p / "proc/sys/kernel/random/boot_id").write_text("boot-1\n")
+        (p / "proc/cmdline").write_text(MINI_CMDLINE + "\n")
+        (p / "proc/uptime").write_text("100.0 100.0\n")
+        (p / "dev").mkdir()
+        (p / "dev/watchdog").write_text("")
+        (p / "sys/firmware/efi/efivars").mkdir(parents=True)
+        root = p / "top/@"
+        (root / "etc/default").mkdir(parents=True)
+        (root / "etc/fstab").write_text(
+            "UUID=aa  /  btrfs  noatime,subvol=@  0 0\n")
+        (root / "etc/default/limine").write_text(
+            f'TARGET_OS_NAME="SmartRoom Firmware"\nKERNEL_CMDLINE[default]="{MINI_CMDLINE}"\n')
+        for rel, data in {
+            "etc/machine-id": "machine-M\n", "etc/hostname": "mini-A\n",
+            "etc/ssh/ssh_host_ed25519_key": "HOSTKEY-M", "etc/ssh/ssh_host_ed25519_key.pub": "HOSTPUB-M",
+            "etc/smartroomos/unique-id": "uid-M\n",
+            "opt/smartroom/config/agent.json": '{"serverUrl": "https://s.example"}',
+            "opt/smartroom/state/requirements.sha256": "abc\n",
+            "etc/NetworkManager/system-connections/wifi.nmconnection": "[connection]\nid=wifi\n",
+        }.items():
+            f = p / rel
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_text(data)
+
+    def release(self, name="2026.11.21-mini", cmdline=MINI_CMDLINE, uki=b"uki-mini-new", pad=0):
+        d = self.tmp / f"release-{name}"
+        (d / "EFI/Linux").mkdir(parents=True)
+        (d / "EFI/Linux/smartroomos_linux-t2.efi").write_bytes(uki)
+        tree = self.tmp / f"tree-{name}"
+        root = tree / "factory"
+        (root / "etc/default").mkdir(parents=True)
+        (root / "etc/fstab").write_text("UUID=aa  /  btrfs  noatime,subvol=@  0 0\n")
+        (root / "etc/default/limine").write_text(f'KERNEL_CMDLINE[default]="{cmdline}"\n')
+        (root / "usr/lib").mkdir(parents=True)
+        (root / "usr/lib/marker").write_text(f"release {name}\n")
+        tar = subprocess.run(["tar", "-C", str(tree), "-cf", "-", "factory"], capture_output=True, check=True).stdout
+        stream = subprocess.run(["zstd", "-q", "-c"], input=tar, capture_output=True, check=True).stdout
+        (d / "root.btrfs.zst").write_bytes(stream)
+        manifest = {
+            "schema": 1, "id": name, "created": "2026-11-21T00:00:00Z", "parent": None, "line": "mini",
+            "root": {"file": "root.btrfs.zst", "sha256": sha(stream), "size": len(stream)},
+            "boot": [
+                {"role": "uki", "path": "EFI/Linux/smartroomos_linux-t2.efi", "sha256": sha(uki), "size": len(uki) + pad},
+            ],
+        }
+        (d / "manifest.json").write_text(json.dumps(manifest))
+        return d
+
+    def trial_boot(self, name="2026.11.21-mini"):
+        """Reboot into the armed Mini trial: Limine took the one-shot."""
+        marker = self.esp / "smartroom-release/trial.marker"
+        if marker.is_file():
+            marker.write_bytes(marker.read_bytes())  # still armed; health-run marks spent
+        (self.prefix / "proc/cmdline").write_text(sr.trial_cmdline(MINI_CMDLINE, f"@r-{name}", name) + "\n")
+        (self.prefix / "proc/sys/kernel/random/boot_id").write_text("boot-2\n")
+        self.host.oneshot = None
+        self.host.saved = None
+
+
+class MiniLine(unittest.TestCase):
+    def test_detects_mini_layout(self):
+        w = MiniWorld(self)
+        self.assertEqual(w.host.line(), "mini")
+        self.assertFalse(w.host.layout().uses_aura)
+
+    def test_update_trial_promote_and_status_json(self):
+        w = MiniWorld(self)
+        w.host.conf  # force defaults
+        (w.prefix / "etc/smartroomos").mkdir(parents=True, exist_ok=True)
+        (w.prefix / "etc/smartroomos/release.conf").write_text("quiet_seconds=60\nlimit_seconds=120\nsample_seconds=5\n")
+        w.host._conf = None
+        code, _, err = w.run("update", str(w.release()), "--unsigned")
+        self.assertEqual(code, 0, err)
+        self.assertTrue((w.esp / "smartroom-release/trial.marker").is_file())
+        self.assertFalse((w.esp / "aura-try").exists())
+        self.assertTrue((w.esp / sr.LAYOUT_MINI.trial_uki).is_file())
+        self.assertIn("/SmartRoom Release Trial", w.limine())
+        w.trial_boot()
+        code, _, err = w.run("health-run")
+        self.assertEqual(code, 0, err)
+        st = w.state()
+        self.assertEqual(st["configured"]["release"], "2026.11.21-mini")
+        self.assertEqual(st["previous"]["release"], "installed")
+        self.assertEqual(st["line"], "mini")
+        self.assertFalse((w.esp / "smartroom-release/trial.marker").exists())
+        doc = json.loads(w.run("status", "--json")[1])
+        self.assertEqual(doc["line"], "mini")
+        self.assertEqual(doc["backend"], "smartroom-release")
+        self.assertEqual(doc["keepGood"], 5)
+        self.assertEqual(doc["release"]["configured"], "2026.11.21-mini")
+        self.assertEqual(doc["trial"], None)
+
+    def test_unhealthy_trial_falls_back(self):
+        w = MiniWorld(self)
+        (w.prefix / "etc/smartroomos").mkdir(parents=True, exist_ok=True)
+        (w.prefix / "etc/smartroomos/release.conf").write_text("quiet_seconds=60\nlimit_seconds=90\nsample_seconds=5\n")
+        w.host._conf = None
+        w.run("update", str(w.release()), "--unsigned")
+        w.trial_boot()
+        w.host.connected = False
+        code, _, _ = w.run("health-run")
+        self.assertEqual(code, 1)
+        self.assertEqual(w.host.reboots, 1)
+        st = w.state()
+        self.assertEqual(st["last_result"]["reason"], "health-timeout")
+        self.assertEqual(st["configured"]["release"], "installed")
+
+    def test_keeps_five_good_release_roots(self):
+        w = MiniWorld(self)
+        (w.prefix / "etc/smartroomos").mkdir(parents=True, exist_ok=True)
+        (w.prefix / "etc/smartroomos/release.conf").write_text("quiet_seconds=30\nlimit_seconds=60\nsample_seconds=5\n")
+        w.host._conf = None
+        for i in range(1, 7):
+            name = f"2026.11.2{i}-mini"
+            code, _, err = w.run("update", str(w.release(name=name, uki=f"uki-{i}".encode())), "--unsigned")
+            self.assertEqual(code, 0, err)
+            w.trial_boot(name)
+            # after first promote, cmdline must name the running release
+            if i > 1:
+                prev = f"2026.11.2{i-1}-mini"
+                (w.prefix / "proc/cmdline").write_text(sr.trial_cmdline(MINI_CMDLINE, f"@r-{name}", name) + "\n")
+                (w.prefix / "proc/sys/kernel/random/boot_id").write_text(f"boot-{i+1}\n")
+            self.assertEqual(w.run("health-run")[0], 0)
+            (w.prefix / "proc/cmdline").write_text(sr.with_subvol(MINI_CMDLINE, f"@r-{name}", name) + "\n")
+            with contextlib.suppress(FileNotFoundError):
+                (w.esp / "smartroom-release/trial.marker").unlink()
+        st = w.state()
+        self.assertEqual(st["configured"]["release"], "2026.11.26-mini")
+        self.assertLessEqual(len(st.get("history") or []), 4)  # configured + 4 = 5
+        roots = {p.name for p in (w.prefix / "top").glob("@r-*")}
+        self.assertLessEqual(len(roots), 5)
+        self.assertIn("@r-2026.11.26-mini", roots)
+        # oldest of the six @r-* should be gone (configured + 4 history)
+        self.assertNotIn("@r-2026.11.21-mini", roots)
+
+    def test_migrate_check_and_migrate_trial(self):
+        w = MiniWorld(self)
+        (w.prefix / "etc/smartroomos").mkdir(parents=True, exist_ok=True)
+        (w.prefix / "etc/smartroomos/release.conf").write_text("quiet_seconds=30\nlimit_seconds=60\nsample_seconds=5\n")
+        w.host._conf = None
+        # fake free space via prefix disk_usage is real tmpfs/home; migrate-check uses shutil on top
+        code, out, err = w.run("migrate-check", "--json")
+        # may fail free-space on tiny tmp; force path is what agents use after review
+        code, _, err = w.run("migrate", str(w.release(name="2026.11.21-mig")), "--unsigned", "--force")
+        self.assertEqual(code, 0, err)
+        st = w.state()
+        self.assertEqual(st["trial"]["kind"], "migrate")
+        self.assertEqual(st["configured"]["root"], "@")
+        self.assertEqual(st["migration"]["old_root"], "@")
+        w.trial_boot("2026.11.21-mig")
+        self.assertEqual(w.run("health-run")[0], 0)
+        st = w.state()
+        self.assertEqual(st["configured"]["release"], "2026.11.21-mig")
+        self.assertTrue(st["migration"].get("kept_until_confirmed"))
+        self.assertTrue((w.prefix / "top/@").exists())
+        self.assertEqual(w.run("confirm-migration")[0], 0)
+
+    def test_migrate_refuses_studio(self):
+        w = World(self)
+        code, out, err = w.run("--json", "migrate-check")
+        self.assertEqual(code, 1)
+        self.assertIn("wrong-line", out + err)
+
+    def test_lost_before_userspace_on_mini(self):
+        w = MiniWorld(self)
+        w.run("update", str(w.release()), "--unsigned")
+        # came back on configured @ without ever reaching the trial root
+        w.back_on_configured(root="@", boot_id="boot-9")
+        self.assertEqual(w.run("health-run")[0], 0)
+        self.assertEqual(w.state()["last_result"]["reason"], "lost-before-userspace")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)

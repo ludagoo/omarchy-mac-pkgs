@@ -7,7 +7,8 @@ Description=SmartRoom release trial: health check and rollback guard
 Documentation=file:///usr/share/doc/smartroom-release/README.md
 DefaultDependencies=no
 After=local-fs.target systemd-remount-fs.service
-RequiresMountsFor=/boot/efi
+# Studio ESP is /boot/efi; Mini ESP is /boot. Require whichever is a mount.
+RequiresMountsFor=/boot
 Before=sysinit.target
 Conflicts=shutdown.target
 Before=shutdown.target

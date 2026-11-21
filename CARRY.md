@@ -72,7 +72,7 @@ clock, marks good by write-beside, and rolls back by leaving the configured
 file alone. `smartroom/aura-try/test-all.sh` runs offline. It does not touch
 a real EFI partition and it does not reboot.
 
-`smartroom-release/` (recipe `smartroom/pkgbuilds/smartroom-release`) is the Studio update
+`smartroom-release/` (recipe `smartroom/pkgbuilds/smartroom-release`) is the Studio and Mini update
 and rollback tool built on aura's trial boot (`aura-try`); see its README. It installs a
 release's root and boot set beside the running one, boots it once under aura's 178 s
 hardware watchdog, and keeps it only when the room proves healthy (Room Controller
@@ -145,7 +145,7 @@ is copied unchanged.
 | 5 | `smartroom/pkgbuilds/`: the omacom/omarchy-pkgs recipe for `omarchy-mac-boot`, unchanged except source (this fork), `depends` (`smartroom-omarchy-helpers` + `sudo` instead of `omarchy`; `asahi-scripts` as the stable 20261104-1 has it) and pkgver/_commit from the build; and the helpers' recipe | omacom builds its packages in omarchy-pkgs from omacom main; ours build from this fork | No (ours) | Never |
 | 6 | `smartroom-boot-os/` and its recipe: `smartroom-boot-os macos\|firmware [--once] [--reboot]`, supporting Apple Silicon (`aurora-bless`) and Intel T2 `Macmini8,1` (`efibootmgr` + `efivarfs`) | Zoom-room Macs switch between SmartRoom Firmware and macOS (Zoom Rooms) from Linux with no macOS password. Apple Silicon uses `aurora-bless` (`boot-volume` / `alt-boot-volume`); Intel T2 uses `efibootmgr` (`BootOrder` / `BootNext`), creates a missing SmartRoom entry, reconstructs a missing macOS `Boot####` entry from `/boot/smartroomos/macos-boot-device.bin` when `bless` overwrote `Boot0080`, and syncs Apple `efi-boot-device*` / `efi-boot-next*` efivars when present | No (ours) | Never |
 | 7 | `omarchy-mac-boot/setup/grub-console.sh`: on a headless (`/etc/omarchy-mac-boot/headless`), unencrypted image the root-device wait is `x-systemd.device-timeout=60`, not `0` (an older endless value is replaced); an encrypted image or a Mac that is not headless keeps `0`. `test/headless-device-wait-test.sh` (a new file, so `user4k.patch`'s hunks in the existing grub-console test still apply) | A room with a missing or unreadable root disk waited for ever in the initramfs with no screen (SmartRoom Firmware WS1, decision 1: boot never waits); after 60 s systemd reaches the emergency target, which the room's initrd hook turns into a reboot | Maybe: "finite root wait for images with nobody to unlock" | omacom takes it |
-| 8 | `smartroom-release/` and its recipe (edge only): trial-boot update and automatic rollback for a Studio on aura's `aura-try` | A Studio had no update path and no rollback by itself (the Mini's snapshot tools do not apply to the Studio boot chain). See the process above | No (ours) | Never |
+| 8 | `smartroom-release/` and its recipe (edge only): trial-boot update and automatic rollback for Studio (aura-try) and Intel Mini (Limine one-shot + iTCO/softdog); remote migrate for old Minis | Parity: one update tool on both lines; old Minis move without a USB visit (WS12). See the process above | No (ours) | Never |
 
 Nothing else differs from omacom (#6, #7, and #8 are our additions beside theirs). In particular the initramfs, in-place
 encryption (still switchable: `omarchy/install.conf` on the ESP, `encrypt=1`),

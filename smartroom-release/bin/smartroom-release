@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
-"""smartroom-release: update a room Mac (Studio) to a new release, as a trial.
+"""smartroom-release: update a SmartRoom room (Studio or Intel Mini) to a new
+release, as a trial.
 
 The design is ~/smartroom-rollback/DESIGN.md. A release is one tested image:
 a btrfs root and the boot files that start it. An update never runs a package
 upgrade on the live system. It writes the new release beside the running one,
-boots it once, and keeps it only if the room proves healthy. Otherwise aura
-(the boot loader below Linux) boots the previous release by itself.
+boots it once, and keeps it only if the room proves healthy. Otherwise the
+boot chain boots the previous release by itself.
+
+  Studio: aura-try + Limine one-shot (U-Boot efivars) + Apple watchdog
+  Mini:   Limine one-shot (NVRAM) + boot-try counting + iTCO_wdt/softdog
 
   smartroom-release status [--json]
   smartroom-release list [--json]
@@ -18,23 +22,25 @@ boots it once, and keeps it only if the room proves healthy. Otherwise aura
   smartroom-release build-release --id ID --out DIR [--source-subvol NAME]
                                   [--sign-key FPR]  make a release from this room
   smartroom-release restore N [--no-reboot]         Room Controller contract
+  smartroom-release migrate RELEASE [--reboot] [--unsigned] [--force]
+                                  old Mini -> release trial (fallback = current @)
+  smartroom-release migrate-check                   refuse safely if the room cannot move
 
 RELEASE is a directory holding manifest.json (see README.md), or an https URL
 of one. Nothing here asks a question. Exit status is non-zero on error; with
 --json an error is {"error": {"code": ..., "message": ...}} on stdout.
 
 How a trial is one-shot at every layer:
-  aura-try   the ESP file `aura-try` ("armed", newline, path, newline). aura's
-             first stage marks it spent on disk before it boots the path. Its
-             trial watchdog (178 s) covers a hang before Linux.
-  Limine     the one-shot entry LoaderEntryOneShot picks the trial UKI, whose
-             command line names the new root subvolume. Limine consumes it.
-  kernel     the trial command line has watchdog.handle_boot_enabled=0, so the
-             kernel does not feed the still-running trial watchdog. This
-             program's health service opens /dev/watchdog and feeds it only
-             while the check is alive.
+  Studio aura-try  ESP file aura-try ("armed", newline, path, newline). aura
+                   marks it spent before it boots the path; 178 s watchdog.
+  Limine           LoaderEntryOneShot picks the trial UKI / entry once.
+  Mini             efivarfs NVRAM holds the one-shot (no ubootefi.var). The
+                   health service opens /dev/watchdog (iTCO_wdt or softdog).
+  kernel           trial cmdline has watchdog.handle_boot_enabled=0 so the
+                   health service must feed the watchdog.
 Everything the trial changes is beside what is configured. Mark-good is a
 fixed list of steps whose only switch is one rename of limine.conf.
+The last KEEP_GOOD (5) good releases stay on disk for manual restore.
 """
 from __future__ import annotations
 
@@ -52,7 +58,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, NamedTuple, Optional
 
 SCHEMA = 1
 MANIFEST = "manifest.json"
@@ -85,6 +91,48 @@ REASONS = (
     "trial-did-not-start",   # Limine ran the trial entry but the trial boot image never ran
     "trial-incomplete",      # the trial boot image ran but Limine booted the configured entry
 )
+
+
+KEEP_GOOD = 5  # last N good releases kept on disk (Lucas decision 3)
+MINI_MARKER = "trial.marker"  # ESP smartroom-release/trial.marker (Mini; no aura-try)
+
+
+class BootLayout(NamedTuple):
+    """Per-line boot file names. Studio uses aura stage2; Mini uses UKI only."""
+    line: str
+    configured_uki: str
+    trial_uki: str
+    previous_uki: str
+    configured_boot: str
+    trial_boot: str
+    previous_boot: str
+    uses_aura: bool
+    uki_needle: str  # substring that marks the configured Limine kernel entry
+
+
+LAYOUT_STUDIO = BootLayout(
+    line="studio",
+    configured_uki=CONFIGURED_UKI,
+    trial_uki=TRIAL_UKI,
+    previous_uki=PREVIOUS_UKI,
+    configured_boot=CONFIGURED_BOOT,
+    trial_boot=TRIAL_BOOT,
+    previous_boot=PREVIOUS_BOOT,
+    uses_aura=True,
+    uki_needle="/EFI/Linux/omarchy_",
+)
+LAYOUT_MINI = BootLayout(
+    line="mini",
+    configured_uki="EFI/Linux/smartroomos_linux-t2.efi",
+    trial_uki="EFI/Linux/smartroomos_linux-t2-trial.efi",
+    previous_uki="EFI/Linux/smartroomos_linux-t2-previous.efi",
+    configured_boot="",
+    trial_boot="",
+    previous_boot="",
+    uses_aura=False,
+    uki_needle="/EFI/Linux/smartroomos_",
+)
+
 
 DEFAULTS = {
     "quiet_seconds": 300,
@@ -237,7 +285,31 @@ class Host:
                 if shutil.which("omarchy-mac-esp") else None
             if done is not None and done.returncode == 0 and done.stdout.strip():
                 return Path(done.stdout.strip())
-        return self.p("/boot/efi")
+        # Studio: /boot/efi. Mini: Limine UKI lives under /boot (no separate efi mount).
+        efi = self.p("/boot/efi")
+        if (efi / "limine.conf").is_file() or (efi / "EFI").is_dir():
+            return efi
+        boot = self.p("/boot")
+        if (boot / "limine.conf").is_file() or (boot / "EFI").is_dir():
+            return boot
+        return efi
+
+    def line(self) -> str:
+        """studio (Apple Silicon / aura) or mini (Intel T2 / Limine-only)."""
+        if self.p("/etc/smartroomos/omarchy-base").is_file():
+            return "studio"
+        esp = self.esp()
+        if (esp / CONFIGURED_BOOT).is_file() or (esp / CONFIGURED_UKI).is_file():
+            return "studio"
+        if (esp / LAYOUT_MINI.configured_uki).is_file():
+            return "mini"
+        # Prefer Mini when there is no aura stage2 and the machine looks Intel.
+        if not (esp / "m1n1").is_dir():
+            return "mini"
+        return "studio"
+
+    def layout(self) -> BootLayout:
+        return LAYOUT_STUDIO if self.line() == "studio" else LAYOUT_MINI
 
     def cmdline(self) -> str:
         return self.p("/proc/cmdline").read_text().strip()
@@ -355,19 +427,44 @@ class Host:
             os.close(fd)
 
     def save_efi_vars(self) -> None:
+        """Studio: persist U-Boot RAM efivars to ubootefi.var. Mini: no-op (NVRAM)."""
+        if self.line() == "mini":
+            return
         saver = self.p(EFI_VARS_SAVE)
-        if not self.prefix and not saver.exists():
+        alt = self.p("/usr/local/sbin/smartroomos-efi-vars-save")
+        if not self.prefix and not saver.exists() and not alt.exists():
             raise Fail("omarchy-mac-boot's efi-vars-save is not installed")
-        if saver.exists():
-            self.run([str(saver)])
+        for candidate in (saver, alt):
+            if candidate.exists():
+                self.run([str(candidate)])
+                return
 
     def oneshot_saved(self) -> bool:
-        """True when U-Boot's variable file on the ESP holds the one-shot."""
+        """True when the one-shot will survive reboot (ubootefi.var or NVRAM)."""
+        if self.line() == "mini":
+            var = self.efivar(ONESHOT)
+            try:
+                data = var.read_bytes()
+            except OSError:
+                return False
+            # efivarfs: 4-byte attributes + UTF-16LE entry id
+            return len(data) > 4
         needle = "LoaderEntryOneShot".encode("utf-16-le")
         try:
             return needle in (self.esp() / "ubootefi.var").read_bytes()
         except OSError:
             return False
+
+    def ensure_watchdog_module(self) -> None:
+        """Mini: prefer iTCO_wdt, else softdog, so /dev/watchdog exists for trials."""
+        if self.line() != "mini" or self.prefix:
+            return
+        if self.p("/dev/watchdog").exists():
+            return
+        for mod in ("iTCO_wdt", "softdog"):
+            subprocess.run(["modprobe", mod], capture_output=True, check=False)
+            if self.p("/dev/watchdog").exists():
+                return
 
     # reboot ---------------------------------------------------------------------------
     def reboot(self) -> None:
@@ -443,12 +540,15 @@ def load_state(host: Host) -> dict:
             return json.loads(path.read_text())
         except ValueError:
             raise Fail(f"{path} is not valid JSON; leaving it alone")
+    layout = host.layout()
     return {
         "schema": SCHEMA,
         "counter": 0,
+        "line": layout.line,
         "configured": {"release": INSTALLED, "number": 0, "root": running_root(host),
-                       "uki": CONFIGURED_UKI, "boot": CONFIGURED_BOOT},
+                       "uki": layout.configured_uki, "boot": layout.configured_boot},
         "previous": None,
+        "history": [],
         "trial": None,
         "promoting": None,
         "last_result": None,
@@ -525,6 +625,10 @@ def with_trial_entry(text: str, release: str, uki: str, cmdline: str) -> str:
     return base + block
 
 
+def _is_kernel_uki_path(path_line: str) -> bool:
+    return any(n in path_line for n in ("/EFI/Linux/omarchy_", "/EFI/Linux/smartroomos_"))
+
+
 def kernel_entry(text: str) -> Optional[tuple[str, str]]:
     """(path, cmdline) of the entry that boots the configured UKI."""
     lines = text.splitlines()
@@ -534,7 +638,7 @@ def kernel_entry(text: str) -> Optional[tuple[str, str]]:
         path = cmd = None
         for line in lines[start:end]:
             stripped = line.strip()
-            if stripped.startswith("path:") and "/EFI/Linux/omarchy_" in stripped:
+            if stripped.startswith("path:") and _is_kernel_uki_path(stripped):
                 path = stripped[len("path:"):].strip()
             elif stripped.startswith("cmdline:"):
                 cmd = stripped[len("cmdline:"):].strip()
@@ -550,7 +654,7 @@ def set_kernel_entry(text: str, uki: str, cmdline: str) -> str:
     for start, end, title in _entry_blocks(lines):
         if title == TRIAL_ENTRY_NAME or done:
             continue
-        has_uki = any(l.strip().startswith("path:") and "/EFI/Linux/omarchy_" in l for l in lines[start:end])
+        has_uki = any(l.strip().startswith("path:") and _is_kernel_uki_path(l) for l in lines[start:end])
         if not has_uki:
             continue
         for i in range(start, end):
@@ -635,9 +739,14 @@ def load_manifest(directory: Path) -> dict:
         if key not in manifest:
             raise Fail(f"manifest has no {key}")
     roles = {item.get("role"): item for item in manifest["boot"]}
-    for role in ("stage2", "uki"):
-        if role not in roles:
-            raise Fail(f"manifest boot list has no {role}")
+    if "uki" not in roles:
+        raise Fail("manifest boot list has no uki")
+    line = manifest.get("line")  # optional: "studio" | "mini"
+    if line not in (None, "studio", "mini"):
+        raise Fail(f"manifest line {line!r} is not studio or mini")
+    if line != "mini" and "stage2" not in roles:
+        # Studio releases need aura stage2; Mini releases are UKI-only.
+        raise Fail("manifest boot list has no stage2")
     for item in [manifest["root"]] + list(manifest["boot"]):
         name = item.get("file") or item.get("path")
         if not name or name.startswith("/") or ".." in Path(name).parts:
@@ -866,17 +975,34 @@ def healthy_sample(host: Host, baseline: dict) -> tuple[int, int, int]:
 def release_rows(state: dict) -> list[dict]:
     rows = []
     conf = state.get("configured") or {}
-    prev = state.get("previous") or {}
-    for key, entry in (("configured", conf), ("previous", prev)):
-        if entry and entry.get("release"):
-            rows.append({
-                "number": entry.get("number", 0),
-                "release": entry["release"],
-                "role": key,
-                "root": entry.get("root"),
-                "bootable": bool(entry.get("boot")),
-                "current": False,
-            })
+    seen = set()
+    if conf and conf.get("release"):
+        rows.append({
+            "number": conf.get("number", 0),
+            "release": conf["release"],
+            "role": "configured",
+            "root": conf.get("root"),
+            "bootable": bool(conf.get("uki") or conf.get("boot")),
+            "current": False,
+        })
+        seen.add(conf["release"])
+    history = list(state.get("history") or [])
+    prev = state.get("previous")
+    if prev and prev.get("release") and prev["release"] not in seen:
+        history = [prev] + [h for h in history if h.get("release") != prev.get("release")]
+    for i, entry in enumerate(history):
+        if not entry or not entry.get("release") or entry["release"] in seen:
+            continue
+        role = "previous" if i == 0 else "history"
+        rows.append({
+            "number": entry.get("number", 0),
+            "release": entry["release"],
+            "role": role,
+            "root": entry.get("root"),
+            "bootable": bool(entry.get("uki") or entry.get("boot")),
+            "current": False,
+        })
+        seen.add(entry["release"])
     return rows
 
 
@@ -886,10 +1012,16 @@ def status_doc(host: Host, state: dict) -> dict:
     trial_state = state.get("trial")
     conf = state.get("configured") or {}
     prev = state.get("previous")
-    on_trial = bool(host.dt_trial())
+    layout = host.layout()
+    on_trial = bool(host.dt_trial()) if layout.uses_aura else (
+        bool(trial_state) and trial_state.get("phase") in ("booting", "armed")
+        and root == trial_state.get("root"))
+    # Prefer the cmdline / root fact for Mini once userspace is up.
+    if not layout.uses_aura and trial_state and root == trial_state.get("root") and release == trial_state.get("release"):
+        on_trial = True
     last = state.get("last_result")
     number = 0
-    for entry in (conf, prev or {}):
+    for entry in [conf, prev or {}] + list(state.get("history") or []):
         if entry and entry.get("release") == release:
             number = entry.get("number", 0)
     esp = host.esp()
@@ -902,6 +1034,9 @@ def status_doc(host: Host, state: dict) -> dict:
         row["current"] = row["release"] == release
     doc = {
         "available": True,
+        "line": state.get("line") or layout.line,
+        "backend": "smartroom-release",
+        "keepGood": KEEP_GOOD,
         "running": {"root": "live", "number": number, "entry": root, "release": release, "trial": on_trial},
         "fallback": None,
         "trial": None,
@@ -919,8 +1054,9 @@ def status_doc(host: Host, state: dict) -> dict:
         "events": state.get("events", [])[-20:],
     }
     if trial_state:
+        layers = ["limine", "aura"] if layout.uses_aura else ["limine", "watchdog"]
         doc["trial"] = {"kind": trial_state.get("kind", "update"), "armed": trial_state.get("armed_at"),
-                        "layers": ["limine", "aura"], "fallbackSnapshot": conf.get("number"),
+                        "layers": layers, "fallbackSnapshot": conf.get("number"),
                         "target": trial_state.get("number"), "phase": trial_state.get("phase")}
     if last and last.get("result") == "rolled-back":
         doc["fallback"] = {"of": last.get("number"), "since": last.get("at"), "reason": last.get("reason")}
@@ -966,21 +1102,36 @@ def require_root(host: Host) -> None:
         raise Fail("run as root")
 
 
-def stage_release(host: Host, state: dict, directory: Path, unsigned: bool, kind: str = "update") -> dict:
+def stage_release(host: Host, state: dict, directory: Path, unsigned: bool, kind: str = "update",
+                  require_healthy: bool = True) -> dict:
+    layout = host.layout()
+    state["line"] = layout.line
     manifest = load_manifest(directory)
     release = manifest["id"]
+    mline = manifest.get("line")
+    if mline and mline != layout.line:
+        raise Fail(f"this release is for {mline}, this room is {layout.line}", "wrong-line")
+    if layout.line == "studio" and "stage2" not in {i.get("role") for i in manifest["boot"]}:
+        raise Fail("a Studio release needs a stage2 boot file")
+    if layout.line == "mini" and "stage2" in {i.get("role") for i in manifest["boot"]} and mline == "studio":
+        raise Fail("refusing a Studio release on a Mini", "wrong-line")
     signed = verify_signature(host, directory, unsigned)
     if state.get("trial") and state["trial"].get("phase") in ("armed", "booting", "promoting"):
         raise Fail("a trial boot is already pending", "trial-pending")
     if state.get("promoting"):
         raise Fail("a promotion is unfinished; the health service finishes it at boot", "trial-pending")
-    if release in (state["configured"].get("release"), (state.get("previous") or {}).get("release")):
+    known = {state["configured"].get("release")}
+    known |= {h.get("release") for h in (state.get("history") or []) if h}
+    if (state.get("previous") or {}).get("release"):
+        known.add(state["previous"]["release"])
+    if release in known and kind != "migrate":
         raise Fail(f"release {release} is already on this room", "not-found")
     esp = host.esp()
-    now_ok = healthy_sample(host, {"displays": 0})
-    if now_ok[0] == 0 or now_ok[1] == 0:
-        raise Fail("this room is not healthy now (Room Controller or network down); "
-                   "an update would look like a failed one. Fix that first.", "unhealthy")
+    if require_healthy:
+        now_ok = healthy_sample(host, {"displays": 0})
+        if now_ok[0] == 0 or now_ok[1] == 0:
+            raise Fail("this room is not healthy now (Room Controller or network down); "
+                       "an update would look like a failed one. Fix that first.", "unhealthy")
     baseline = {"displays": host.displays()}
     check_files(directory, manifest)
     space_check(host, manifest, esp)
@@ -1002,31 +1153,75 @@ def stage_release(host: Host, state: dict, directory: Path, unsigned: bool, kind
         require_zero_touch(cmdline)
         fix_root_files(host, new_root, subvol, release)
     # boot files, beside the configured ones
-    copy_atomic(directory / roles["stage2"]["path"], esp / TRIAL_BOOT, roles["stage2"]["sha256"])
-    copy_atomic(directory / roles["uki"]["path"], esp / TRIAL_UKI, roles["uki"]["sha256"])
+    trial_uki = layout.trial_uki
+    trial_boot = layout.trial_boot
+    if layout.uses_aura:
+        copy_atomic(directory / roles["stage2"]["path"], esp / trial_boot, roles["stage2"]["sha256"])
+    copy_atomic(directory / roles["uki"]["path"], esp / trial_uki, roles["uki"]["sha256"])
+    # Keep a durable UKI copy for history/restore (ESP/smartroom-release/uki/<id>.efi).
+    uki_store = esp / STATE_DIR / "uki" / f"{release}.efi"
+    copy_atomic(directory / roles["uki"]["path"], uki_store, roles["uki"]["sha256"])
+    if layout.uses_aura:
+        boot_store = esp / STATE_DIR / "boot" / f"{release}.bin"
+        copy_atomic(directory / roles["stage2"]["path"], boot_store, roles["stage2"]["sha256"])
     trial_cmd = trial_cmdline(cmdline, subvol, release)
-    write_atomic(esp / "limine.conf", with_trial_entry(cfg_text, release, TRIAL_UKI, trial_cmd).encode(), 0o700)
+    write_atomic(esp / "limine.conf", with_trial_entry(cfg_text, release, trial_uki, trial_cmd).encode(), 0o700)
     state["counter"] = state.get("counter", 0) + 1
     state["trial"] = {
         "kind": kind, "release": release, "number": state["counter"], "root": subvol,
-        "boot": TRIAL_BOOT, "uki": TRIAL_UKI, "cmdline": with_subvol(cmdline, subvol, release),
+        "boot": trial_boot, "uki": trial_uki, "cmdline": with_subvol(cmdline, subvol, release),
         "phase": "staged", "staged_at": host.stamp(), "baseline": baseline, "signed": signed,
-        "carried": len(carried), "reached": False,
+        "carried": len(carried), "reached": False, "line": layout.line,
     }
-    event(host, state, "started", release=release, previous=state["configured"].get("release"))
+    event(host, state, "started", release=release, previous=state["configured"].get("release"), line=layout.line)
     event(host, state, "files-checked", result="ok", release=release, signed=signed)
     save_state(host, state)
     return state
 
 
-def promote_previous_as_trial(host: Host, state: dict) -> dict:
-    """A rollback is a trial of the previous release, whose files are on disk."""
-    prev = state.get("previous")
+def find_release_entry(state: dict, number: Optional[int] = None, release: Optional[str] = None) -> dict:
+    """Locate a kept release by number or id (configured, previous, or history)."""
+    conf = state.get("configured") or {}
+    candidates = []
+    if conf.get("release"):
+        candidates.append(conf)
+    if state.get("previous"):
+        candidates.append(state["previous"])
+    candidates.extend(state.get("history") or [])
+    for entry in candidates:
+        if not entry:
+            continue
+        if number is not None and entry.get("number") == number:
+            return entry
+        if release is not None and entry.get("release") == release:
+            return entry
+    raise Fail(f"release {'number ' + str(number) if number is not None else release} is not on this room", "not-found")
+
+
+def promote_previous_as_trial(host: Host, state: dict, entry: Optional[dict] = None) -> dict:
+    """A rollback is a trial of a kept release whose files are on disk."""
+    layout = host.layout()
+    prev = entry or state.get("previous")
     if not prev:
         raise Fail("there is no previous release on this room", "not-found")
     esp = host.esp()
-    if not (esp / prev["uki"]).is_file() or not (esp / prev["boot"]).is_file():
-        raise Fail("the previous release's boot files are gone", "not-found")
+    uki_src = esp / prev["uki"] if prev.get("uki") and (esp / prev["uki"]).is_file() else None
+    if uki_src is None:
+        stored = esp / STATE_DIR / "uki" / f"{prev['release']}.efi"
+        if stored.is_file():
+            uki_src = stored
+    if uki_src is None:
+        raise Fail("the previous release's UKI is gone", "not-found")
+    boot_src = None
+    if layout.uses_aura:
+        if prev.get("boot") and (esp / prev["boot"]).is_file():
+            boot_src = esp / prev["boot"]
+        else:
+            stored_b = esp / STATE_DIR / "boot" / f"{prev['release']}.bin"
+            if stored_b.is_file():
+                boot_src = stored_b
+        if boot_src is None:
+            raise Fail("the previous release's boot files are gone", "not-found")
     with host.top() as top:
         if prev["root"] and not subvol_exists(top, prev["root"]):
             raise Fail(f"the previous root {prev['root']} is gone", "not-found")
@@ -1035,19 +1230,21 @@ def promote_previous_as_trial(host: Host, state: dict) -> dict:
     if not found:
         raise Fail("limine.conf has no kernel entry")
     # Its own files keep their names; the trial files are copies so mark-good is the same steps.
-    copy_atomic(esp / prev["boot"], esp / TRIAL_BOOT)
-    copy_atomic(esp / prev["uki"], esp / TRIAL_UKI)
+    if layout.uses_aura and boot_src is not None:
+        copy_atomic(boot_src, esp / layout.trial_boot)
+    copy_atomic(uki_src, esp / layout.trial_uki)
     cmdline = with_subvol(found[1], prev["root"] or "@", None if prev["release"] == INSTALLED else prev["release"])
     require_zero_touch(cmdline)
     state["counter"] = state.get("counter", 0) + 1
     state["trial"] = {
         "kind": "rollback", "release": prev["release"], "number": prev.get("number", 0), "root": prev["root"],
-        "boot": TRIAL_BOOT, "uki": TRIAL_UKI, "cmdline": cmdline,
+        "boot": layout.trial_boot, "uki": layout.trial_uki, "cmdline": cmdline,
         "phase": "staged", "staged_at": host.stamp(), "baseline": {"displays": host.displays()},
-        "signed": None, "carried": 0, "reached": False,
+        "signed": None, "carried": 0, "reached": False, "line": layout.line,
     }
     write_atomic(esp / "limine.conf",
-                 with_trial_entry(cfg_text, prev["release"], TRIAL_UKI, cmdline + " " + " ".join(TRIAL_ONLY_PARAMS)).encode(), 0o700)
+                 with_trial_entry(cfg_text, prev["release"], layout.trial_uki,
+                                  cmdline + " " + " ".join(TRIAL_ONLY_PARAMS)).encode(), 0o700)
     event(host, state, "started", release=prev["release"], previous=state["configured"].get("release"), kind="rollback")
     save_state(host, state)
     return state
@@ -1057,38 +1254,51 @@ def arm_trial(host: Host, state: dict) -> dict:
     trial = state.get("trial")
     if not trial or trial.get("phase") != "staged":
         raise Fail("nothing is staged", "not-found")
+    layout = host.layout()
     esp = host.esp()
     # the files must still check out, right before they can be booted
-    for rel in (trial["boot"], trial["uki"]):
+    need = [trial["uki"]]
+    if trial.get("boot"):
+        need.append(trial["boot"])
+    for rel in need:
         if not (esp / rel).is_file():
             raise Fail(f"staged file {rel} is missing")
     text = (esp / "limine.conf").read_text()
     if f"/{TRIAL_ENTRY_NAME}" not in text:
         raise Fail("the Limine trial entry is not in limine.conf")
-    # 1. Limine's one-shot, saved to U-Boot's variable file and read back
+    host.ensure_watchdog_module()
+    # 1. Limine's one-shot
     host.set_oneshot(TRIAL_ENTRY_ID)
     host.save_efi_vars()
     if not host.oneshot_saved():
         host.set_oneshot(None)
         with contextlib.suppress(Fail):
             host.save_efi_vars()
-        raise Fail("the Limine one-shot did not reach U-Boot's variable file; nothing is armed")
-    # 2. aura-try last: it is what arms the watchdog and starts the trial boot image
-    write_atomic(esp / MARKER, f"armed\n{trial['boot']}\n".encode(), 0o700)
+        raise Fail("the Limine one-shot did not persist; nothing is armed")
+    # 2. Studio: aura-try last (arms the hardware watchdog and starts the trial image).
+    #    Mini: ESP marker under smartroom-release/ (Limine one-shot is the switch).
+    if layout.uses_aura:
+        write_atomic(esp / MARKER, f"armed\n{trial['boot']}\n".encode(), 0o700)
+        event_path = trial["boot"]
+    else:
+        write_atomic(esp / STATE_DIR / MINI_MARKER, f"armed\n{trial['uki']}\n".encode(), 0o700)
+        event_path = trial["uki"]
     trial["phase"] = "armed"
     trial["armed_at"] = host.stamp()
     trial["armed_boot_id"] = host.boot_id()
-    event(host, state, "armed", release=trial["release"], path=trial["boot"])
+    event(host, state, "armed", release=trial["release"], path=event_path, line=layout.line)
     save_state(host, state)
     return state
 
 
 def clear_trial_files(host: Host, state: dict, keep_subvolume: bool = True) -> None:
+    layout = host.layout()
     esp = host.esp()
-    marker = esp / MARKER
-    remove(marker)
-    for rel in (TRIAL_BOOT, TRIAL_UKI):
-        remove(esp / rel)
+    remove(esp / MARKER)
+    remove(esp / STATE_DIR / MINI_MARKER)
+    for rel in (layout.trial_boot, layout.trial_uki, TRIAL_BOOT, TRIAL_UKI):
+        if rel:
+            remove(esp / rel)
     cfg = esp / "limine.conf"
     if cfg.is_file():
         text = cfg.read_text()
@@ -1184,12 +1394,12 @@ def cmd_restore(host: Host, args) -> int:
     """Room Controller contract: snapshots.rollback -> restore N --no-reboot."""
     require_root(host)
     state = load_state(host)
-    prev = state.get("previous") or {}
-    if prev.get("number") != args.number:
-        raise Fail(f"release number {args.number} is not on this room", "not-found")
     if state.get("trial"):
         raise Fail("a trial boot is already pending", "trial-pending")
-    promote_previous_as_trial(host, state)
+    entry = find_release_entry(state, number=args.number)
+    if entry.get("release") == (state.get("configured") or {}).get("release"):
+        raise Fail("that release is already configured", "not-found")
+    promote_previous_as_trial(host, state, entry=entry)
     arm_trial(host, state)
     out = {"accepted": True, "trialId": state["trial"]["armed_at"], "fallbackSnapshot": state["configured"].get("number"),
            "rebootAt": host.stamp()}
@@ -1205,12 +1415,13 @@ def cmd_restore(host: Host, args) -> int:
 
 def cmd_build_release(host: Host, args) -> int:
     require_root(host)
+    layout = host.layout()
     release = safe_id(args.id)
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     esp = host.esp()
-    src_boot = Path(args.boot_from) if args.boot_from else esp / CONFIGURED_BOOT
-    src_uki = Path(args.uki_from) if args.uki_from else esp / CONFIGURED_UKI
+    src_uki = Path(args.uki_from) if args.uki_from else esp / layout.configured_uki
+    src_boot = Path(args.boot_from) if args.boot_from else (esp / layout.configured_boot if layout.configured_boot else None)
     with host.top() as top:
         source = args.source_subvol or running_root(host)
         snap = top / f"@build-{release}"
@@ -1231,13 +1442,26 @@ def cmd_build_release(host: Host, args) -> int:
         finally:
             delete_subvolume(host, top, snap.name)
     boot = []
-    for role, src, rel in (("stage2", src_boot, "m1n1/boot.bin"), ("uki", src_uki, "EFI/Linux/omarchy_linux-aurora.efi")):
+    if layout.uses_aura:
+        if src_boot is None or not Path(src_boot).is_file():
+            raise Fail("Studio build-release needs the configured stage2 boot file")
+        rel = "m1n1/boot.bin"
         dst = out / rel
         dst.parent.mkdir(parents=True, exist_ok=True)
-        digest = copy_atomic(src, dst)
-        boot.append({"role": role, "path": rel, "sha256": digest, "size": dst.stat().st_size})
+        digest = copy_atomic(Path(src_boot), dst)
+        boot.append({"role": "stage2", "path": rel, "sha256": digest, "size": dst.stat().st_size})
+        uki_rel = "EFI/Linux/omarchy_linux-aurora.efi"
+    else:
+        uki_rel = "EFI/Linux/smartroomos_linux-t2.efi"
+    if not Path(src_uki).is_file():
+        raise Fail(f"build-release: UKI missing at {src_uki}")
+    dst = out / uki_rel
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    digest = copy_atomic(Path(src_uki), dst)
+    boot.append({"role": "uki", "path": uki_rel, "sha256": digest, "size": dst.stat().st_size})
     manifest = {
         "schema": SCHEMA, "id": release, "created": host.stamp(), "parent": args.parent or None,
+        "line": layout.line,
         "root": {"file": "root.btrfs.zst", "sha256": sha256_file(stream), "size": stream.stat().st_size},
         "boot": boot,
     }
@@ -1247,6 +1471,7 @@ def cmd_build_release(host: Host, args) -> int:
                   "--output", str(out / (MANIFEST + ".sig")), str(out / MANIFEST)])
     print(f"release {release} written to {out}")
     return 0
+
 
 
 # --------------------------------------------------------------------------
@@ -1271,8 +1496,23 @@ def finish_failed_trial(host: Host, state: dict, reason: str, **fields: Any) -> 
     clear_trial_files(host, state)
 
 
+def history_push(state: dict, entry: dict) -> None:
+    """Keep the last KEEP_GOOD good releases (excluding the configured one)."""
+    if not entry or not entry.get("release"):
+        return
+    hist = [h for h in (state.get("history") or []) if h and h.get("release") != entry.get("release")]
+    hist.insert(0, {
+        "release": entry["release"], "number": entry.get("number", 0), "root": entry.get("root"),
+        "uki": entry.get("uki"), "boot": entry.get("boot"),
+    })
+    # Configured + history together are the last KEEP_GOOD good releases.
+    state["history"] = hist[: max(0, KEEP_GOOD - 1)]
+    state["previous"] = state["history"][0] if state["history"] else None
+
+
 def promote(host: Host, state: dict) -> None:
     """Mark-good: fixed, resumable steps. limine.conf is the one switch."""
+    layout = host.layout()
     esp = host.esp()
     trial = state["trial"]
     promo = state.get("promoting") or {"step": 0, "release": trial["release"]}
@@ -1280,6 +1520,10 @@ def promote(host: Host, state: dict) -> None:
     if state.get("trial") is None:
         raise Fail("nothing to promote")
     conf = dict(state["configured"])
+    configured_uki = layout.configured_uki
+    configured_boot = layout.configured_boot
+    previous_uki = layout.previous_uki
+    previous_boot = layout.previous_boot
 
     def save(step: int) -> None:
         promo["step"] = step
@@ -1288,31 +1532,44 @@ def promote(host: Host, state: dict) -> None:
     cfg = esp / "limine.conf"
     cmdline = with_subvol(trial["cmdline"], trial["root"] or "@",
                           None if trial["release"] == INSTALLED else trial["release"])
-    if promo["step"] < 1:                      # keep the configured set as the previous one
+    if promo["step"] < 1:                      # keep the configured set as history/previous
         if conf["release"] != trial["release"]:
-            copy_atomic(esp / conf["uki"], esp / PREVIOUS_UKI)
-            copy_atomic(esp / conf["boot"], esp / PREVIOUS_BOOT)
+            if conf.get("uki") and (esp / conf["uki"]).is_file():
+                copy_atomic(esp / conf["uki"], esp / previous_uki)
+                # also keep under the durable store name
+                copy_atomic(esp / conf["uki"], esp / STATE_DIR / "uki" / f"{conf['release']}.efi")
+            if layout.uses_aura and conf.get("boot") and (esp / conf["boot"]).is_file():
+                copy_atomic(esp / conf["boot"], esp / previous_boot)
+                copy_atomic(esp / conf["boot"], esp / STATE_DIR / "boot" / f"{conf['release']}.bin")
             promo["old"] = {"release": conf["release"], "number": conf.get("number", 0), "root": conf["root"],
-                            "uki": PREVIOUS_UKI, "boot": PREVIOUS_BOOT}
+                            "uki": previous_uki if (esp / previous_uki).is_file() else conf.get("uki"),
+                            "boot": previous_boot if layout.uses_aura else conf.get("boot", "")}
         save(1)
     if promo["step"] < 2:                      # the switch: configured entry -> trial UKI + new root
         write_atomic(cfg, set_kernel_entry(strip_trial_entry(cfg.read_text()), trial["uki"], cmdline).encode(), 0o700)
         save(2)
-    if promo["step"] < 3:                      # stage 2
-        copy_atomic(esp / trial["boot"], esp / CONFIGURED_BOOT)
+    if promo["step"] < 3:                      # stage 2 (Studio only)
+        if layout.uses_aura and trial.get("boot"):
+            copy_atomic(esp / trial["boot"], esp / configured_boot)
         save(3)
     if promo["step"] < 4:                      # the UKI under its standard name
-        copy_atomic(esp / trial["uki"], esp / CONFIGURED_UKI)
+        copy_atomic(esp / trial["uki"], esp / configured_uki)
         save(4)
     if promo["step"] < 5:                      # the standard name is now the same bytes: use it
-        write_atomic(cfg, set_kernel_entry(cfg.read_text(), CONFIGURED_UKI, cmdline).encode(), 0o700)
+        write_atomic(cfg, set_kernel_entry(cfg.read_text(), configured_uki, cmdline).encode(), 0o700)
         save(5)
     # done: the trial files go, the marker goes, the state names the new configured release
-    old = promo.get("old") or state.get("previous")
+    old = promo.get("old")
     state["configured"] = {"release": trial["release"], "number": trial["number"], "root": trial["root"],
-                           "uki": CONFIGURED_UKI, "boot": CONFIGURED_BOOT}
+                           "uki": configured_uki, "boot": configured_boot}
     if old:
-        state["previous"] = old
+        history_push(state, old)
+    elif state.get("previous"):
+        history_push(state, state["previous"])
+    # Migration: keep the pre-migration @ root recorded until explicitly discarded.
+    if trial.get("kind") == "migrate" and old:
+        state["migration"] = {"old_root": old.get("root"), "old_release": old.get("release"),
+                              "kept_until_confirmed": True, "at": host.stamp()}
     event(host, state, "marked-good", release=trial["release"], at_uptime=int(host.uptime()))
     record_result(host, state, "committed")
     state["trial"] = None
@@ -1324,12 +1581,45 @@ def promote(host: Host, state: dict) -> None:
 
 
 def prune(host: Host, state: dict) -> None:
-    keep = {(state.get("configured") or {}).get("root"), (state.get("previous") or {}).get("root"), running_root(host)}
+    keep = {(state.get("configured") or {}).get("root"), running_root(host)}
+    if state.get("previous"):
+        keep.add(state["previous"].get("root"))
+    for entry in state.get("history") or []:
+        if entry:
+            keep.add(entry.get("root"))
+    if state.get("trial"):
+        keep.add(state["trial"].get("root"))
+    # Migration: never delete the old @ until confirmed.
+    mig = state.get("migration") or {}
+    if mig.get("kept_until_confirmed") and mig.get("old_root"):
+        keep.add(mig["old_root"])
+    keep.discard(None)
+    keep.discard("")
     with contextlib.suppress(Fail):
         with host.top() as top:
             for child in sorted(top.glob("@r-*")):
                 if child.name not in keep:
                     delete_subvolume(host, top, child.name)
+            # Also allow pruning of unnamed failed receive leftovers only; never delete @ itself here.
+    # ESP UKI store: drop copies not in keep set of release ids
+    esp = host.esp()
+    keep_ids = {(state.get("configured") or {}).get("release")}
+    for entry in [state.get("previous")] + list(state.get("history") or []):
+        if entry:
+            keep_ids.add(entry.get("release"))
+    if mig.get("kept_until_confirmed"):
+        keep_ids.add(mig.get("old_release"))
+    store = esp / STATE_DIR / "uki"
+    if store.is_dir():
+        for f in store.glob("*.efi"):
+            rid = f.stem
+            if rid not in keep_ids and rid != INSTALLED:
+                remove(f)
+    boot_store = esp / STATE_DIR / "boot"
+    if boot_store.is_dir():
+        for f in boot_store.glob("*.bin"):
+            if f.stem not in keep_ids and f.stem != INSTALLED:
+                remove(f)
 
 
 def healthy_window(samples: list[tuple[float, tuple[int, int, int]]], start: float, now: float,
@@ -1405,8 +1695,9 @@ def run_health(host: Host, state: dict) -> int:
 
 def cmd_health_run(host: Host, args) -> int:
     state = load_state(host)
+    layout = host.layout()
     boot_root = running_root(host)
-    trial_boot = host.dt_trial()
+    trial_boot = host.dt_trial() if layout.uses_aura else None
     if state.get("promoting") and state.get("trial"):
         promote(host, state)                        # a power cut stopped mark-good half way: finish it
         return 0
@@ -1417,27 +1708,196 @@ def cmd_health_run(host: Host, args) -> int:
         return 0
     if trial.get("armed_boot_id") and trial["armed_boot_id"] == host.boot_id():
         return 0                                    # armed, not rebooted yet
-    marker = host.esp() / MARKER
-    if marker.is_file() and marker.read_bytes().startswith(b"armed\n") and not host.dt_trial():
-        return 0                                    # aura has not taken the marker: not attempted yet
+    if layout.uses_aura:
+        marker = host.esp() / MARKER
+        if marker.is_file() and marker.read_bytes().startswith(b"armed\n") and not host.dt_trial():
+            return 0                                # aura has not taken the marker: not attempted yet
+    else:
+        marker = host.esp() / STATE_DIR / MINI_MARKER
+        # Mini: Limine consumes the one-shot on the trial boot; marker stays "armed"
+        # until we clear it. Presence alone does not mean "not yet attempted".
     configured_root = (state["configured"] or {}).get("root")
-    if boot_root == trial["root"] and trial_boot == trial["boot"]:
-        return run_health(host, state)
-    if boot_root == trial["root"] and trial_boot is None and boot_root != configured_root:
-        finish_failed_trial(host, state, "trial-did-not-start")
-        host.reboot()
-        return 1
-    if boot_root == configured_root:
-        if trial_boot == trial["boot"]:
-            finish_failed_trial(host, state, "trial-incomplete")
+    on_trial_root = boot_root == trial["root"]
+    if layout.uses_aura:
+        if on_trial_root and trial_boot == trial["boot"]:
+            return run_health(host, state)
+        if on_trial_root and trial_boot is None and boot_root != configured_root:
+            finish_failed_trial(host, state, "trial-did-not-start")
+            host.reboot()
+            return 1
+        if boot_root == configured_root:
+            if trial_boot == trial["boot"]:
+                finish_failed_trial(host, state, "trial-incomplete")
+                return 0
+            reason = "lost-after-userspace" if trial.get("reached") else "lost-before-userspace"
+            finish_failed_trial(host, state, reason)
             return 0
+        return 0
+    # Mini: trial = we booted the trial subvolume (one-shot consumed).
+    if on_trial_root:
+        if marker.is_file() and marker.read_bytes().startswith(b"armed\n"):
+            write_atomic(marker, marker.read_bytes().replace(b"armed", b"spent", 1), 0o700)
+        return run_health(host, state)
+    if boot_root == configured_root:
         reason = "lost-after-userspace" if trial.get("reached") else "lost-before-userspace"
         finish_failed_trial(host, state, reason)
         return 0
     return 0
 
 
+
 # --------------------------------------------------------------------------
+
+
+
+# --------------------------------------------------------------------------
+# migrate: move an OLD Mini install onto a release trial (remote, no USB)
+
+
+def migrate_preflight(host: Host, force: bool = False) -> dict:
+    """Refuse safely when the room is not a known old Mini layout."""
+    layout = host.layout()
+    if layout.line != "mini":
+        raise Fail("migrate is for Intel Minis only (Studio already uses smartroom-release)", "wrong-line")
+    esp = host.esp()
+    report = {"line": "mini", "checks": []}
+
+    def check(name: str, ok: bool, detail: str = "") -> None:
+        report["checks"].append({"name": name, "ok": ok, "detail": detail})
+        if not ok and not force:
+            raise Fail(f"migrate refused: {name}: {detail or 'failed'}", "migrate-refused")
+
+    # btrfs root
+    try:
+        fstype = host.run(["findmnt", "-no", "FSTYPE", "/"], check=False).stdout.decode().strip() if not host.prefix else "btrfs"
+    except Fail:
+        fstype = ""
+    if host.prefix:
+        fstype = "btrfs"
+    check("btrfs-root", fstype == "btrfs", fstype or "unknown")
+
+    # limine.conf + known UKI entry
+    cfg = esp / "limine.conf"
+    check("limine.conf", cfg.is_file(), str(cfg))
+    text = cfg.read_text() if cfg.is_file() else ""
+    found = kernel_entry(text) if text else None
+    check("limine-uki-entry", found is not None, "no smartroomos_/omarchy_ UKI entry")
+
+    # unexpected / unknown entries: refuse when a password prompt or menu timeout is enabled
+    if "timeout:" in text:
+        # timeout: 0 or no is fine; positive timeout parks at a menu
+        import re as _re
+        m = _re.search(r"^timeout:\s*(\S+)", text, _re.M)
+        to = (m.group(1) if m else "").strip()
+        check("limine-timeout", to in ("0", "no", ""), f"timeout={to}")
+    check("no-hash-prompt", "hash_mismatch_panic: yes" not in text, "hash_mismatch_panic would wait for a key")
+
+    # EFI one-shot writable
+    efivars = host.p("/sys/firmware/efi/efivars")
+    check("efivarfs", host.prefix or efivars.is_dir(), str(efivars))
+
+    # free space: need roughly the size of the current root free on the btrfs device
+    with host.top() as top:
+        check("top-writable", top.exists() or host.prefix, str(top))
+        # require at least 8 GiB free on the filesystem that holds roots
+        try:
+            free = shutil.disk_usage(top if top.exists() else host.p("/")).free
+        except OSError:
+            free = 0
+        check("free-space", free >= 8 * 1024**3, f"{free // 2**30} GiB free (need >= 8)")
+
+    # firmware password / Secure Boot surprises: if SetupMode is 0 and SecureBoot is 1
+    # we still allow Limine one-shot (it uses BootNext-style LoaderEntryOneShot), but
+    # refuse when the ESP is not writable.
+    try:
+        esp_free = shutil.disk_usage(esp).free
+    except OSError:
+        esp_free = 0
+    check("esp-writable", esp_free >= ESP_MARGIN, f"{esp_free // 2**20} MiB ESP free")
+
+    # unknown boot entries: Limine conf should not contain non-SmartRoom OS entries at top level
+    for start, end, title in _entry_blocks(text.splitlines() if text else []):
+        if title in (TRIAL_ENTRY_NAME,):
+            continue
+        # nested // entries are fine; top-level / entries that are not SmartRoom* are suspicious
+        line0 = text.splitlines()[start] if text else ""
+        if line0.startswith("/") and not line0.startswith("//") and not title.lower().startswith("smartroom"):
+            # Allow the common Mini title variants
+            if title not in ("linux-t2",) and "smartroom" not in title.lower() and "omarchy" not in title.lower():
+                check("known-boot-entry", force, f"unexpected Limine entry {title!r}")
+
+    report["ok"] = all(c["ok"] for c in report["checks"])
+    return report
+
+
+def cmd_migrate_check(host: Host, args) -> int:
+    require_root(host)
+    report = migrate_preflight(host, force=True)  # always report; exit non-zero if any failed
+    if args.json:
+        print(json.dumps(report, sort_keys=True))
+    else:
+        for c in report["checks"]:
+            print(f"{'ok' if c['ok'] else 'FAIL'}  {c['name']}: {c.get('detail') or ''}")
+        print("ready" if report["ok"] else "not-ready")
+    return 0 if report["ok"] else 1
+
+
+def cmd_migrate(host: Host, args) -> int:
+    """Install a release beside the old Mini root and arm a trial; old @ is the fallback."""
+    require_root(host)
+    migrate_preflight(host, force=bool(args.force))
+    state = load_state(host)
+    # Ensure configured points at the live old root (@) as "installed".
+    layout = host.layout()
+    live = running_root(host)
+    state["configured"] = {
+        "release": INSTALLED, "number": 0, "root": live,
+        "uki": layout.configured_uki, "boot": layout.configured_boot,
+    }
+    state["previous"] = None
+    state["history"] = state.get("history") or []
+    state["migration"] = {"pending": True, "old_root": live, "at": host.stamp()}
+    save_state(host, state)
+    directory = fetch(host, args.release)
+    # Migration may run when the Room Controller is briefly disconnected; still prefer healthy.
+    stage_release(host, state, directory, args.unsigned, kind="migrate",
+                  require_healthy=not bool(args.force))
+    try:
+        arm_trial(host, state)
+    except Fail:
+        clear_trial_files(host, state)
+        state["trial"] = None
+        event(host, state, "files-written-not-armed", reason="arm failed")
+        save_state(host, state)
+        raise
+    print(f"armed migration trial {state['trial']['release']}: fallback root is {live}")
+    if args.reboot:
+        host.reboot()
+    return 0
+
+
+def cmd_confirm_migration(host: Host, args) -> int:
+    """After a migrate promotion, allow pruning the old @ once the room is confirmed good."""
+    require_root(host)
+    state = load_state(host)
+    mig = state.get("migration")
+    if not mig:
+        raise Fail("no migration is pending confirmation", "not-found")
+    old = mig.get("old_root")
+    state["migration"] = {**mig, "kept_until_confirmed": False, "confirmed_at": host.stamp()}
+    event(host, state, "migration-confirmed", old_root=old)
+    save_state(host, state)
+    prune(host, state)
+    # Optionally delete the old @ when it is not the running root and not in history.
+    if old and old != "@" and old != running_root(host):
+        with host.top() as top:
+            if subvol_exists(top, old) and old not in {
+                (state.get("configured") or {}).get("root"),
+                *((h or {}).get("root") for h in (state.get("history") or [])),
+            }:
+                delete_subvolume(host, top, old)
+    print("migration confirmed")
+    return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1477,13 +1937,21 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--uki-from")
     p.add_argument("--parent")
     p.add_argument("--sign-key")
+    p = sub.add_parser("migrate-check")
+    p = sub.add_parser("migrate")
+    p.add_argument("release")
+    p.add_argument("--unsigned", action="store_true")
+    p.add_argument("--reboot", action="store_true")
+    p.add_argument("--force", action="store_true", help="override non-fatal preflight refusals (still refuses wrong line)")
+    sub.add_parser("confirm-migration")
     return parser
 
 
 COMMANDS = {
     "status": cmd_status, "list": cmd_list, "update": cmd_update, "stage": cmd_stage, "arm": cmd_arm,
     "rollback": cmd_rollback, "discard": cmd_discard, "health-run": cmd_health_run, "restore": cmd_restore,
-    "build-release": cmd_build_release,
+    "build-release": cmd_build_release, "migrate": cmd_migrate, "migrate-check": cmd_migrate_check,
+    "confirm-migration": cmd_confirm_migration,
 }
 
 
