@@ -726,6 +726,22 @@ def set_kernel_entry(text: str, uki: str, cmdline: str) -> str:
     return "\n".join(lines) + "\n"
 
 
+def ensure_unattended_limine(text: str) -> str:
+    """Old Minis ship timeout: 1; a release trial must never park at a menu."""
+    lines = text.splitlines()
+    out = []
+    seen = False
+    for line in lines:
+        if re.match(r"^timeout:\s*", line):
+            out.append("timeout: 0")
+            seen = True
+        else:
+            out.append(line)
+    if not seen:
+        out.insert(0, "timeout: 0")
+    return "\n".join(out) + ("\n" if text.endswith("\n") or not text else "\n")
+
+
 def with_subvol(cmdline: str, subvol: str, release: Optional[str]) -> str:
     """CMDLINE for the root SUBVOL and RELEASE; trial-only parameters removed."""
     words = [w for w in cmdline.split() if w not in TRIAL_ONLY_PARAMS
@@ -857,8 +873,18 @@ def check_files(directory: Path, manifest: dict) -> None:
 def carry_entries(host: Host) -> list[str]:
     path = host.p(CARRY_LIST)
     if not path.is_file():
-        here = Path(__file__).resolve().parent.parent / "share" / "release-carry.list"
-        path = here if here.is_file() else path
+        # pkgs tree: bin/smartroom-release → share/release-carry.list
+        # bootstrap scp: /usr/bin/smartroom-release + /usr/share/smartroomos/...
+        # agent scp of just the binary: look beside the file too
+        here = Path(__file__).resolve()
+        for candidate in (
+            here.parent.parent / "share" / "release-carry.list",
+            here.parent / "release-carry.list",
+            Path("/usr/share/smartroomos/release-carry.list"),
+        ):
+            if candidate.is_file():
+                path = candidate
+                break
     if not path.is_file():
         raise Fail(f"carry list {CARRY_LIST} is missing")
     entries = []
@@ -1221,7 +1247,8 @@ def stage_release(host: Host, state: dict, directory: Path, unsigned: bool, kind
         boot_store = esp / STATE_DIR / "boot" / f"{release}.bin"
         copy_atomic(directory / roles["stage2"]["path"], boot_store, roles["stage2"]["sha256"])
     trial_cmd = trial_cmdline(cmdline, subvol, release)
-    write_atomic(esp / "limine.conf", with_trial_entry(cfg_text, release, trial_uki, trial_cmd).encode(), 0o700)
+    cfg_text = ensure_unattended_limine(with_trial_entry(cfg_text, release, trial_uki, trial_cmd))
+    write_atomic(esp / "limine.conf", cfg_text.encode(), 0o700)
     state["counter"] = state.get("counter", 0) + 1
     state["trial"] = {
         "kind": kind, "release": release, "number": state["counter"], "root": subvol,

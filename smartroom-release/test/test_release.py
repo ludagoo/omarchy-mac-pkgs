@@ -1188,6 +1188,18 @@ class MiniLine(unittest.TestCase):
         self.assertFalse(host.agent_connected())
 
 
+class TestUnattendedLimine(unittest.TestCase):
+    def test_timeout_one_becomes_zero(self):
+        text = "timeout: 1\nquiet: yes\n"
+        out = sr.ensure_unattended_limine(text)
+        self.assertIn("timeout: 0\n", out)
+        self.assertNotIn("timeout: 1", out)
+
+    def test_inserts_timeout_when_missing(self):
+        out = sr.ensure_unattended_limine("quiet: yes\n")
+        self.assertTrue(out.startswith("timeout: 0\n"))
+
+
 class TestBtrfsDeviceUnderOverlay(unittest.TestCase):
     """Live Host.btrfs_device must not return 'overlay' on a snapshot boot."""
 
