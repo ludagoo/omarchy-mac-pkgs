@@ -334,6 +334,55 @@ class Host:
             return 0.0
 
     # btrfs -----------------------------------------------------------------
+    def btrfs_device(self) -> str:
+        """Block device that holds the room's btrfs.
+
+        A normal @ boot has FSTYPE=btrfs. A snapshot boot runs under
+        sd-btrfs-overlayfs, so findmnt SOURCE / is "overlay"; the real
+        device is still mounted underneath (and is named on the cmdline).
+        Old Minis hit this whenever LoaderEntryDefault still names a
+        Snapshots.* entry — migrate/build-release must still find the disk.
+        """
+        if self.prefix:
+            return "prefix"
+        fstype = self.run(["findmnt", "-no", "FSTYPE", "/"], check=False).stdout.decode().strip()
+        source = self.run(["findmnt", "-no", "SOURCE", "/"], check=False).stdout.decode().strip()
+        device = re.sub(r"\[.*\]$", "", source)
+        if fstype == "btrfs" and device and Path(device).exists():
+            return device
+        # Prefer a btrfs SOURCE that still names a snapshot / @ subvol.
+        listed = self.run(["findmnt", "-nro", "SOURCE", "-t", "btrfs"], check=False).stdout.decode()
+        preferred = []
+        fallback = []
+        for line in listed.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            dev = re.sub(r"\[.*\]$", "", line)
+            if not (dev and Path(dev).exists()):
+                continue
+            if ".snapshots/" in line or "[/@" in line or line.endswith("[@]"):
+                preferred.append(dev)
+            else:
+                fallback.append(dev)
+        if preferred:
+            return preferred[0]
+        if fallback:
+            return fallback[0]
+        cmd = self.cmdline()
+        m = re.search(r"root=UUID=([^\s]+)", cmd)
+        if m:
+            by_uuid = Path(f"/dev/disk/by-uuid/{m.group(1)}")
+            if by_uuid.exists():
+                return str(by_uuid)
+        m = re.search(r"root=(/dev/\S+)", cmd)
+        if m and Path(m.group(1)).exists():
+            return m.group(1)
+        raise Fail(
+            f"cannot find btrfs device for / (fstype={fstype or '?'}, source={source or '?'})",
+            "no-btrfs",
+        )
+
     @contextlib.contextmanager
     def top(self):
         """The btrfs top level (subvolid 5), where the root subvolumes live."""
@@ -343,8 +392,7 @@ class Host:
             yield top
             return
         mount = Path("/run/smartroom-release/top")
-        source = self.run(["findmnt", "-no", "SOURCE", "/"]).stdout.decode().strip()
-        device = re.sub(r"\[.*\]$", "", source)
+        device = self.btrfs_device()
         mounted = subprocess.run(["findmnt", "-M", str(mount)], capture_output=True).returncode == 0
         did = False
         if not mounted:
@@ -1782,14 +1830,20 @@ def migrate_preflight(host: Host, force: bool = False) -> dict:
         if not ok and not force:
             raise Fail(f"migrate refused: {name}: {detail or 'failed'}", "migrate-refused")
 
-    # btrfs root
-    try:
-        fstype = host.run(["findmnt", "-no", "FSTYPE", "/"], check=False).stdout.decode().strip() if not host.prefix else "btrfs"
-    except Fail:
-        fstype = ""
+    # btrfs root (plain @, or snapshot under sd-btrfs-overlayfs)
     if host.prefix:
         fstype = "btrfs"
-    check("btrfs-root", fstype == "btrfs", fstype or "unknown")
+        check("btrfs-root", True, "prefix")
+    else:
+        try:
+            fstype = host.run(["findmnt", "-no", "FSTYPE", "/"], check=False).stdout.decode().strip()
+        except Fail:
+            fstype = ""
+        try:
+            device = host.btrfs_device()
+            check("btrfs-root", True, f"{fstype or '?'} via {device}")
+        except Fail as e:
+            check("btrfs-root", False, f"{fstype or 'unknown'}: {e}")
 
     # limine.conf + known UKI entry
     cfg = esp / "limine.conf"
