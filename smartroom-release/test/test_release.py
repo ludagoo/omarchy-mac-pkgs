@@ -328,6 +328,30 @@ class Stage(unittest.TestCase):
         d = self.w.release(**kw)
         return d, self.w.run("stage", str(d), "--unsigned")
 
+    def test_tunnel_token_is_carried_across_update_and_rollback(self):
+        # WS15: a room's tunnel token survives a release update and a rollback
+        # onto a root that did not ship the tunnel unit. The value must never
+        # appear in the release tree that was staged (only via carry).
+        secret = "dummy-ws15-tunnel-token-not-real"
+        token = self.w.prefix / "etc/smartroomos/tunnel/token"
+        token.parent.mkdir(parents=True, exist_ok=True)
+        token.write_text(secret)
+        token.chmod(0o600)
+        d_a, (code, _, err) = self.stage(name="2026.11.23-tunnel-a")
+        self.assertEqual(code, 0, err)
+        new = self.w.prefix / "top/@r-2026.11.23-tunnel-a"
+        carried = new / "etc/smartroomos/tunnel/token"
+        self.assertTrue(carried.is_file(), "token must be carried into the new root")
+        self.assertEqual(carried.read_text(), secret)
+        self.assertEqual(carried.stat().st_mode & 0o777, 0o600)
+        # Second stage (like update then rollback to another root): still carried.
+        d_b, (code, _, err) = self.stage(name="2026.11.23-tunnel-b")
+        self.assertEqual(code, 0, err)
+        older = self.w.prefix / "top/@r-2026.11.23-tunnel-b"
+        self.assertEqual((older / "etc/smartroomos/tunnel/token").read_text(), secret)
+        self.assertNotIn(secret.encode(), (d_a / "root.btrfs.zst").read_bytes())
+        self.assertNotIn(secret.encode(), (d_b / "root.btrfs.zst").read_bytes())
+
     def test_stage_writes_the_release_beside_the_configured_one(self):
         d, (code, out, err) = self.stage()
         self.assertEqual(code, 0, err)
@@ -990,6 +1014,7 @@ class Cli(unittest.TestCase):
         self.assertIn("/etc/ssh/ssh_host_*", entries)
         self.assertIn("/etc/systemd/system/smartroom-agent.service", entries)
         self.assertIn("/opt/smartroom/agent", entries)
+        self.assertIn("/etc/smartroomos/tunnel", entries)      # WS15: per-room Cloudflare token
         self.assertNotIn("/etc/systemd/system/smartroom-agent.service.d", entries)
 
 
