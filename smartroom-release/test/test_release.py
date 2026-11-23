@@ -1487,6 +1487,30 @@ class TestBuildAsideEphemeral(unittest.TestCase):
             dst.rename(src)
         self.assertTrue((arch / "old" / "f").is_file())
 
+    def test_carry_strips_drift_archive(self):
+        td = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, td, ignore_errors=True)
+        host = sr.Host(td)
+        src = host.p("/var/lib/smartroomos")
+        src.mkdir(parents=True)
+        (src / "latch").write_text("1")
+        (src / "drift-archive").mkdir()
+        (src / "drift-archive" / "huge").write_bytes(b"x" * 100)
+        # Minimal carry list
+        cl = host.p("/usr/share/smartroomos/release-carry.list")
+        cl.parent.mkdir(parents=True, exist_ok=True)
+        cl.write_text("/var/lib/smartroomos\n")
+        new_root = Path(td) / "new-root"
+        new_root.mkdir()
+        # Host.run uses real cp
+        copied = sr.carry_into(host, new_root)
+        self.assertIn("/var/lib/smartroomos", copied)
+        self.assertTrue((new_root / "var/lib/smartroomos/latch").is_file())
+        self.assertTrue((new_root / "var/lib/smartroomos/drift-archive").is_dir())
+        self.assertFalse((new_root / "var/lib/smartroomos/drift-archive/huge").exists())
+
+
+
 
 class TestUnattendedLimine(unittest.TestCase):
     def test_timeout_one_becomes_zero(self):

@@ -1320,6 +1320,12 @@ def carry_into(host: Host, new_root: Path) -> list[str]:
             elif target.is_dir():
                 shutil.rmtree(target)
             host.run(["cp", "-a", "--no-target-directory", str(source), str(target)])
+            # /var/lib/smartroomos is carried for the room latch, but drift-archive
+            # can hold multi-GB nested root.btrfs.zst copies from local builds —
+            # never carry those into the next root (Mini keep-5 ENOSPC).
+            if str(rel) == "var/lib/smartroomos" or str(rel).endswith("var/lib/smartroomos"):
+                shutil.rmtree(target / "drift-archive", ignore_errors=True)
+                (target / "drift-archive").mkdir(parents=True, exist_ok=True)
             copied.append("/" + str(rel))
     return copied
 
@@ -2276,8 +2282,10 @@ def _aside_ephemeral_for_build(host: Host, out: Path) -> list[tuple[Path, Path]]
     arch = host.p("/var/lib/smartroomos/drift-archive")
     if arch.is_dir():
         candidates.append(arch)
-    root_dir = host.p("/root")
-    if root_dir.is_dir():
+    for parent_name in ("/root", "/home"):
+        root_dir = host.p(parent_name)
+        if not root_dir.is_dir():
+            continue
         for child in sorted(root_dir.iterdir()):
             name = child.name
             if not (name.startswith("ws12-release") or name.startswith("ws13b-rel")
