@@ -739,6 +739,55 @@ class Host:
             return 0.0
 
     # btrfs -----------------------------------------------------------------
+    def btrfs_device(self) -> str:
+        """Block device that holds the room's btrfs.
+
+        A normal @ boot has FSTYPE=btrfs. A snapshot boot runs under
+        sd-btrfs-overlayfs, so findmnt SOURCE / is "overlay"; the real
+        device is still mounted underneath (and is named on the cmdline).
+        Old Minis hit this whenever LoaderEntryDefault still names a
+        Snapshots.* entry — migrate/build-release must still find the disk.
+        """
+        if self.prefix:
+            return "prefix"
+        fstype = self.run(["findmnt", "-no", "FSTYPE", "/"], check=False).stdout.decode().strip()
+        source = self.run(["findmnt", "-no", "SOURCE", "/"], check=False).stdout.decode().strip()
+        device = re.sub(r"\[.*\]$", "", source)
+        if fstype == "btrfs" and device and Path(device).exists():
+            return device
+        # Prefer a btrfs SOURCE that still names a snapshot / @ subvol.
+        listed = self.run(["findmnt", "-nro", "SOURCE", "-t", "btrfs"], check=False).stdout.decode()
+        preferred = []
+        fallback = []
+        for line in listed.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            dev = re.sub(r"\[.*\]$", "", line)
+            if not (dev and Path(dev).exists()):
+                continue
+            if ".snapshots/" in line or "[/@" in line or line.endswith("[@]"):
+                preferred.append(dev)
+            else:
+                fallback.append(dev)
+        if preferred:
+            return preferred[0]
+        if fallback:
+            return fallback[0]
+        cmd = self.cmdline()
+        m = re.search(r"root=UUID=([^\s]+)", cmd)
+        if m:
+            by_uuid = Path(f"/dev/disk/by-uuid/{m.group(1)}")
+            if by_uuid.exists():
+                return str(by_uuid)
+        m = re.search(r"root=(/dev/\S+)", cmd)
+        if m and Path(m.group(1)).exists():
+            return m.group(1)
+        raise Fail(
+            f"cannot find btrfs device for / (fstype={fstype or '?'}, source={source or '?'})",
+            "no-btrfs",
+        )
+
     @contextlib.contextmanager
     def top(self):
         """The btrfs top level (subvolid 5), where the root subvolumes live."""
@@ -748,8 +797,7 @@ class Host:
             yield top
             return
         mount = Path("/run/smartroom-release/top")
-        source = self.run(["findmnt", "-no", "SOURCE", "/"]).stdout.decode().strip()
-        device = re.sub(r"\[.*\]$", "", source)
+        device = self.btrfs_device()
         mounted = subprocess.run(["findmnt", "-M", str(mount)], capture_output=True).returncode == 0
         did = False
         if not mounted:
@@ -765,6 +813,14 @@ class Host:
     # health signals ------------------------------------------------------------
     def agent_connected(self) -> bool:
         """The Room Controller holds a live TCP connection to its server."""
+        # Offline Intel VM scenarios cannot open a real Room Controller session.
+        # When SMARTROOM_RELEASE_VM=1, a root-owned marker means "pretend connected"
+        # so promote/fallback paths can be exercised without a server.
+        if os.environ.get("SMARTROOM_RELEASE_VM") == "1":
+            for rel in ("/run/smartroomos/release-vm-healthy",
+                        "/etc/smartroomos/release-vm-healthy"):
+                if self.p(rel).is_file():
+                    return True
         conf = self.p("/opt/smartroom/config/agent.json")
         try:
             url = json.loads(conf.read_text()).get("serverUrl", "")
@@ -1075,6 +1131,22 @@ def set_kernel_entry(text: str, uki: str, cmdline: str) -> str:
     return "\n".join(lines) + "\n"
 
 
+def ensure_unattended_limine(text: str) -> str:
+    """Old Minis ship timeout: 1; a release trial must never park at a menu."""
+    lines = text.splitlines()
+    out = []
+    seen = False
+    for line in lines:
+        if re.match(r"^timeout:\s*", line):
+            out.append("timeout: 0")
+            seen = True
+        else:
+            out.append(line)
+    if not seen:
+        out.insert(0, "timeout: 0")
+    return "\n".join(out) + ("\n" if text.endswith("\n") or not text else "\n")
+
+
 def with_subvol(cmdline: str, subvol: str, release: Optional[str]) -> str:
     """CMDLINE for the root SUBVOL and RELEASE; trial-only parameters removed."""
     words = [w for w in cmdline.split() if w not in TRIAL_ONLY_PARAMS
@@ -1206,8 +1278,18 @@ def check_files(directory: Path, manifest: dict) -> None:
 def carry_entries(host: Host) -> list[str]:
     path = host.p(CARRY_LIST)
     if not path.is_file():
-        here = Path(__file__).resolve().parent.parent / "share" / "release-carry.list"
-        path = here if here.is_file() else path
+        # pkgs tree: bin/smartroom-release → share/release-carry.list
+        # bootstrap scp: /usr/bin/smartroom-release + /usr/share/smartroomos/...
+        # agent scp of just the binary: look beside the file too
+        here = Path(__file__).resolve()
+        for candidate in (
+            here.parent.parent / "share" / "release-carry.list",
+            here.parent / "release-carry.list",
+            Path("/usr/share/smartroomos/release-carry.list"),
+        ):
+            if candidate.is_file():
+                path = candidate
+                break
     if not path.is_file():
         raise Fail(f"carry list {CARRY_LIST} is missing")
     entries = []
@@ -1928,7 +2010,8 @@ def stage_release(host: Host, state: dict, directory: Path, unsigned: bool, kind
         roles["uki"]["sha256"], roles["stage2"]["sha256"] if layout.uses_aura else None,
     )
     trial_cmd = trial_cmdline(cmdline, subvol, release)
-    write_atomic(esp / "limine.conf", with_trial_entry(cfg_text, release, trial_uki, trial_cmd).encode(), 0o700)
+    cfg_text = ensure_unattended_limine(with_trial_entry(cfg_text, release, trial_uki, trial_cmd))
+    write_atomic(esp / "limine.conf", cfg_text.encode(), 0o700)
     state["counter"] = state.get("counter", 0) + 1
     state["esp_budget"] = budget
     state["trial"] = {
@@ -2650,6 +2733,13 @@ def cmd_health_run(host: Host, args) -> int:
         reason = "lost-after-userspace" if trial.get("reached") else "lost-before-userspace"
         finish_failed_trial(host, state, reason)
         return 0
+    # Bad UKI / firmware hang: rebooted (new boot_id) onto some other root
+    # (e.g. factory @) while a trial is still armed. Clear it so the next
+    # update/migrate is not blocked by "a trial boot is already pending".
+    if trial.get("armed_boot_id") and trial["armed_boot_id"] != host.boot_id():
+        reason = "lost-after-userspace" if trial.get("reached") else "lost-before-userspace"
+        finish_failed_trial(host, state, reason)
+        return 0
     return 0
 
 
@@ -2675,14 +2765,20 @@ def migrate_preflight(host: Host, force: bool = False) -> dict:
         if not ok and not force:
             raise Fail(f"migrate refused: {name}: {detail or 'failed'}", "migrate-refused")
 
-    # btrfs root
-    try:
-        fstype = host.run(["findmnt", "-no", "FSTYPE", "/"], check=False).stdout.decode().strip() if not host.prefix else "btrfs"
-    except Fail:
-        fstype = ""
+    # btrfs root (plain @, or snapshot under sd-btrfs-overlayfs)
     if host.prefix:
         fstype = "btrfs"
-    check("btrfs-root", fstype == "btrfs", fstype or "unknown")
+        check("btrfs-root", True, "prefix")
+    else:
+        try:
+            fstype = host.run(["findmnt", "-no", "FSTYPE", "/"], check=False).stdout.decode().strip()
+        except Fail:
+            fstype = ""
+        try:
+            device = host.btrfs_device()
+            check("btrfs-root", True, f"{fstype or '?'} via {device}")
+        except Fail as e:
+            check("btrfs-root", False, f"{fstype or 'unknown'}: {e}")
 
     # limine.conf + known UKI entry
     cfg = esp / "limine.conf"

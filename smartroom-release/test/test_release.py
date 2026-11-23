@@ -1428,6 +1428,114 @@ class MiniLine(unittest.TestCase):
         self.assertEqual(w.run("health-run")[0], 0)
         self.assertEqual(w.state()["last_result"]["reason"], "lost-before-userspace")
 
+    def test_lost_before_userspace_when_mini_lands_on_wrong_root(self):
+        """Bad UKI + reset can land on factory @ while configured is @r-…."""
+        w = MiniWorld(self)
+        (w.prefix / "etc/smartroomos").mkdir(parents=True, exist_ok=True)
+        (w.prefix / "etc/smartroomos/release.conf").write_text(
+            "quiet_seconds=30\nlimit_seconds=60\nsample_seconds=5\n")
+        w.host._conf = None
+        name = "2026.11.21-mini"
+        self.assertEqual(w.run("update", str(w.release(name=name)), "--unsigned")[0], 0)
+        w.trial_boot(name)
+        self.assertEqual(w.run("health-run")[0], 0)
+        # Promote left configured on @r-name. Arm a second trial, then land on @.
+        self.assertEqual(w.run("update", str(w.release(name="2026.11.21-bad", uki=b"BAD")), "--unsigned")[0], 0)
+        (w.prefix / "proc/cmdline").write_text(sr.with_subvol(MINI_CMDLINE, "@", None) + "\n")
+        (w.prefix / "proc/sys/kernel/random/boot_id").write_text("boot-after-reset\n")
+        self.assertEqual(w.run("health-run")[0], 0)
+        st = w.state()
+        self.assertIsNone(st.get("trial"))
+        self.assertEqual(st["last_result"]["reason"], "lost-before-userspace")
+        self.assertEqual(st["configured"]["release"], name)
+
+    def test_vm_marker_counts_as_connected(self):
+        w = MiniWorld(self)
+        host = sr.Host(str(w.prefix))
+        os.environ["SMARTROOM_RELEASE_VM"] = "1"
+        self.addCleanup(lambda: os.environ.pop("SMARTROOM_RELEASE_VM", None))
+        self.assertFalse(host.agent_connected())
+        (w.prefix / "etc/smartroomos").mkdir(parents=True, exist_ok=True)
+        (w.prefix / "etc/smartroomos/release-vm-healthy").write_text("1\n")
+        self.assertTrue(host.agent_connected())
+        (w.prefix / "etc/smartroomos/release-vm-healthy").unlink()
+        self.assertFalse(host.agent_connected())
+
+
+class TestUnattendedLimine(unittest.TestCase):
+    def test_timeout_one_becomes_zero(self):
+        text = "timeout: 1\nquiet: yes\n"
+        out = sr.ensure_unattended_limine(text)
+        self.assertIn("timeout: 0\n", out)
+        self.assertNotIn("timeout: 1", out)
+
+    def test_inserts_timeout_when_missing(self):
+        out = sr.ensure_unattended_limine("quiet: yes\n")
+        self.assertTrue(out.startswith("timeout: 0\n"))
+
+
+class TestBtrfsDeviceUnderOverlay(unittest.TestCase):
+    """Live Host.btrfs_device must not return 'overlay' on a snapshot boot."""
+
+    def _host_with_findmnt(self, fstype, source, btrfs_sources, cmdline, existing):
+        host = sr.Host()
+        host.prefix = None
+
+        def run(argv, check=True, input=None):
+            if argv[:3] == ["findmnt", "-no", "FSTYPE"]:
+                return subprocess.CompletedProcess(argv, 0, (fstype + "\n").encode(), b"")
+            if argv[:3] == ["findmnt", "-no", "SOURCE"] and argv[-1] == "/":
+                return subprocess.CompletedProcess(argv, 0, (source + "\n").encode(), b"")
+            if argv[:3] == ["findmnt", "-nro", "SOURCE"]:
+                body = "".join(s + "\n" for s in btrfs_sources)
+                return subprocess.CompletedProcess(argv, 0, body.encode(), b"")
+            raise AssertionError(f"unexpected run: {argv}")
+
+        host.run = run  # type: ignore[method-assign]
+        host.cmdline = lambda: cmdline  # type: ignore[method-assign]
+        real_exists = Path.exists
+
+        def exists(self):
+            s = str(self)
+            if s in existing:
+                return True
+            if s.startswith("/dev/") or s.startswith("/run/"):
+                return s in existing
+            return real_exists(self)
+
+        self.addCleanup(setattr, Path, "exists", real_exists)
+        Path.exists = exists  # type: ignore[method-assign]
+        return host
+
+    def test_plain_btrfs_root(self):
+        host = self._host_with_findmnt(
+            "btrfs", "/dev/vda2[/@]", [], "root=UUID=x rootflags=subvol=@",
+            {"/dev/vda2"})
+        self.assertEqual(host.btrfs_device(), "/dev/vda2")
+
+    def test_overlay_uses_underlying_snapshot_mount(self):
+        host = self._host_with_findmnt(
+            "overlay", "overlay",
+            ["/dev/vda2[/@/.snapshots/3/snapshot]", "/dev/vda2[/@home]"],
+            "root=UUID=ba rootflags=subvol=/@/.snapshots/3/snapshot",
+            {"/dev/vda2"})
+        self.assertEqual(host.btrfs_device(), "/dev/vda2")
+
+    def test_overlay_falls_back_to_cmdline_uuid(self):
+        host = self._host_with_findmnt(
+            "overlay", "overlay", [],
+            "root=UUID=ba21474e-0579-415b-bcf4-2fc36ab0b138 rw rootflags=subvol=/@/.snapshots/3/snapshot",
+            {"/dev/disk/by-uuid/ba21474e-0579-415b-bcf4-2fc36ab0b138"})
+        self.assertEqual(
+            host.btrfs_device(),
+            "/dev/disk/by-uuid/ba21474e-0579-415b-bcf4-2fc36ab0b138")
+
+    def test_overlay_without_device_raises(self):
+        host = self._host_with_findmnt("overlay", "overlay", [], "quiet", set())
+        with self.assertRaises(sr.Fail) as ctx:
+            host.btrfs_device()
+        self.assertEqual(ctx.exception.code, "no-btrfs")
+
 
 class EspBudgetWS14(unittest.TestCase):
     """WS14: ESP holds current + one fallback; history lives on btrfs boot-store.
