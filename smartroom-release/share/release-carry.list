@@ -41,3 +41,7 @@
 /opt/smartroom/chrome-profiles
 # Room-specific health settings, if the room has any.
 /etc/smartroomos/release.conf
+# Per-room Cloudflare tunnel token (presence only on the room; never in images).
+# Carry the directory so a rollback to a release without the tunnel unit still
+# keeps the token file for the next update that restores the unit.
+/etc/smartroomos/tunnel
