@@ -15,6 +15,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -1511,27 +1512,123 @@ class TestBuildAsideEphemeral(unittest.TestCase):
             dst.rename(src)
         self.assertTrue((arch / "old" / "f").is_file())
 
-    def test_carry_strips_drift_archive(self):
+    def test_carry_keeps_drift_archive_content(self):
+        """Hand-change archive must land in the NEW root (banner + content)."""
         td = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, td, ignore_errors=True)
         host = sr.Host(td)
         src = host.p("/var/lib/smartroomos")
         src.mkdir(parents=True)
         (src / "latch").write_text("1")
-        (src / "drift-archive").mkdir()
-        (src / "drift-archive" / "huge").write_bytes(b"x" * 100)
-        # Minimal carry list
+        aid = "old-20261123T120000Z"
+        arch = src / "drift-archive" / aid
+        arch.mkdir(parents=True)
+        (arch / "manifest.json").write_text('{"entries":[{"path":"/etc/hand.conf"}]}\n')
+        (arch / "files").mkdir()
+        (arch / "files" / "etc__hand.conf").write_text("hand\n")
+        (arch / "README.md").write_text("# drift\n")
+        integ = src / "integrity"
+        integ.mkdir(parents=True)
+        pending = {
+            "archives": [{
+                "id": aid, "acked": False, "count": 1,
+                "paths": ["/etc/hand.conf"],
+                "old_release": "old", "new_release": "new",
+                "path": str(arch),
+            }],
+        }
+        (integ / "hand-changes-pending.json").write_text(json.dumps(pending) + "\n")
+        (integ / "status.json").write_text(json.dumps({
+            "schema": 2, "state": "drift",
+            "hand_changes_pending": {
+                "archive_id": aid, "count": 1, "old_release": "old",
+                "new_release": "new",
+            },
+        }) + "\n")
         cl = host.p("/usr/share/smartroomos/release-carry.list")
         cl.parent.mkdir(parents=True, exist_ok=True)
         cl.write_text("/var/lib/smartroomos\n")
         new_root = Path(td) / "new-root"
         new_root.mkdir()
-        # Host.run uses real cp
         copied = sr.carry_into(host, new_root)
         self.assertIn("/var/lib/smartroomos", copied)
         self.assertTrue((new_root / "var/lib/smartroomos/latch").is_file())
-        self.assertTrue((new_root / "var/lib/smartroomos/drift-archive").is_dir())
-        self.assertFalse((new_root / "var/lib/smartroomos/drift-archive/huge").exists())
+        carried = new_root / "var/lib/smartroomos/drift-archive" / aid
+        self.assertTrue((carried / "files" / "etc__hand.conf").is_file())
+        self.assertTrue((carried / "manifest.json").is_file())
+        new_pending = json.loads(
+            (new_root / "var/lib/smartroomos/integrity/hand-changes-pending.json").read_text()
+        )
+        self.assertFalse(new_pending["archives"][0].get("content_pruned"))
+        self.assertEqual(new_pending["archives"][0]["id"], aid)
+
+    def test_carry_size_guard_marks_content_pruned(self):
+        """Over-budget archives keep manifest and are marked content_pruned."""
+        td = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, td, ignore_errors=True)
+        host = sr.Host(td)
+        src = host.p("/var/lib/smartroomos")
+        src.mkdir(parents=True)
+        (src / "latch").write_text("1")
+        arch_root = src / "drift-archive"
+        arch_root.mkdir()
+        # Oldest: large payload (will be pruned under a tiny budget).
+        old = arch_root / "rel-old-20261120T000000Z"
+        old.mkdir()
+        (old / "manifest.json").write_text('{"entries":[{"path":"/etc/old.conf"}]}\n')
+        (old / "files").mkdir()
+        (old / "files" / "big").write_bytes(b"O" * 200_000)
+        time.sleep(0.02)
+        # Newest: small, must survive.
+        new = arch_root / "rel-new-20261123T000000Z"
+        new.mkdir()
+        (new / "manifest.json").write_text('{"entries":[{"path":"/etc/new.conf"}]}\n')
+        (new / "files").mkdir()
+        (new / "files" / "small").write_text("ok\n")
+        integ = src / "integrity"
+        integ.mkdir(parents=True)
+        pending = {
+            "archives": [
+                {"id": old.name, "acked": False, "count": 1, "paths": ["/etc/old.conf"]},
+                {"id": new.name, "acked": False, "count": 1, "paths": ["/etc/new.conf"]},
+            ],
+        }
+        (integ / "hand-changes-pending.json").write_text(json.dumps(pending) + "\n")
+        (integ / "status.json").write_text(json.dumps({
+            "schema": 2,
+            "hand_changes_pending": {"archive_id": new.name, "count": 1},
+        }) + "\n")
+        cl = host.p("/usr/share/smartroomos/release-carry.list")
+        cl.parent.mkdir(parents=True, exist_ok=True)
+        cl.write_text("/var/lib/smartroomos\n")
+        new_root = Path(td) / "new-root"
+        new_root.mkdir()
+        # Patch the budget for the test so we do not need multi-hundred-MiB files.
+        old_max = sr.DRIFT_ARCHIVE_CARRY_MAX
+        sr.DRIFT_ARCHIVE_CARRY_MAX = 50_000
+        try:
+            sr.carry_into(host, new_root)
+        finally:
+            sr.DRIFT_ARCHIVE_CARRY_MAX = old_max
+        carried_old = new_root / "var/lib/smartroomos/drift-archive" / old.name
+        carried_new = new_root / "var/lib/smartroomos/drift-archive" / new.name
+        self.assertTrue((carried_old / "manifest.json").is_file())
+        self.assertFalse((carried_old / "files" / "big").exists())
+        self.assertTrue((carried_new / "files" / "small").is_file())
+        new_pending = json.loads(
+            (new_root / "var/lib/smartroomos/integrity/hand-changes-pending.json").read_text()
+        )
+        by_id = {a["id"]: a for a in new_pending["archives"]}
+        self.assertTrue(by_id[old.name].get("content_pruned"))
+        self.assertIn("carry_size_budget", by_id[old.name].get("content_pruned_reason") or "")
+        self.assertFalse(by_id[new.name].get("content_pruned"))
+        st = json.loads(
+            (new_root / "var/lib/smartroomos/integrity/status.json").read_text()
+        )
+        self.assertTrue(any(
+            p.get("id") == old.name and p.get("content_pruned")
+            for p in st.get("drift_archive_pruned") or []
+        ))
 
 
 
