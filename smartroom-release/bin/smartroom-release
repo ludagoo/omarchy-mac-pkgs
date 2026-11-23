@@ -1694,9 +1694,32 @@ def subvol_exists(top: Path, name: str) -> bool:
 
 
 def delete_subvolume(host: Host, top: Path, name: str) -> None:
-    if (top / name).exists():
-        host.run(["btrfs", "property", "set", "-ts", str(top / name), "ro", "false"], check=False)
-        host.run(["btrfs", "subvolume", "delete", "--commit-after", str(top / name)])
+    """Delete a btrfs subvolume, including nested children (e.g. .snapshots).
+
+    WS13 nested `root/.snapshots` under every @r-* so snapper works on release
+    roots. Plain `btrfs subvolume delete` refuses a parent while children
+    remain, so prune left every old @r-* on disk after keep-5 (Mini VM: 10
+    roots with keepGood=5). Use --recursive (btrfs-progs) after clearing ro.
+    """
+    target = top / name
+    if not target.exists():
+        return
+    host.run(["btrfs", "property", "set", "-ts", str(target), "ro", "false"], check=False)
+    # Also clear ro on nested snapper snapshots so --recursive can remove them.
+    listed = host.run(
+        ["btrfs", "subvolume", "list", "-o", str(target)], check=False,
+    ).stdout.decode(errors="replace")
+    for line in listed.splitlines():
+        parts = line.rsplit(" path ", 1)
+        if len(parts) != 2:
+            continue
+        rel = parts[1].strip()
+        path = top / rel if not rel.startswith(name) else top / rel
+        if not str(path).startswith(str(target)):
+            path = target / rel
+        if path.exists() and path != target:
+            host.run(["btrfs", "property", "set", "-ts", str(path), "ro", "false"], check=False)
+    host.run(["btrfs", "subvolume", "delete", "--recursive", "--commit-after", str(target)])
 
 
 def receive_root(host: Host, top: Path, directory: Path, manifest: dict, subvol: str) -> None:

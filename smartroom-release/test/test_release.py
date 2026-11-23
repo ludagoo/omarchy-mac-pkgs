@@ -1463,6 +1463,30 @@ class MiniLine(unittest.TestCase):
 
 
 
+
+class TestDeleteSubvolumeRecursive(unittest.TestCase):
+    def test_delete_subvolume_uses_recursive(self):
+        """Nested .snapshots must not block prune of @r-* roots."""
+        calls = []
+        host = sr.Host()
+        host.prefix = None
+
+        def run(argv, check=True, input=None):
+            calls.append(list(argv))
+            return subprocess.CompletedProcess(argv, 0, b"", b"")
+
+        host.run = run  # type: ignore[method-assign]
+        top = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, top, ignore_errors=True)
+        target = top / "@r-old"
+        target.mkdir()
+        (target / ".snapshots").mkdir()
+        sr.delete_subvolume(host, top, "@r-old")
+        deleted = [c for c in calls if c[:3] == ["btrfs", "subvolume", "delete"]]
+        self.assertTrue(deleted, calls)
+        self.assertIn("--recursive", deleted[-1], deleted[-1])
+
+
 class TestBuildAsideEphemeral(unittest.TestCase):
     def test_parks_drift_archive_and_old_release_dirs(self):
         td = tempfile.mkdtemp()
