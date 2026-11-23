@@ -72,7 +72,7 @@ clock, marks good by write-beside, and rolls back by leaving the configured
 file alone. `smartroom/aura-try/test-all.sh` runs offline. It does not touch
 a real EFI partition and it does not reboot.
 
-`smartroom-release/` (recipe `smartroom/pkgbuilds/smartroom-release`) is the Studio update
+`smartroom-release/` (recipe `smartroom/pkgbuilds/smartroom-release`) is the Studio and Mini update
 and rollback tool built on aura's trial boot (`aura-try`); see its README. It installs a
 release's root and boot set beside the running one, boots it once under aura's 178 s
 hardware watchdog, and keeps it only when the room proves healthy (Room Controller
@@ -103,6 +103,35 @@ in `smartroom/aura-try/` (which stays as the design reference and its own test).
   any other SmartRoom package; `desk-check` asserts the binary, the health unit, the release
   keyring and the Room Controller pin. Releases themselves are signed with the SmartRoom
   package key (the public key is `/usr/share/smartroomos/release-keyring.gpg`).
+- **WS13 (drift).** On stage: create a nested `.snapshots` under the new root and
+  `pacman-key --add` + `--lsign-key` the release keyring into that root's gnupg so
+  pacman stops asking to import it; precompile shipped SmartRoom Python
+  (`compileall`) so runtime writes no `__pycache__`. On promote: finalize
+  limine defaults, re-import the key, run `smartroomos-integrity record`, then
+  take a read-only snapper snapshot `release <id> as installed` as type=post
+  paired with a throwaway pre (snapper rejects orphan posts; no cleanup
+  algorithm; `EXCLUDE_SNAPSHOT_TYPES=post` skips the post UKI;
+  `limine-snapper-remove` clears the pre's UKI). Also rewrite
+  `ROOT_SUBVOLUME_PATH` / `ROOT_SNAPSHOTS_PATH` to the live `@r-<id>` so
+  limine-snapper-sync keeps working after the first promote. Firmware side:
+  `smartroomcontrollerfirmware` `docs/disk-drift.md`.
+- **WS13c (home + export + never-forget).** On stage: if the outgoing root has
+  drift, `smartroomos-integrity archive-outgoing` writes
+  `/var/lib/smartroomos/drift-archive/<old>-<time>/` (last 5; never blocks;
+  never re-applies). On promote: also take a home as-installed snapper
+  snapshot (`-c home`, nested `/home/.snapshots` on `@home` so it survives
+  root replace). Home runtime IGNORE list and layout extras: see
+  `docs/disk-drift.md`.
+- **WS14 (ESP budget).** The ESP holds only the configured boot set and one
+  fallback (previous, or trial while a trial is staged). Kept-release UKI and
+  stage2 copies live on btrfs at `/var/lib/smartroomos/boot-store/<id>/` with
+  sha256 in `meta.json`; `rollback` / `restore` / `smartroom-rollback to`
+  copy them back to the ESP trial slots. Stage computes the worst-case bytes
+  promote will need, offloads the legacy ESP `smartroom-release/uki` store
+  first, and refuses with `esp-full` in status JSON when it still does not
+  fit. Promote failure is recovered to a bootable release (`promote-failed`).
+  `smartroom-release esp-migrate` cleans rooms that still have the old ESP
+  store or WS13d `esp-hold` park files.
 
 `user4k.patch` in the omarchy-mac-boot recipe is the stable line's (see
 Base): the upstream console change, its cases after upstream's M4 cases,
@@ -145,7 +174,7 @@ is copied unchanged.
 | 5 | `smartroom/pkgbuilds/`: the omacom/omarchy-pkgs recipe for `omarchy-mac-boot`, unchanged except source (this fork), `depends` (`smartroom-omarchy-helpers` + `sudo` instead of `omarchy`; `asahi-scripts` as the stable 20261104-1 has it) and pkgver/_commit from the build; and the helpers' recipe | omacom builds its packages in omarchy-pkgs from omacom main; ours build from this fork | No (ours) | Never |
 | 6 | `smartroom-boot-os/` and its recipe: `smartroom-boot-os macos\|firmware [--once] [--reboot]`, supporting Apple Silicon (`aurora-bless`) and Intel T2 `Macmini8,1` (`efibootmgr` + `efivarfs`) | Zoom-room Macs switch between SmartRoom Firmware and macOS (Zoom Rooms) from Linux with no macOS password. Apple Silicon uses `aurora-bless` (`boot-volume` / `alt-boot-volume`); Intel T2 uses `efibootmgr` (`BootOrder` / `BootNext`), creates a missing SmartRoom entry, reconstructs a missing macOS `Boot####` entry from `/boot/smartroomos/macos-boot-device.bin` when `bless` overwrote `Boot0080`, and syncs Apple `efi-boot-device*` / `efi-boot-next*` efivars when present | No (ours) | Never |
 | 7 | `omarchy-mac-boot/setup/grub-console.sh`: on a headless (`/etc/omarchy-mac-boot/headless`), unencrypted image the root-device wait is `x-systemd.device-timeout=60`, not `0` (an older endless value is replaced); an encrypted image or a Mac that is not headless keeps `0`. `test/headless-device-wait-test.sh` (a new file, so `user4k.patch`'s hunks in the existing grub-console test still apply) | A room with a missing or unreadable root disk waited for ever in the initramfs with no screen (SmartRoom Firmware WS1, decision 1: boot never waits); after 60 s systemd reaches the emergency target, which the room's initrd hook turns into a reboot | Maybe: "finite root wait for images with nobody to unlock" | omacom takes it |
-| 8 | `smartroom-release/` and its recipe (edge only): trial-boot update and automatic rollback for a Studio on aura's `aura-try` | A Studio had no update path and no rollback by itself (the Mini's snapshot tools do not apply to the Studio boot chain). See the process above | No (ours) | Never |
+| 8 | `smartroom-release/` and its recipe (edge only): trial-boot update and automatic rollback for Studio (aura-try) and Intel Mini (Limine one-shot + iTCO/softdog); remote migrate for old Minis | Parity: one update tool on both lines; old Minis move without a USB visit (WS12). See the process above | No (ours) | Never |
 
 Nothing else differs from omacom (#6, #7, and #8 are our additions beside theirs). In particular the initramfs, in-place
 encryption (still switchable: `omarchy/install.conf` on the ESP, `encrypt=1`),

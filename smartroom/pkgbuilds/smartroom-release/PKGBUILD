@@ -1,10 +1,11 @@
-# SmartRoom only: update a Studio to a new release as a watchdog-guarded
-# trial, keep it only if the room proves healthy, otherwise let aura boot the
-# previous release (smartroom-release/, design in the smartroom-rollback DESIGN.md).
+# SmartRoom: update a Studio or Intel Mini to a new release as a watchdog-guarded
+# trial (aura-try on Studio; Limine one-shot + iTCO/softdog on Mini). Keep it only
+# if the room proves healthy; otherwise the previous release boots by itself.
+# Also: migrate an old Mini install onto the release system (smartroom-release/).
 pkgname=smartroom-release
 pkgver=${SMARTROOM_MAC_PKGS_DATE:?set by smartroom/build-packages}
 pkgrel=1
-pkgdesc='Trial-boot update and automatic rollback for an Apple Silicon room Mac (aura-try)'
+pkgdesc='Trial-boot update and automatic rollback for Studio and Intel Mini rooms'
 arch=('any')
 url='https://github.com/ludagoo/omarchy-mac-pkgs'
 license=('MIT')

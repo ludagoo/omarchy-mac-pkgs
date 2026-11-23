@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
-"""smartroom-release: update a room Mac (Studio) to a new release, as a trial.
+"""smartroom-release: update a SmartRoom room (Studio or Intel Mini) to a new
+release, as a trial.
 
 The design is ~/smartroom-rollback/DESIGN.md. A release is one tested image:
 a btrfs root and the boot files that start it. An update never runs a package
 upgrade on the live system. It writes the new release beside the running one,
-boots it once, and keeps it only if the room proves healthy. Otherwise aura
-(the boot loader below Linux) boots the previous release by itself.
+boots it once, and keeps it only if the room proves healthy. Otherwise the
+boot chain boots the previous release by itself.
+
+  Studio: aura-try + Limine one-shot (U-Boot efivars) + Apple watchdog
+  Mini:   Limine one-shot (NVRAM) + boot-try counting + iTCO_wdt/softdog
 
   smartroom-release status [--json]
   smartroom-release list [--json]
@@ -18,29 +22,33 @@ boots it once, and keeps it only if the room proves healthy. Otherwise aura
   smartroom-release build-release --id ID --out DIR [--source-subvol NAME]
                                   [--sign-key FPR]  make a release from this room
   smartroom-release restore N [--no-reboot]         Room Controller contract
+  smartroom-release migrate RELEASE [--reboot] [--unsigned] [--force]
+                                  old Mini -> release trial (fallback = current @)
+  smartroom-release migrate-check                   refuse safely if the room cannot move
+  smartroom-release esp-migrate [--esp-hold DIR]    move ESP UKI store + ws13d hold into boot-store
 
 RELEASE is a directory holding manifest.json (see README.md), or an https URL
 of one. Nothing here asks a question. Exit status is non-zero on error; with
 --json an error is {"error": {"code": ..., "message": ...}} on stdout.
 
 How a trial is one-shot at every layer:
-  aura-try   the ESP file `aura-try` ("armed", newline, path, newline). aura's
-             first stage marks it spent on disk before it boots the path. Its
-             trial watchdog (178 s) covers a hang before Linux.
-  Limine     the one-shot entry LoaderEntryOneShot picks the trial UKI, whose
-             command line names the new root subvolume. Limine consumes it.
-  kernel     the trial command line has watchdog.handle_boot_enabled=0, so the
-             kernel does not feed the still-running trial watchdog. This
-             program's health service opens /dev/watchdog and feeds it only
-             while the check is alive.
+  Studio aura-try  ESP file aura-try ("armed", newline, path, newline). aura
+                   marks it spent before it boots the path; 178 s watchdog.
+  Limine           LoaderEntryOneShot picks the trial UKI / entry once.
+  Mini             efivarfs NVRAM holds the one-shot (no ubootefi.var). The
+                   health service opens /dev/watchdog (iTCO_wdt or softdog).
+  kernel           trial cmdline has watchdog.handle_boot_enabled=0 so the
+                   health service must feed the watchdog.
 Everything the trial changes is beside what is configured. Mark-good is a
 fixed list of steps whose only switch is one rename of limine.conf.
+The last KEEP_GOOD (5) good releases stay on disk for manual restore.
 """
 from __future__ import annotations
 
 import argparse
 import contextlib
 import dataclasses
+import errno
 import hashlib
 import json
 import os
@@ -52,7 +60,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, NamedTuple, Optional
 
 SCHEMA = 1
 MANIFEST = "manifest.json"
@@ -76,6 +84,10 @@ INSTALLED = "installed"
 CARRY_LIST = "/usr/share/smartroomos/release-carry.list"
 EVENTS_KEEP = 100
 ESP_MARGIN = 32 * 1024 * 1024
+# Durable boot files for kept releases live on the system disk (btrfs), not the ESP.
+# The ESP only holds what the next boot and its one fallback need (WS14).
+BOOT_STORE = "/var/lib/smartroomos/boot-store"
+ESP_HOLD_DEFAULT = "/var/lib/srbuild/esp-hold"
 
 # Reasons a trial ends without becoming the configured release.
 REASONS = (
@@ -84,7 +96,54 @@ REASONS = (
     "lost-before-userspace", # never reached userspace (bad file, early panic, loader hang)
     "trial-did-not-start",   # Limine ran the trial entry but the trial boot image never ran
     "trial-incomplete",      # the trial boot image ran but Limine booted the configured entry
+    "promote-failed",        # mark-good could not finish; room left on a bootable release
 )
+
+
+KEEP_GOOD = 5  # last N good releases kept on disk (Lucas decision 3)
+# Cap on /var/lib/smartroomos/drift-archive when carried into a new root.
+# Archives hold hand-change records Lucas requires; drop content only with a
+# content_pruned mark (never silently). 256 MiB keeps Mini updates off ENOSPC.
+DRIFT_ARCHIVE_CARRY_MAX = 256 * 1024 * 1024
+MINI_MARKER = "trial.marker"  # ESP smartroom-release/trial.marker (Mini; no aura-try)
+
+
+class BootLayout(NamedTuple):
+    """Per-line boot file names. Studio uses aura stage2; Mini uses UKI only."""
+    line: str
+    configured_uki: str
+    trial_uki: str
+    previous_uki: str
+    configured_boot: str
+    trial_boot: str
+    previous_boot: str
+    uses_aura: bool
+    uki_needle: str  # substring that marks the configured Limine kernel entry
+
+
+LAYOUT_STUDIO = BootLayout(
+    line="studio",
+    configured_uki=CONFIGURED_UKI,
+    trial_uki=TRIAL_UKI,
+    previous_uki=PREVIOUS_UKI,
+    configured_boot=CONFIGURED_BOOT,
+    trial_boot=TRIAL_BOOT,
+    previous_boot=PREVIOUS_BOOT,
+    uses_aura=True,
+    uki_needle="/EFI/Linux/omarchy_",
+)
+LAYOUT_MINI = BootLayout(
+    line="mini",
+    configured_uki="EFI/Linux/smartroomos_linux-t2.efi",
+    trial_uki="EFI/Linux/smartroomos_linux-t2-trial.efi",
+    previous_uki="EFI/Linux/smartroomos_linux-t2-previous.efi",
+    configured_boot="",
+    trial_boot="",
+    previous_boot="",
+    uses_aura=False,
+    uki_needle="/EFI/Linux/smartroomos_",
+)
+
 
 DEFAULTS = {
     "quiet_seconds": 300,
@@ -125,13 +184,19 @@ def write_atomic(path: Path, data: bytes, mode: int = 0o600) -> None:
     """Write beside, flush, rename. A power cut leaves the old file or the new."""
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".new")
-    with open(tmp, "wb") as stream:
-        stream.write(data)
-        stream.flush()
-        os.fsync(stream.fileno())
-    with contextlib.suppress(OSError):
-        os.chmod(tmp, mode)
-    os.replace(tmp, path)
+    try:
+        with open(tmp, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        with contextlib.suppress(OSError):
+            os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except OSError as exc:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+        code = "esp-full" if getattr(exc, "errno", None) == errno.ENOSPC else "io-error"
+        raise Fail(f"cannot write {path.name}: {exc}", code) from exc
     fsync_dir(path.parent)
 
 
@@ -149,18 +214,22 @@ def copy_atomic(src: Path, dst: Path, expect: Optional[str] = None) -> str:
     tmp = dst.with_name(dst.name + ".new")
     digest = hashlib.sha256()
     try:
-        with open(src, "rb") as source, open(tmp, "wb") as target:
-            while chunk := source.read(1 << 20):
-                digest.update(chunk)
-                target.write(chunk)
-            target.flush()
-            os.fsync(target.fileno())
-        got = digest.hexdigest()
-        if expect is not None and got != expect:
-            raise Fail(f"{src.name}: sha256 {got} is not the expected {expect}")
-        if sha256_file(tmp) != got:
-            raise Fail(f"{dst.name}: the copy does not read back the same")
-        os.replace(tmp, dst)
+        try:
+            with open(src, "rb") as source, open(tmp, "wb") as target:
+                while chunk := source.read(1 << 20):
+                    digest.update(chunk)
+                    target.write(chunk)
+                target.flush()
+                os.fsync(target.fileno())
+            got = digest.hexdigest()
+            if expect is not None and got != expect:
+                raise Fail(f"{src.name}: sha256 {got} is not the expected {expect}")
+            if sha256_file(tmp) != got:
+                raise Fail(f"{dst.name}: the copy does not read back the same")
+            os.replace(tmp, dst)
+        except OSError as exc:
+            code = "esp-full" if getattr(exc, "errno", None) == errno.ENOSPC else "io-error"
+            raise Fail(f"cannot write {dst.name}: {exc}", code) from exc
     finally:
         with contextlib.suppress(OSError):
             tmp.unlink()
@@ -171,6 +240,389 @@ def copy_atomic(src: Path, dst: Path, expect: Optional[str] = None) -> str:
 def remove(path: Path) -> None:
     with contextlib.suppress(FileNotFoundError):
         path.unlink()
+
+
+def file_size(path: Path) -> int:
+    try:
+        return path.stat().st_size
+    except OSError:
+        return 0
+
+
+# --------------------------------------------------------------------------
+# boot-store (btrfs): kept-release UKI/boot files; ESP holds current + one fallback
+
+
+def boot_store_root(host: Host) -> Path:
+    return host.p(BOOT_STORE)
+
+
+def boot_store_dir(host: Host, release: str) -> Path:
+    return boot_store_root(host) / safe_id(release)
+
+
+def boot_store_meta(host: Host, release: str) -> Optional[dict]:
+    meta = boot_store_dir(host, release) / "meta.json"
+    if not meta.is_file():
+        return None
+    try:
+        return json.loads(meta.read_text())
+    except ValueError:
+        return None
+
+
+def boot_store_paths(host: Host, release: str) -> tuple[Optional[Path], Optional[Path]]:
+    """(uki, boot) paths in the store when present and sha256 matches meta."""
+    d = boot_store_dir(host, release)
+    meta = boot_store_meta(host, release)
+    if not meta:
+        return None, None
+    uki = d / "uki.efi"
+    boot = d / "boot.bin"
+    uki_ok = uki.is_file() and meta.get("uki_sha256") == sha256_file(uki)
+    boot_ok = True
+    boot_path: Optional[Path] = None
+    if meta.get("boot_sha256"):
+        boot_ok = boot.is_file() and meta.get("boot_sha256") == sha256_file(boot)
+        boot_path = boot if boot_ok else None
+    elif boot.is_file():
+        boot_path = boot
+    return (uki if uki_ok else None), (boot_path if boot_ok else None)
+
+
+def boot_store_put(host: Host, release: str, uki: Path, boot: Optional[Path] = None,
+                   uki_sha: Optional[str] = None, boot_sha: Optional[str] = None) -> dict:
+    """Copy boot files into the btrfs store; verify sha256; write meta.json."""
+    if not release:
+        raise Fail("boot-store put needs a release id")
+    if not uki.is_file():
+        raise Fail(f"boot-store: UKI missing at {uki}")
+    d = boot_store_dir(host, release)
+    d.mkdir(parents=True, exist_ok=True)
+    got_uki = copy_atomic(uki, d / "uki.efi", uki_sha)
+    got_boot = None
+    if boot is not None and boot.is_file():
+        got_boot = copy_atomic(boot, d / "boot.bin", boot_sha)
+    meta = {
+        "release": release,
+        "uki_sha256": got_uki,
+        "uki_size": file_size(d / "uki.efi"),
+        "boot_sha256": got_boot,
+        "boot_size": file_size(d / "boot.bin") if got_boot else 0,
+        "stored_at": host.stamp(),
+    }
+    write_atomic(d / "meta.json", (json.dumps(meta, indent=2, sort_keys=True) + "\n").encode())
+    return meta
+
+
+def boot_store_has(host: Host, release: str) -> bool:
+    uki, _ = boot_store_paths(host, release)
+    return uki is not None
+
+
+def _shared_esp_slots(layout: BootLayout) -> set[str]:
+    """ESP paths that rotate between releases; never treat as one release's archive."""
+    return {p for p in (
+        layout.configured_uki, layout.previous_uki, layout.trial_uki,
+        layout.configured_boot, layout.previous_boot, layout.trial_boot,
+        CONFIGURED_UKI, PREVIOUS_UKI, TRIAL_UKI,
+        CONFIGURED_BOOT, PREVIOUS_BOOT, TRIAL_BOOT,
+    ) if p}
+
+
+def resolve_boot_files(host: Host, entry: dict,
+                       state: Optional[dict] = None) -> tuple[Path, Optional[Path]]:
+    """Locate UKI (+ stage2) for a kept release.
+
+    Prefer btrfs boot-store and the legacy named ESP store. Shared ESP slots
+    (configured/previous/trial) are only used when this entry currently owns
+    that slot — otherwise history would pick up another release's bytes.
+    """
+    layout = host.layout()
+    esp = host.esp()
+    release = entry.get("release") or ""
+    shared = _shared_esp_slots(layout)
+    uki_src: Optional[Path] = None
+    boot_src: Optional[Path] = None
+    conf = ((state or {}).get("configured") or {}).get("release")
+    prev = ((state or {}).get("previous") or {}).get("release")
+
+    stored_u, stored_b = boot_store_paths(host, release)
+    if stored_u is not None:
+        uki_src, boot_src = stored_u, stored_b
+
+    if uki_src is None:
+        legacy = esp / STATE_DIR / "uki" / f"{release}.efi"
+        if legacy.is_file():
+            uki_src = legacy
+
+    if uki_src is None and entry.get("uki"):
+        rel = entry["uki"]
+        path = esp / rel
+        if path.is_file():
+            if rel not in shared:
+                uki_src = path
+            elif rel in (layout.configured_uki, CONFIGURED_UKI) and conf == release:
+                uki_src = path
+            elif rel in (layout.previous_uki, PREVIOUS_UKI) and prev == release:
+                uki_src = path
+
+    if uki_src is None:
+        raise Fail(f"the release {release}'s UKI is gone", "not-found")
+
+    if layout.uses_aura:
+        if boot_src is None:
+            legacy_b = esp / STATE_DIR / "boot" / f"{release}.bin"
+            if legacy_b.is_file():
+                boot_src = legacy_b
+        if boot_src is None and entry.get("boot"):
+            rel = entry["boot"]
+            path = esp / rel
+            if path.is_file():
+                if rel not in shared:
+                    boot_src = path
+                elif rel in (layout.configured_boot, CONFIGURED_BOOT) and conf == release:
+                    boot_src = path
+                elif rel in (layout.previous_boot, PREVIOUS_BOOT) and prev == release:
+                    boot_src = path
+        if boot_src is None:
+            raise Fail(f"the release {release}'s boot files are gone", "not-found")
+    return uki_src, boot_src
+
+
+def keep_release_ids(state: dict) -> set[str]:
+    ids = {(state.get("configured") or {}).get("release")}
+    for entry in [state.get("previous")] + list(state.get("history") or []):
+        if entry and entry.get("release"):
+            ids.add(entry["release"])
+    if state.get("trial") and state["trial"].get("release"):
+        ids.add(state["trial"]["release"])
+    mig = state.get("migration") or {}
+    if mig.get("kept_until_confirmed") and mig.get("old_release"):
+        ids.add(mig["old_release"])
+    ids.discard(None)
+    ids.discard("")
+    return ids
+
+
+def migrate_esp_uki_store(host: Host, state: dict) -> list[str]:
+    """Move legacy ESP smartroom-release/uki|boot copies into the btrfs boot-store."""
+    esp = host.esp()
+    moved: list[str] = []
+    layout = host.layout()
+    for uki in sorted((esp / STATE_DIR / "uki").glob("*.efi")) if (esp / STATE_DIR / "uki").is_dir() else []:
+        rid = uki.stem
+        boot = esp / STATE_DIR / "boot" / f"{rid}.bin"
+        boot_path = boot if layout.uses_aura and boot.is_file() else None
+        existing_u, _ = boot_store_paths(host, rid)
+        if existing_u is not None and sha256_file(existing_u) == sha256_file(uki):
+            remove(uki)
+            if boot_path:
+                remove(boot_path)
+            moved.append(f"{rid}:duplicate")
+            continue
+        boot_store_put(host, rid, uki, boot_path)
+        remove(uki)
+        if boot_path:
+            remove(boot_path)
+        moved.append(rid)
+    # Drop empty legacy dirs when drained.
+    for sub in ("uki", "boot"):
+        d = esp / STATE_DIR / sub
+        if d.is_dir() and not any(d.iterdir()):
+            with contextlib.suppress(OSError):
+                d.rmdir()
+    return moved
+
+
+def ingest_esp_hold(host: Host, state: dict, hold: Optional[Path] = None) -> list[str]:
+    """Place WS13d-parked ESP files into the boot-store or delete sha256 duplicates.
+
+    Leaves *-pre / *-orig safety folders alone. Only touches ws13d-* names.
+    """
+    hold = hold or host.p(ESP_HOLD_DEFAULT)
+    if not hold.is_dir():
+        return []
+    actions: list[str] = []
+    # Index known store sha256 -> release
+    known: dict[str, str] = {}
+    root = boot_store_root(host)
+    if root.is_dir():
+        for meta_path in root.glob("*/meta.json"):
+            try:
+                meta = json.loads(meta_path.read_text())
+            except ValueError:
+                continue
+            if meta.get("uki_sha256"):
+                known[meta["uki_sha256"]] = meta.get("release") or meta_path.parent.name
+            if meta.get("boot_sha256"):
+                known[meta["boot_sha256"]] = meta.get("release") or meta_path.parent.name
+    # Also index live ESP configured/previous
+    esp = host.esp()
+    layout = host.layout()
+    for rel, role in ((layout.configured_uki, "configured"), (layout.previous_uki, "previous"),
+                      (layout.configured_boot, "configured-boot"), (layout.previous_boot, "previous-boot")):
+        if not rel:
+            continue
+        p = esp / rel
+        if p.is_file():
+            known[sha256_file(p)] = role
+
+    def handle_file(path: Path, hint: str) -> None:
+        if not path.is_file():
+            return
+        digest = sha256_file(path)
+        if digest in known:
+            remove(path)
+            actions.append(f"delete-duplicate:{path.name}:{known[digest]}")
+            return
+        # Prefer a kept history id when the filename names one.
+        rid = None
+        for kid in keep_release_ids(state):
+            if kid and kid in path.name:
+                rid = kid
+                break
+        if rid is None:
+            rid = f"esp-hold-{hint}-{digest[:12]}"
+        if path.name.endswith(".efi") or "uki" in path.name or "aurora" in path.name:
+            boot_store_put(host, rid, path, None)
+            known[digest] = rid
+            remove(path)
+            actions.append(f"store-uki:{path.name}->{rid}")
+        elif path.name.endswith(".bin") or "boot" in path.name:
+            # Need a UKI already in store for this id, or store boot beside a new stub id.
+            d = boot_store_dir(host, rid)
+            if (d / "uki.efi").is_file():
+                copy_atomic(path, d / "boot.bin")
+                meta = boot_store_meta(host, rid) or {"release": rid}
+                meta["boot_sha256"] = sha256_file(d / "boot.bin")
+                meta["boot_size"] = file_size(d / "boot.bin")
+                write_atomic(d / "meta.json", (json.dumps(meta, indent=2, sort_keys=True) + "\n").encode())
+            else:
+                d.mkdir(parents=True, exist_ok=True)
+                copy_atomic(path, d / "boot.bin")
+                write_atomic(d / "meta.json", (json.dumps({
+                    "release": rid, "uki_sha256": None, "boot_sha256": sha256_file(d / "boot.bin"),
+                    "uki_size": 0, "boot_size": file_size(d / "boot.bin"), "stored_at": host.stamp(),
+                }, indent=2, sort_keys=True) + "\n").encode())
+            known[digest] = rid
+            remove(path)
+            actions.append(f"store-boot:{path.name}->{rid}")
+
+    for child in sorted(hold.iterdir()):
+        name = child.name
+        # Leave older *-pre / *-orig safety copies alone (brief).
+        if name.endswith("-pre") or name.endswith("-orig"):
+            continue
+        if not name.startswith("ws13d"):
+            continue
+        if child.is_dir():
+            for f in sorted(child.iterdir()):
+                handle_file(f, child.name)
+            with contextlib.suppress(OSError):
+                if child.is_dir() and not any(child.iterdir()):
+                    child.rmdir()
+        elif child.is_file():
+            handle_file(child, name)
+    return actions
+
+
+def ensure_entry_in_boot_store(host: Host, entry: Optional[dict],
+                               state: Optional[dict] = None) -> None:
+    if not entry or not entry.get("release"):
+        return
+    release = entry["release"]
+    if boot_store_has(host, release):
+        return
+    try:
+        uki, boot = resolve_boot_files(host, entry, state=state)
+    except Fail:
+        return
+    boot_store_put(host, release, uki, boot)
+
+
+def esp_offload_non_essential(host: Host, state: dict, for_trial: bool = False) -> list[str]:
+    """ESP keeps configured (+ trial while staged) and at most one previous fallback.
+
+    Everything else (legacy ESP UKI store, extra previous while staging a trial) moves
+    to the btrfs boot-store or is deleted when already stored with matching sha256.
+    """
+    actions = migrate_esp_uki_store(host, state)
+    layout = host.layout()
+    esp = host.esp()
+    # Ensure configured + previous + history are durable on btrfs.
+    ensure_entry_in_boot_store(host, state.get("configured"), state=state)
+    ensure_entry_in_boot_store(host, state.get("previous"), state=state)
+    for entry in state.get("history") or []:
+        ensure_entry_in_boot_store(host, entry, state=state)
+    # While staging/arming a trial, previous ESP slots are not needed for fallback
+    # (aura/Limine fall back to configured). Free them for the trial + promote reserve.
+    trial = state.get("trial")
+    trial_busy = bool(trial and trial.get("phase") in ("staged", "armed", "booting", "promoting"))
+    if for_trial or trial_busy:
+        for rel in (layout.previous_uki, layout.previous_boot):
+            if rel and (esp / rel).is_file():
+                # Already in boot-store via ensure_entry above.
+                remove(esp / rel)
+                actions.append(f"offload-previous:{rel}")
+    return actions
+
+
+def esp_budget_bytes(host: Host, uki_size: int, boot_size: int) -> dict:
+    """Worst-case ESP bytes a stage+promote cycle needs free (beyond configured files).
+
+    Sequential peak (after previous has been offloaded): write trial, then at promote
+    write previous, then one .new temp while configured+previous+trial coexist.
+    Spare is max(temp, ESP_MARGIN) so a 59 MiB UKI .new is covered even when
+    ESP_MARGIN is 32 MiB.
+    """
+    layout = host.layout()
+    trial = uki_size + (boot_size if layout.uses_aura else 0)
+    previous = uki_size + (boot_size if layout.uses_aura else 0)
+    temp = max(uki_size, boot_size if layout.uses_aura else uki_size, 1)
+    spare = max(temp, ESP_MARGIN)
+    need = trial + previous + spare
+    return {
+        "trial": trial,
+        "previous_reserve": previous,
+        "temp": temp,
+        "margin": ESP_MARGIN,
+        "spare": spare,
+        "need": need,
+        "uki_size": uki_size,
+        "boot_size": boot_size if layout.uses_aura else 0,
+    }
+
+
+def esp_free_bytes(esp: Path) -> int:
+    return shutil.disk_usage(esp).free
+
+
+def limine_history_bytes(esp: Path) -> int:
+    total = 0
+    for path in esp.glob("**/limine_history/**"):
+        if path.is_file():
+            total += file_size(path)
+    return total
+
+
+def restore_previous_to_esp(host: Host, state: dict) -> None:
+    """Copy the previous release's boot files back onto the ESP fallback slots."""
+    prev = state.get("previous")
+    if not prev or not prev.get("release"):
+        return
+    layout = host.layout()
+    esp = host.esp()
+    if layout.previous_uki and (esp / layout.previous_uki).is_file():
+        return
+    uki, boot = resolve_boot_files(host, prev, state=state)
+    copy_atomic(uki, esp / layout.previous_uki)
+    if layout.uses_aura and boot is not None and layout.previous_boot:
+        copy_atomic(boot, esp / layout.previous_boot)
+    prev["uki"] = layout.previous_uki
+    if layout.uses_aura:
+        prev["boot"] = layout.previous_boot
+    state["previous"] = prev
 
 
 # --------------------------------------------------------------------------
@@ -220,9 +672,14 @@ class Host:
         return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(self.now()))
 
     # commands --------------------------------------------------------------
-    def run(self, argv: list[str], check: bool = True, input: Optional[bytes] = None) -> subprocess.CompletedProcess:
+    def run(self, argv: list[str], check: bool = True, input: Optional[bytes] = None,
+            env: Optional[dict] = None) -> subprocess.CompletedProcess:
+        run_env = None
+        if env:
+            run_env = os.environ.copy()
+            run_env.update(env)
         try:
-            done = subprocess.run(argv, input=input, capture_output=True, check=False)
+            done = subprocess.run(argv, input=input, capture_output=True, check=False, env=run_env)
         except FileNotFoundError:
             raise Fail(f"{argv[0]} is not installed")
         if check and done.returncode != 0:
@@ -237,7 +694,31 @@ class Host:
                 if shutil.which("omarchy-mac-esp") else None
             if done is not None and done.returncode == 0 and done.stdout.strip():
                 return Path(done.stdout.strip())
-        return self.p("/boot/efi")
+        # Studio: /boot/efi. Mini: Limine UKI lives under /boot (no separate efi mount).
+        efi = self.p("/boot/efi")
+        if (efi / "limine.conf").is_file() or (efi / "EFI").is_dir():
+            return efi
+        boot = self.p("/boot")
+        if (boot / "limine.conf").is_file() or (boot / "EFI").is_dir():
+            return boot
+        return efi
+
+    def line(self) -> str:
+        """studio (Apple Silicon / aura) or mini (Intel T2 / Limine-only)."""
+        if self.p("/etc/smartroomos/omarchy-base").is_file():
+            return "studio"
+        esp = self.esp()
+        if (esp / CONFIGURED_BOOT).is_file() or (esp / CONFIGURED_UKI).is_file():
+            return "studio"
+        if (esp / LAYOUT_MINI.configured_uki).is_file():
+            return "mini"
+        # Prefer Mini when there is no aura stage2 and the machine looks Intel.
+        if not (esp / "m1n1").is_dir():
+            return "mini"
+        return "studio"
+
+    def layout(self) -> BootLayout:
+        return LAYOUT_STUDIO if self.line() == "studio" else LAYOUT_MINI
 
     def cmdline(self) -> str:
         return self.p("/proc/cmdline").read_text().strip()
@@ -262,6 +743,55 @@ class Host:
             return 0.0
 
     # btrfs -----------------------------------------------------------------
+    def btrfs_device(self) -> str:
+        """Block device that holds the room's btrfs.
+
+        A normal @ boot has FSTYPE=btrfs. A snapshot boot runs under
+        sd-btrfs-overlayfs, so findmnt SOURCE / is "overlay"; the real
+        device is still mounted underneath (and is named on the cmdline).
+        Old Minis hit this whenever LoaderEntryDefault still names a
+        Snapshots.* entry — migrate/build-release must still find the disk.
+        """
+        if self.prefix:
+            return "prefix"
+        fstype = self.run(["findmnt", "-no", "FSTYPE", "/"], check=False).stdout.decode().strip()
+        source = self.run(["findmnt", "-no", "SOURCE", "/"], check=False).stdout.decode().strip()
+        device = re.sub(r"\[.*\]$", "", source)
+        if fstype == "btrfs" and device and Path(device).exists():
+            return device
+        # Prefer a btrfs SOURCE that still names a snapshot / @ subvol.
+        listed = self.run(["findmnt", "-nro", "SOURCE", "-t", "btrfs"], check=False).stdout.decode()
+        preferred = []
+        fallback = []
+        for line in listed.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            dev = re.sub(r"\[.*\]$", "", line)
+            if not (dev and Path(dev).exists()):
+                continue
+            if ".snapshots/" in line or "[/@" in line or line.endswith("[@]"):
+                preferred.append(dev)
+            else:
+                fallback.append(dev)
+        if preferred:
+            return preferred[0]
+        if fallback:
+            return fallback[0]
+        cmd = self.cmdline()
+        m = re.search(r"root=UUID=([^\s]+)", cmd)
+        if m:
+            by_uuid = Path(f"/dev/disk/by-uuid/{m.group(1)}")
+            if by_uuid.exists():
+                return str(by_uuid)
+        m = re.search(r"root=(/dev/\S+)", cmd)
+        if m and Path(m.group(1)).exists():
+            return m.group(1)
+        raise Fail(
+            f"cannot find btrfs device for / (fstype={fstype or '?'}, source={source or '?'})",
+            "no-btrfs",
+        )
+
     @contextlib.contextmanager
     def top(self):
         """The btrfs top level (subvolid 5), where the root subvolumes live."""
@@ -271,8 +801,7 @@ class Host:
             yield top
             return
         mount = Path("/run/smartroom-release/top")
-        source = self.run(["findmnt", "-no", "SOURCE", "/"]).stdout.decode().strip()
-        device = re.sub(r"\[.*\]$", "", source)
+        device = self.btrfs_device()
         mounted = subprocess.run(["findmnt", "-M", str(mount)], capture_output=True).returncode == 0
         did = False
         if not mounted:
@@ -288,6 +817,14 @@ class Host:
     # health signals ------------------------------------------------------------
     def agent_connected(self) -> bool:
         """The Room Controller holds a live TCP connection to its server."""
+        # Offline Intel VM scenarios cannot open a real Room Controller session.
+        # When SMARTROOM_RELEASE_VM=1, a root-owned marker means "pretend connected"
+        # so promote/fallback paths can be exercised without a server.
+        if os.environ.get("SMARTROOM_RELEASE_VM") == "1":
+            for rel in ("/run/smartroomos/release-vm-healthy",
+                        "/etc/smartroomos/release-vm-healthy"):
+                if self.p(rel).is_file():
+                    return True
         conf = self.p("/opt/smartroom/config/agent.json")
         try:
             url = json.loads(conf.read_text()).get("serverUrl", "")
@@ -355,19 +892,44 @@ class Host:
             os.close(fd)
 
     def save_efi_vars(self) -> None:
+        """Studio: persist U-Boot RAM efivars to ubootefi.var. Mini: no-op (NVRAM)."""
+        if self.line() == "mini":
+            return
         saver = self.p(EFI_VARS_SAVE)
-        if not self.prefix and not saver.exists():
+        alt = self.p("/usr/local/sbin/smartroomos-efi-vars-save")
+        if not self.prefix and not saver.exists() and not alt.exists():
             raise Fail("omarchy-mac-boot's efi-vars-save is not installed")
-        if saver.exists():
-            self.run([str(saver)])
+        for candidate in (saver, alt):
+            if candidate.exists():
+                self.run([str(candidate)])
+                return
 
     def oneshot_saved(self) -> bool:
-        """True when U-Boot's variable file on the ESP holds the one-shot."""
+        """True when the one-shot will survive reboot (ubootefi.var or NVRAM)."""
+        if self.line() == "mini":
+            var = self.efivar(ONESHOT)
+            try:
+                data = var.read_bytes()
+            except OSError:
+                return False
+            # efivarfs: 4-byte attributes + UTF-16LE entry id
+            return len(data) > 4
         needle = "LoaderEntryOneShot".encode("utf-16-le")
         try:
             return needle in (self.esp() / "ubootefi.var").read_bytes()
         except OSError:
             return False
+
+    def ensure_watchdog_module(self) -> None:
+        """Mini: prefer iTCO_wdt, else softdog, so /dev/watchdog exists for trials."""
+        if self.line() != "mini" or self.prefix:
+            return
+        if self.p("/dev/watchdog").exists():
+            return
+        for mod in ("iTCO_wdt", "softdog"):
+            subprocess.run(["modprobe", mod], capture_output=True, check=False)
+            if self.p("/dev/watchdog").exists():
+                return
 
     # reboot ---------------------------------------------------------------------------
     def reboot(self) -> None:
@@ -443,12 +1005,15 @@ def load_state(host: Host) -> dict:
             return json.loads(path.read_text())
         except ValueError:
             raise Fail(f"{path} is not valid JSON; leaving it alone")
+    layout = host.layout()
     return {
         "schema": SCHEMA,
         "counter": 0,
+        "line": layout.line,
         "configured": {"release": INSTALLED, "number": 0, "root": running_root(host),
-                       "uki": CONFIGURED_UKI, "boot": CONFIGURED_BOOT},
+                       "uki": layout.configured_uki, "boot": layout.configured_boot},
         "previous": None,
+        "history": [],
         "trial": None,
         "promoting": None,
         "last_result": None,
@@ -525,6 +1090,10 @@ def with_trial_entry(text: str, release: str, uki: str, cmdline: str) -> str:
     return base + block
 
 
+def _is_kernel_uki_path(path_line: str) -> bool:
+    return any(n in path_line for n in ("/EFI/Linux/omarchy_", "/EFI/Linux/smartroomos_"))
+
+
 def kernel_entry(text: str) -> Optional[tuple[str, str]]:
     """(path, cmdline) of the entry that boots the configured UKI."""
     lines = text.splitlines()
@@ -534,7 +1103,7 @@ def kernel_entry(text: str) -> Optional[tuple[str, str]]:
         path = cmd = None
         for line in lines[start:end]:
             stripped = line.strip()
-            if stripped.startswith("path:") and "/EFI/Linux/omarchy_" in stripped:
+            if stripped.startswith("path:") and _is_kernel_uki_path(stripped):
                 path = stripped[len("path:"):].strip()
             elif stripped.startswith("cmdline:"):
                 cmd = stripped[len("cmdline:"):].strip()
@@ -550,7 +1119,7 @@ def set_kernel_entry(text: str, uki: str, cmdline: str) -> str:
     for start, end, title in _entry_blocks(lines):
         if title == TRIAL_ENTRY_NAME or done:
             continue
-        has_uki = any(l.strip().startswith("path:") and "/EFI/Linux/omarchy_" in l for l in lines[start:end])
+        has_uki = any(l.strip().startswith("path:") and _is_kernel_uki_path(l) for l in lines[start:end])
         if not has_uki:
             continue
         for i in range(start, end):
@@ -564,6 +1133,22 @@ def set_kernel_entry(text: str, uki: str, cmdline: str) -> str:
     if not done:
         raise Fail("limine.conf has no kernel entry for the UKI; not touching it")
     return "\n".join(lines) + "\n"
+
+
+def ensure_unattended_limine(text: str) -> str:
+    """Old Minis ship timeout: 1; a release trial must never park at a menu."""
+    lines = text.splitlines()
+    out = []
+    seen = False
+    for line in lines:
+        if re.match(r"^timeout:\s*", line):
+            out.append("timeout: 0")
+            seen = True
+        else:
+            out.append(line)
+    if not seen:
+        out.insert(0, "timeout: 0")
+    return "\n".join(out) + ("\n" if text.endswith("\n") or not text else "\n")
 
 
 def with_subvol(cmdline: str, subvol: str, release: Optional[str]) -> str:
@@ -635,9 +1220,14 @@ def load_manifest(directory: Path) -> dict:
         if key not in manifest:
             raise Fail(f"manifest has no {key}")
     roles = {item.get("role"): item for item in manifest["boot"]}
-    for role in ("stage2", "uki"):
-        if role not in roles:
-            raise Fail(f"manifest boot list has no {role}")
+    if "uki" not in roles:
+        raise Fail("manifest boot list has no uki")
+    line = manifest.get("line")  # optional: "studio" | "mini"
+    if line not in (None, "studio", "mini"):
+        raise Fail(f"manifest line {line!r} is not studio or mini")
+    if line != "mini" and "stage2" not in roles:
+        # Studio releases need aura stage2; Mini releases are UKI-only.
+        raise Fail("manifest boot list has no stage2")
     for item in [manifest["root"]] + list(manifest["boot"]):
         name = item.get("file") or item.get("path")
         if not name or name.startswith("/") or ".." in Path(name).parts:
@@ -692,8 +1282,18 @@ def check_files(directory: Path, manifest: dict) -> None:
 def carry_entries(host: Host) -> list[str]:
     path = host.p(CARRY_LIST)
     if not path.is_file():
-        here = Path(__file__).resolve().parent.parent / "share" / "release-carry.list"
-        path = here if here.is_file() else path
+        # pkgs tree: bin/smartroom-release → share/release-carry.list
+        # bootstrap scp: /usr/bin/smartroom-release + /usr/share/smartroomos/...
+        # agent scp of just the binary: look beside the file too
+        here = Path(__file__).resolve()
+        for candidate in (
+            here.parent.parent / "share" / "release-carry.list",
+            here.parent / "release-carry.list",
+            Path("/usr/share/smartroomos/release-carry.list"),
+        ):
+            if candidate.is_file():
+                path = candidate
+                break
     if not path.is_file():
         raise Fail(f"carry list {CARRY_LIST} is missing")
     entries = []
@@ -704,6 +1304,130 @@ def carry_entries(host: Host) -> list[str]:
                 raise Fail(f"bad carry list entry {line!r}")
             entries.append(line)
     return entries
+
+
+def _dir_nbytes(path: Path) -> int:
+    total = 0
+    if not path.exists():
+        return 0
+    for root, _dirs, files in os.walk(path):
+        for name in files:
+            try:
+                total += (Path(root) / name).stat().st_size
+            except OSError:
+                pass
+    return total
+
+
+def _clear_archive_content_keep_manifest(archive: Path) -> None:
+    """Remove archive payload files but keep manifest.json at the archive root."""
+    manifest = archive / "manifest.json"
+    saved = None
+    if manifest.is_file():
+        with contextlib.suppress(OSError):
+            saved = manifest.read_bytes()
+    for root, dirs, files in os.walk(archive, topdown=False):
+        for name in files:
+            p = Path(root) / name
+            if p == manifest:
+                continue
+            with contextlib.suppress(OSError):
+                p.unlink()
+        for name in dirs:
+            with contextlib.suppress(OSError):
+                (Path(root) / name).rmdir()
+    if saved is not None:
+        write_atomic(manifest, saved, mode=0o644)
+
+
+def prune_carried_drift_archive(
+    target_smartroomos: Path,
+    max_bytes: int = DRIFT_ARCHIVE_CARRY_MAX,
+) -> list[dict]:
+    """Enforce a total size budget on a carried drift-archive.
+
+    Newest archives that fit are kept intact. For each archive whose content
+    is dropped: keep manifest.json and return a content_pruned record. Callers
+    mark hand-changes-pending.json / status.json so nothing is silent.
+    """
+    arch = target_smartroomos / "drift-archive"
+    if not arch.is_dir():
+        return []
+    entries: list[tuple[float, Path, int]] = []
+    for child in arch.iterdir():
+        if not child.is_dir():
+            continue
+        try:
+            mtime = child.stat().st_mtime
+        except OSError:
+            mtime = 0.0
+        entries.append((mtime, child, _dir_nbytes(child)))
+    entries.sort(key=lambda t: t[0], reverse=True)
+    kept = 0
+    pruned: list[dict] = []
+    reason = f"carry_size_budget:{max_bytes}"
+    for _mtime, child, size in entries:
+        if size <= 0 or kept + size <= max_bytes:
+            kept += size
+            continue
+        _clear_archive_content_keep_manifest(child)
+        pruned.append({"id": child.name, "reason": reason, "size": size})
+    return pruned
+
+
+def mark_content_pruned(target_smartroomos: Path, pruned: list[dict]) -> None:
+    """Record content_pruned on hand-changes-pending.json and status.json."""
+    if not pruned:
+        return
+    by_id = {p["id"]: p for p in pruned if p.get("id")}
+    pending_path = target_smartroomos / "integrity" / "hand-changes-pending.json"
+    if pending_path.is_file():
+        try:
+            doc = json.loads(pending_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            doc = None
+        if isinstance(doc, dict):
+            for a in doc.get("archives") or []:
+                if not isinstance(a, dict):
+                    continue
+                info = by_id.get(a.get("id"))
+                if not info:
+                    continue
+                a["content_pruned"] = True
+                a["content_pruned_reason"] = info["reason"]
+            with contextlib.suppress(OSError):
+                write_atomic(
+                    pending_path,
+                    (json.dumps(doc, indent=2, sort_keys=True) + "\n").encode(),
+                    mode=pending_path.stat().st_mode & 0o7777,
+                )
+    status_path = target_smartroomos / "integrity" / "status.json"
+    if status_path.is_file():
+        try:
+            st = json.loads(status_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            st = None
+        if isinstance(st, dict):
+            h = st.get("hand_changes_pending")
+            if isinstance(h, dict):
+                info = by_id.get(h.get("archive_id"))
+                if info:
+                    h["content_pruned"] = True
+                    h["content_pruned_reason"] = info["reason"]
+            # Also stamp any pruned ids so agents reading status see the reason.
+            st.setdefault("drift_archive_pruned", [])
+            if isinstance(st["drift_archive_pruned"], list):
+                for p in pruned:
+                    st["drift_archive_pruned"].append({
+                        "id": p["id"], "content_pruned": True,
+                        "content_pruned_reason": p["reason"],
+                    })
+            with contextlib.suppress(OSError):
+                write_atomic(
+                    status_path,
+                    (json.dumps(st, indent=2, sort_keys=True) + "\n").encode(),
+                    mode=status_path.stat().st_mode & 0o7777,
+                )
 
 
 def carry_into(host: Host, new_root: Path) -> list[str]:
@@ -724,6 +1448,13 @@ def carry_into(host: Host, new_root: Path) -> list[str]:
             elif target.is_dir():
                 shutil.rmtree(target)
             host.run(["cp", "-a", "--no-target-directory", str(source), str(target)])
+            # Carry drift-archive (banner + content Lucas requires). Cap total
+            # size so nested multi-GB build leftovers cannot ENOSPC the Mini.
+            if str(rel) == "var/lib/smartroomos" or str(rel).endswith("var/lib/smartroomos"):
+                pruned = prune_carried_drift_archive(
+                    target, max_bytes=DRIFT_ARCHIVE_CARRY_MAX,
+                )
+                mark_content_pruned(target, pruned)
             copied.append("/" + str(rel))
     return copied
 
@@ -780,6 +1511,298 @@ def fix_root_files(host: Host, new_root: Path, subvol: str, release: str) -> Non
     info = new_root / "usr/share/smartroomos"
     info.mkdir(parents=True, exist_ok=True)
     write_atomic(info / "release-id", (release + "\n").encode(), mode=0o644)
+    # Nested .snapshots so snapper works the first time this root is booted
+    # (per-root nested subvolume; see docs/disk-drift.md).
+    ensure_nested_snapshots(host, new_root)
+    # Put the SmartRoom release signing key into pacman's keyring so
+    # `pacman -Q` stops asking to import it on rooms that carried an older gnupg.
+    import_release_pacman_key(host, new_root)
+    # Precompile our Python so the live room never writes __pycache__ at runtime
+    # (a planted .pyc must still show as drift; do not IGNORE __pycache__).
+    precompile_smartroom_python(new_root)
+
+
+def ensure_nested_snapshots(host: Host, root: Path) -> None:
+    """Create root/.snapshots as a btrfs subvolume when missing."""
+    snap = root / ".snapshots"
+    if snap.exists():
+        return
+    if host.prefix:
+        snap.mkdir(parents=True, exist_ok=True)
+        return
+    done = host.run(["btrfs", "subvolume", "create", str(snap)], check=False)
+    if done.returncode != 0:
+        snap.mkdir(parents=True, exist_ok=True)
+
+
+def import_release_pacman_key(host: Host, root: Path) -> None:
+    """pacman-key --add + --lsign-key for /usr/share/smartroomos/release-keyring.gpg.
+
+    Runs after carry_into (gnupg is carried from the old room) during stage, and
+    again at promote on the live root so a room staged by an older
+    smartroom-release still stops asking to import the key.
+    """
+    keyring = root / "usr/share/smartroomos/release-keyring.gpg"
+    gnupg = root / "etc/pacman.d/gnupg"
+    if not keyring.is_file():
+        return
+    # Fingerprint of the SmartRoom package signing key (studio-build).
+    fpr = "26436A50BDD17118770DE9185FDA1532DC448891"
+    if host.prefix:
+        # Tests: record that we would import; do not need a real keyring.
+        stamp = root / "var/lib/smartroomos/release-key-imported"
+        stamp.parent.mkdir(parents=True, exist_ok=True)
+        stamp.write_text(fpr + "\n")
+        return
+    if not gnupg.is_dir():
+        return
+    # GNUPGHOME must point at the target keyring; otherwise a host agent can
+    # leave the carried pubring untouched (seen on the home Studio trial).
+    env_add = {"GNUPGHOME": str(gnupg)}
+    host.run(
+        ["pacman-key", "--gpgdir", str(gnupg), "--add", str(keyring)],
+        check=False, env=env_add,
+    )
+    host.run(
+        ["pacman-key", "--gpgdir", str(gnupg), "--lsign-key", fpr],
+        check=False, env=env_add,
+    )
+
+
+def precompile_smartroom_python(root: Path) -> None:
+    """Write __pycache__ for our shipped Python so runtime imports create no new .pyc."""
+    import compileall
+    targets = [
+        root / "usr/local/lib/smartroomos",
+        root / "usr/local/sbin",
+        root / "usr/local/bin",
+        root / "usr/bin",
+    ]
+    for path in targets:
+        if path.is_dir():
+            compileall.compile_dir(str(path), quiet=1, force=False, legacy=False)
+        elif path.is_file() and path.suffix == ".py":
+            compileall.compile_file(str(path), quiet=1, force=False)
+
+
+def _set_limine_snapper_root_paths(text: str, subvol: str) -> str:
+    """Point limine-snapper-sync at the live release subvol (@ or @r-<id>).
+
+    Without this, after the first promote limine-snapper-sync refuses to run
+    (`ROOT_SUBVOLUME_PATH="/@" does not match .../@r-...`) and pacman snapshot
+    boot entries stop updating. As-installed stays excluded via type=post.
+    """
+    root = "/" + subvol.lstrip("/")
+    snaps = f"{root}/.snapshots"
+    for key, value in (
+        ("ROOT_SUBVOLUME_PATH", f'"{root}"'),
+        ("ROOT_SNAPSHOTS_PATH", f'"{snaps}"'),
+    ):
+        if re.search(rf"^{key}=", text, flags=re.M):
+            text = re.sub(rf"^{key}=.*$", f"{key}={value}", text, flags=re.M)
+        else:
+            text = text.rstrip() + f"\n{key}={value}\n"
+    return text
+
+
+def finalize_promoted_root(host: Host, release: str, subvol: str) -> None:
+    """Last root edits before the as-installed snapshot (WS13b).
+
+    Re-normalize /etc/default/limine to the configured cmdline (no trial-only
+    params) so the snapshot matches what promote leaves on disk. Also point
+    limine-snapper-sync at this release's subvol so it keeps working on @r-*.
+    """
+    path = host.p("/etc/default/limine")
+    if path.is_file():
+        text = path.read_text()
+
+        def one(match: re.Match[str]) -> str:
+            rel = None if release == INSTALLED else release
+            return match.group(1) + with_subvol(match.group(2), subvol, rel) + match.group(3)
+
+        new = re.sub(r'^(KERNEL_CMDLINE\[[^\]]*\]=")([^"]*)(")', one, text, flags=re.M)
+        new = _set_limine_snapper_root_paths(new, subvol)
+        if new != text:
+            write_atomic(path, new.encode(), mode=path.stat().st_mode & 0o7777)
+    sync_conf = host.p("/etc/limine-snapper-sync.conf")
+    if sync_conf.is_file():
+        text = sync_conf.read_text()
+        new = _set_limine_snapper_root_paths(text, subvol)
+        if new != text:
+            write_atomic(sync_conf, new.encode(), mode=sync_conf.stat().st_mode & 0o7777)
+    precompile_smartroom_python(host.p("/"))
+
+
+def exclude_as_installed_from_limine_sync(host: Host, *snap_nums: int) -> None:
+    """Drop ESP UKI copies limine-snapper-sync made for as-installed snaps.
+
+    As-installed is a drift reference, not a boot target: created as snapper
+    type=post so EXCLUDE_SNAPSHOT_TYPES=post skips it. The paired pre (needed
+    because snapper rejects orphan --pre-number 0) can still get a UKI copy;
+    limine-snapper-remove cleans pre and any post copy that still landed.
+    """
+    if host.prefix:
+        return
+    for snap_num in snap_nums:
+        if snap_num is None or snap_num < 1:
+            continue
+        host.run(["limine-snapper-remove", str(snap_num)], check=False)
+
+
+def _snapper_print_number(done) -> Optional[int]:
+    if done is None or done.returncode != 0:
+        return None
+    try:
+        return int(done.stdout.decode().strip().splitlines()[-1])
+    except (ValueError, IndexError, AttributeError):
+        return None
+
+
+def take_as_installed_snapshot(host: Host, release: str) -> Optional[int]:
+    """Read-only snapper snapshot of the running root after promote. No cleanup algorithm.
+
+    Type=post so limine-snapper-sync's EXCLUDE_SNAPSHOT_TYPES=post skips the
+    ESP UKI copy (as-installed is a reference, not a boot target). Snapper
+    requires a real pre for every post; we pair a throwaway pre, then remove
+    any ESP UKI the pre may have received.
+    """
+    if host.prefix:
+        # Scratch tests: create a marker file the integrity tool can find.
+        marker = host.p("/var/lib/smartroomos/integrity/as-installed.json")
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(json.dumps({
+            "snapshot": 1, "uuid": None, "kind": "as-installed",
+            "path": str(host.p("/")),
+            "description": f"release {release} as installed",
+            "note": None,
+        }) + "\n")
+        return 1
+    repair = host.p("/usr/local/sbin/smartroomos-snapper-repair")
+    if repair.is_file():
+        host.run([str(repair)], check=False)
+    desc = f"release {release} as installed"
+    userdata = f"release={release},purpose=as-installed"
+    pre_desc = f"as-installed pair for {release}"
+    pre_done = host.run([
+        "snapper", "--no-dbus", "-c", "root", "create",
+        "--type", "pre", "--read-only",
+        "--description", pre_desc,
+        "--cleanup-algorithm", "",
+        "--print-number",
+    ], check=False)
+    pre_num = _snapper_print_number(pre_done)
+    num: Optional[int] = None
+    if pre_num is not None:
+        done = host.run([
+            "snapper", "--no-dbus", "-c", "root", "create",
+            "--type", "post", "--pre-number", str(pre_num), "--read-only",
+            "--description", desc,
+            "--cleanup-algorithm", "",
+            "--userdata", userdata,
+            "--print-number",
+        ], check=False)
+        num = _snapper_print_number(done)
+    if num is None:
+        # Older snapper or pre create failed: fall back to single, then remove
+        # any ESP copy (EXCLUDE_SNAPSHOT_TYPES=post does not apply to single).
+        done = host.run([
+            "snapper", "--no-dbus", "-c", "root", "create",
+            "--type", "single", "--read-only",
+            "--description", desc,
+            "--cleanup-algorithm", "",
+            "--userdata", userdata,
+            "--print-number",
+        ], check=False)
+        num = _snapper_print_number(done)
+        pre_num = None
+    if num is None:
+        return None
+    exclude_as_installed_from_limine_sync(host, *([pre_num] if pre_num else []), num)
+    marker = host.p("/var/lib/smartroomos/integrity/as-installed.json")
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    path = f"/.snapshots/{num}/snapshot"
+    write_atomic(marker, (json.dumps({
+        "snapshot": num, "uuid": None, "kind": "as-installed", "path": path,
+        "description": desc, "note": None,
+        "pre_snapshot": pre_num,
+    }, indent=2) + "\n").encode(), mode=0o644)
+    return num
+
+
+def take_as_installed_home_snapshot(host: Host, release: str) -> Optional[int]:
+    """Read-only snapper snapshot of @home at promote (WS13c).
+
+    Lives under /home/.snapshots on the @home subvolume, so it survives when
+    the release root is replaced. Same userdata as the root as-installed.
+    """
+    if host.prefix:
+        marker = host.p("/var/lib/smartroomos/integrity/as-installed-home.json")
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        home = host.p("/home")
+        home.mkdir(parents=True, exist_ok=True)
+        marker.write_text(json.dumps({
+            "snapshot": 1, "uuid": None, "kind": "as-installed",
+            "path": str(home),
+            "description": f"release {release} as installed",
+            "note": None,
+        }) + "\n")
+        return 1
+    if not host.p("/home").is_dir():
+        return None
+    repair = host.p("/usr/local/sbin/smartroomos-snapper-repair")
+    if repair.is_file():
+        host.run([str(repair)], check=False)
+    desc = f"release {release} as installed"
+    userdata = f"release={release},purpose=as-installed"
+    done = host.run([
+        "snapper", "--no-dbus", "-c", "home", "create",
+        "--type", "single", "--read-only",
+        "--description", desc,
+        "--cleanup-algorithm", "",
+        "--userdata", userdata,
+        "--print-number",
+    ], check=False)
+    num = _snapper_print_number(done)
+    if num is None:
+        return None
+    marker = host.p("/var/lib/smartroomos/integrity/as-installed-home.json")
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    path = f"/home/.snapshots/{num}/snapshot"
+    write_atomic(marker, (json.dumps({
+        "snapshot": num, "uuid": None, "kind": "as-installed", "path": path,
+        "description": desc, "note": None,
+    }, indent=2) + "\n").encode(), mode=0o644)
+    return num
+
+
+def archive_outgoing_drift(host: Host, state: dict, new_release: str) -> None:
+    """If the current room has drift, export it before installing a new release.
+
+    Never blocks the update and never re-applies the changes (WS13c).
+    """
+    if host.prefix:
+        # Scratch: call the integrity tool against the fake root when present.
+        tool = host.p("/usr/local/sbin/smartroomos-integrity")
+        if not tool.is_file():
+            return
+        old = (state.get("configured") or {}).get("release") or "unknown"
+        env = os.environ.copy()
+        env["SMARTROOMOS_ROOT"] = str(host.p("/"))
+        # Honour the shebang (python or a test stub shell script).
+        subprocess.run(
+            [str(tool), "archive-outgoing",
+             "--old-release", str(old), "--new-release", str(new_release)],
+            check=False, env=env,
+        )
+        return
+    tool = Path("/usr/local/sbin/smartroomos-integrity")
+    if not tool.is_file():
+        return
+    old = (state.get("configured") or {}).get("release") or "unknown"
+    host.run([
+        str(tool), "archive-outgoing",
+        "--old-release", str(old), "--new-release", str(new_release),
+    ], check=False)
 
 
 def new_root_cmdline(new_root: Path, fallback: str) -> str:
@@ -800,9 +1823,32 @@ def subvol_exists(top: Path, name: str) -> bool:
 
 
 def delete_subvolume(host: Host, top: Path, name: str) -> None:
-    if (top / name).exists():
-        host.run(["btrfs", "property", "set", "-ts", str(top / name), "ro", "false"], check=False)
-        host.run(["btrfs", "subvolume", "delete", "--commit-after", str(top / name)])
+    """Delete a btrfs subvolume, including nested children (e.g. .snapshots).
+
+    WS13 nested `root/.snapshots` under every @r-* so snapper works on release
+    roots. Plain `btrfs subvolume delete` refuses a parent while children
+    remain, so prune left every old @r-* on disk after keep-5 (Mini VM: 10
+    roots with keepGood=5). Use --recursive (btrfs-progs) after clearing ro.
+    """
+    target = top / name
+    if not target.exists():
+        return
+    host.run(["btrfs", "property", "set", "-ts", str(target), "ro", "false"], check=False)
+    # Also clear ro on nested snapper snapshots so --recursive can remove them.
+    listed = host.run(
+        ["btrfs", "subvolume", "list", "-o", str(target)], check=False,
+    ).stdout.decode(errors="replace")
+    for line in listed.splitlines():
+        parts = line.rsplit(" path ", 1)
+        if len(parts) != 2:
+            continue
+        rel = parts[1].strip()
+        path = top / rel if not rel.startswith(name) else top / rel
+        if not str(path).startswith(str(target)):
+            path = target / rel
+        if path.exists() and path != target:
+            host.run(["btrfs", "property", "set", "-ts", str(path), "ro", "false"], check=False)
+    host.run(["btrfs", "subvolume", "delete", "--recursive", "--commit-after", str(target)])
 
 
 def receive_root(host: Host, top: Path, directory: Path, manifest: dict, subvol: str) -> None:
@@ -840,12 +1886,37 @@ def receive_root(host: Host, top: Path, directory: Path, manifest: dict, subvol:
 # preconditions
 
 
-def space_check(host: Host, manifest: dict, esp: Path) -> None:
-    need = sum(item["size"] for item in manifest["boot"] if "size" in item)
-    free = shutil.disk_usage(esp).free
-    if free < need + ESP_MARGIN:
-        raise Fail(f"the ESP has {free // 2**20} MiB free; this release needs {need // 2**20} MiB "
-                   f"and {ESP_MARGIN // 2**20} MiB spare", "esp-full")
+def space_check(host: Host, manifest: dict, esp: Path, state: Optional[dict] = None) -> dict:
+    """Refuse before anything irreversible when the ESP cannot fit trial + promote reserve.
+
+    Worst case: trial files now, previous set at promote, one .new temp, plus ESP_MARGIN.
+    Call after esp_offload_non_essential so history UKI copies are already off the ESP.
+    """
+    roles = {item["role"]: item for item in manifest["boot"]}
+    uki_size = int(roles.get("uki", {}).get("size") or 0)
+    boot_size = int(roles.get("stage2", {}).get("size") or 0)
+    # Prefer live configured sizes when present (promote copies those bytes).
+    layout = host.layout()
+    conf_uki = esp / layout.configured_uki
+    conf_boot = esp / layout.configured_boot if layout.configured_boot else None
+    if conf_uki.is_file():
+        uki_size = max(uki_size, file_size(conf_uki))
+    if conf_boot is not None and conf_boot.is_file():
+        boot_size = max(boot_size, file_size(conf_boot))
+    budget = esp_budget_bytes(host, uki_size, boot_size)
+    free = esp_free_bytes(esp)
+    budget["free"] = free
+    budget["limine_history"] = limine_history_bytes(esp)
+    if free < budget["need"]:
+        raise Fail(
+            f"the ESP has {free // 2**20} MiB free; stage+promote needs "
+            f"{budget['need'] // 2**20} MiB "
+            f"(trial {budget['trial'] // 2**20} + previous reserve "
+            f"{budget['previous_reserve'] // 2**20} + "
+            f"{budget['spare'] // 2**20} MiB spare for .new)",
+            "esp-full",
+        )
+    return budget
 
 
 def health_now(host: Host) -> dict:
@@ -866,17 +1937,34 @@ def healthy_sample(host: Host, baseline: dict) -> tuple[int, int, int]:
 def release_rows(state: dict) -> list[dict]:
     rows = []
     conf = state.get("configured") or {}
-    prev = state.get("previous") or {}
-    for key, entry in (("configured", conf), ("previous", prev)):
-        if entry and entry.get("release"):
-            rows.append({
-                "number": entry.get("number", 0),
-                "release": entry["release"],
-                "role": key,
-                "root": entry.get("root"),
-                "bootable": bool(entry.get("boot")),
-                "current": False,
-            })
+    seen = set()
+    if conf and conf.get("release"):
+        rows.append({
+            "number": conf.get("number", 0),
+            "release": conf["release"],
+            "role": "configured",
+            "root": conf.get("root"),
+            "bootable": bool(conf.get("uki") or conf.get("boot")),
+            "current": False,
+        })
+        seen.add(conf["release"])
+    history = list(state.get("history") or [])
+    prev = state.get("previous")
+    if prev and prev.get("release") and prev["release"] not in seen:
+        history = [prev] + [h for h in history if h.get("release") != prev.get("release")]
+    for i, entry in enumerate(history):
+        if not entry or not entry.get("release") or entry["release"] in seen:
+            continue
+        role = "previous" if i == 0 else "history"
+        rows.append({
+            "number": entry.get("number", 0),
+            "release": entry["release"],
+            "role": role,
+            "root": entry.get("root"),
+            "bootable": bool(entry.get("uki") or entry.get("boot")),
+            "current": False,
+        })
+        seen.add(entry["release"])
     return rows
 
 
@@ -886,29 +1974,64 @@ def status_doc(host: Host, state: dict) -> dict:
     trial_state = state.get("trial")
     conf = state.get("configured") or {}
     prev = state.get("previous")
-    on_trial = bool(host.dt_trial())
+    layout = host.layout()
+    # Studio: aurora,trial stays in the device tree until reboot. After a
+    # committed promote on this boot, trust state (trial is None) so status
+    # does not keep saying "trial boot" (WS13b / same class as trial_pending).
+    if layout.uses_aura:
+        on_trial = bool(host.dt_trial()) and bool(trial_state)
+        if trial_state is None and (state.get("last_result") or {}).get("result") == "committed":
+            on_trial = False
+    else:
+        on_trial = (
+            bool(trial_state) and trial_state.get("phase") in ("booting", "armed")
+            and root == trial_state.get("root"))
+        # Prefer the cmdline / root fact for Mini once userspace is up.
+        if trial_state and root == trial_state.get("root") and release == trial_state.get("release"):
+            on_trial = True
     last = state.get("last_result")
     number = 0
-    for entry in (conf, prev or {}):
+    for entry in [conf, prev or {}] + list(state.get("history") or []):
         if entry and entry.get("release") == release:
             number = entry.get("number", 0)
     esp = host.esp()
     used = None
+    free = None
+    total = None
     with contextlib.suppress(OSError):
         usage = shutil.disk_usage(esp)
+        total = usage.total
+        free = usage.free
         used = round(100 * (usage.total - usage.free) / usage.total) if usage.total else None
     rows = release_rows(state)
     for row in rows:
         row["current"] = row["release"] == release
+        # bootable if ESP slots or btrfs boot-store has the UKI
+        if not row["bootable"] and row.get("release"):
+            row["bootable"] = boot_store_has(host, row["release"])
+        elif row.get("release"):
+            row["bootable"] = bool(row["bootable"]) or boot_store_has(host, row["release"])
+    budget = state.get("esp_budget")
     doc = {
         "available": True,
+        "line": state.get("line") or layout.line,
+        "backend": "smartroom-release",
+        "keepGood": KEEP_GOOD,
         "running": {"root": "live", "number": number, "entry": root, "release": release, "trial": on_trial},
         "fallback": None,
         "trial": None,
         "firmware": release,
         "count": len(rows),
         "protected": 0,
-        "esp": {"usedPercent": used, "limitPercent": 90},
+        "esp": {
+            "usedPercent": used,
+            "limitPercent": 90,
+            "freeBytes": free,
+            "totalBytes": total,
+            "bootStore": BOOT_STORE,
+            "limineHistoryBytes": limine_history_bytes(esp),
+            "budget": budget,
+        },
         "release": {
             "running": release,
             "configured": conf.get("release"),
@@ -919,8 +2042,9 @@ def status_doc(host: Host, state: dict) -> dict:
         "events": state.get("events", [])[-20:],
     }
     if trial_state:
+        layers = ["limine", "aura"] if layout.uses_aura else ["limine", "watchdog"]
         doc["trial"] = {"kind": trial_state.get("kind", "update"), "armed": trial_state.get("armed_at"),
-                        "layers": ["limine", "aura"], "fallbackSnapshot": conf.get("number"),
+                        "layers": layers, "fallbackSnapshot": conf.get("number"),
                         "target": trial_state.get("number"), "phase": trial_state.get("phase")}
     if last and last.get("result") == "rolled-back":
         doc["fallback"] = {"of": last.get("number"), "since": last.get("at"), "reason": last.get("reason")}
@@ -966,27 +2090,57 @@ def require_root(host: Host) -> None:
         raise Fail("run as root")
 
 
-def stage_release(host: Host, state: dict, directory: Path, unsigned: bool, kind: str = "update") -> dict:
+def stage_release(host: Host, state: dict, directory: Path, unsigned: bool, kind: str = "update",
+                  require_healthy: bool = True) -> dict:
+    layout = host.layout()
+    state["line"] = layout.line
     manifest = load_manifest(directory)
     release = manifest["id"]
+    mline = manifest.get("line")
+    if mline and mline != layout.line:
+        raise Fail(f"this release is for {mline}, this room is {layout.line}", "wrong-line")
+    if layout.line == "studio" and "stage2" not in {i.get("role") for i in manifest["boot"]}:
+        raise Fail("a Studio release needs a stage2 boot file")
+    if layout.line == "mini" and "stage2" in {i.get("role") for i in manifest["boot"]} and mline == "studio":
+        raise Fail("refusing a Studio release on a Mini", "wrong-line")
     signed = verify_signature(host, directory, unsigned)
     if state.get("trial") and state["trial"].get("phase") in ("armed", "booting", "promoting"):
         raise Fail("a trial boot is already pending", "trial-pending")
     if state.get("promoting"):
         raise Fail("a promotion is unfinished; the health service finishes it at boot", "trial-pending")
-    if release in (state["configured"].get("release"), (state.get("previous") or {}).get("release")):
+    known = {state["configured"].get("release")}
+    known |= {h.get("release") for h in (state.get("history") or []) if h}
+    if (state.get("previous") or {}).get("release"):
+        known.add(state["previous"]["release"])
+    if release in known and kind != "migrate":
         raise Fail(f"release {release} is already on this room", "not-found")
     esp = host.esp()
-    now_ok = healthy_sample(host, {"displays": 0})
-    if now_ok[0] == 0 or now_ok[1] == 0:
-        raise Fail("this room is not healthy now (Room Controller or network down); "
-                   "an update would look like a failed one. Fix that first.", "unhealthy")
+    if require_healthy:
+        now_ok = healthy_sample(host, {"displays": 0})
+        if now_ok[0] == 0 or now_ok[1] == 0:
+            raise Fail("this room is not healthy now (Room Controller or network down); "
+                       "an update would look like a failed one. Fix that first.", "unhealthy")
     baseline = {"displays": host.displays()}
     check_files(directory, manifest)
-    space_check(host, manifest, esp)
     roles = {item["role"]: item for item in manifest["boot"]}
+    # WS14: move legacy ESP UKI store + previous fallback off the ESP before budgeting.
+    esp_offload_non_essential(host, state, for_trial=True)
+    try:
+        budget = space_check(host, manifest, esp, state)
+    except Fail as exc:
+        if exc.code == "esp-full":
+            record_result(host, state, "refused", reason="esp-full", message=exc.message)
+            event(host, state, "stage-refused", reason="esp-full", message=exc.message)
+            # Put the one fallback (previous) back on the ESP when we are not staging.
+            with contextlib.suppress(Fail, OSError):
+                restore_previous_to_esp(host, state)
+            save_state(host, state)
+        raise
     subvol = subvol_name(release)
     cmdline = None
+    # WS13c: save hand changes from the outgoing root before we replace it.
+    # Never blocks; never re-applies. Banner stays until ack.
+    archive_outgoing_drift(host, state, release)
     prune(host, state)                 # roots left by failed trials are dead weight; free their space first
     with host.top() as top:
         if subvol_exists(top, subvol):
@@ -1001,53 +2155,99 @@ def stage_release(host: Host, state: dict, directory: Path, unsigned: bool, kind
         cmdline = new_root_cmdline(new_root, found[1])
         require_zero_touch(cmdline)
         fix_root_files(host, new_root, subvol, release)
-    # boot files, beside the configured ones
-    copy_atomic(directory / roles["stage2"]["path"], esp / TRIAL_BOOT, roles["stage2"]["sha256"])
-    copy_atomic(directory / roles["uki"]["path"], esp / TRIAL_UKI, roles["uki"]["sha256"])
+    # boot files, beside the configured ones (ESP); durable copy on btrfs boot-store.
+    trial_uki = layout.trial_uki
+    trial_boot = layout.trial_boot
+    stage2_src = directory / roles["stage2"]["path"] if layout.uses_aura else None
+    uki_src = directory / roles["uki"]["path"]
+    if layout.uses_aura and stage2_src is not None:
+        copy_atomic(stage2_src, esp / trial_boot, roles["stage2"]["sha256"])
+    copy_atomic(uki_src, esp / trial_uki, roles["uki"]["sha256"])
+    boot_store_put(
+        host, release, uki_src, stage2_src if layout.uses_aura else None,
+        roles["uki"]["sha256"], roles["stage2"]["sha256"] if layout.uses_aura else None,
+    )
     trial_cmd = trial_cmdline(cmdline, subvol, release)
-    write_atomic(esp / "limine.conf", with_trial_entry(cfg_text, release, TRIAL_UKI, trial_cmd).encode(), 0o700)
+    cfg_text = ensure_unattended_limine(with_trial_entry(cfg_text, release, trial_uki, trial_cmd))
+    write_atomic(esp / "limine.conf", cfg_text.encode(), 0o700)
     state["counter"] = state.get("counter", 0) + 1
+    state["esp_budget"] = budget
     state["trial"] = {
         "kind": kind, "release": release, "number": state["counter"], "root": subvol,
-        "boot": TRIAL_BOOT, "uki": TRIAL_UKI, "cmdline": with_subvol(cmdline, subvol, release),
+        "boot": trial_boot, "uki": trial_uki, "cmdline": with_subvol(cmdline, subvol, release),
         "phase": "staged", "staged_at": host.stamp(), "baseline": baseline, "signed": signed,
-        "carried": len(carried), "reached": False,
+        "carried": len(carried), "reached": False, "line": layout.line,
     }
-    event(host, state, "started", release=release, previous=state["configured"].get("release"))
+    event(host, state, "started", release=release, previous=state["configured"].get("release"), line=layout.line)
     event(host, state, "files-checked", result="ok", release=release, signed=signed)
     save_state(host, state)
     return state
 
 
-def promote_previous_as_trial(host: Host, state: dict) -> dict:
-    """A rollback is a trial of the previous release, whose files are on disk."""
-    prev = state.get("previous")
+def find_release_entry(state: dict, number: Optional[int] = None, release: Optional[str] = None) -> dict:
+    """Locate a kept release by number or id (configured, previous, or history)."""
+    conf = state.get("configured") or {}
+    candidates = []
+    if conf.get("release"):
+        candidates.append(conf)
+    if state.get("previous"):
+        candidates.append(state["previous"])
+    candidates.extend(state.get("history") or [])
+    for entry in candidates:
+        if not entry:
+            continue
+        if number is not None and entry.get("number") == number:
+            return entry
+        if release is not None and entry.get("release") == release:
+            return entry
+    raise Fail(f"release {'number ' + str(number) if number is not None else release} is not on this room", "not-found")
+
+
+def promote_previous_as_trial(host: Host, state: dict, entry: Optional[dict] = None) -> dict:
+    """A rollback is a trial of a kept release whose files are on disk (ESP or boot-store)."""
+    layout = host.layout()
+    prev = entry or state.get("previous")
     if not prev:
         raise Fail("there is no previous release on this room", "not-found")
     esp = host.esp()
-    if not (esp / prev["uki"]).is_file() or not (esp / prev["boot"]).is_file():
-        raise Fail("the previous release's boot files are gone", "not-found")
+    # Ensure durable store is populated from any legacy ESP copies first.
+    esp_offload_non_essential(host, state, for_trial=True)
+    uki_src, boot_src = resolve_boot_files(host, prev, state=state)
     with host.top() as top:
         if prev["root"] and not subvol_exists(top, prev["root"]):
             raise Fail(f"the previous root {prev['root']} is gone", "not-found")
+    # Budget: trial files + promote previous reserve (same as an update).
+    uki_sz = file_size(uki_src)
+    boot_sz = file_size(boot_src) if boot_src else 0
+    budget = esp_budget_bytes(host, uki_sz, boot_sz)
+    free = esp_free_bytes(esp)
+    if free < budget["need"]:
+        raise Fail(
+            f"the ESP has {free // 2**20} MiB free; rollback trial needs "
+            f"{budget['need'] // 2**20} MiB reserved",
+            "esp-full",
+        )
     cfg_text = (esp / "limine.conf").read_text()
     found = kernel_entry(cfg_text)
     if not found:
         raise Fail("limine.conf has no kernel entry")
     # Its own files keep their names; the trial files are copies so mark-good is the same steps.
-    copy_atomic(esp / prev["boot"], esp / TRIAL_BOOT)
-    copy_atomic(esp / prev["uki"], esp / TRIAL_UKI)
+    if layout.uses_aura and boot_src is not None:
+        copy_atomic(boot_src, esp / layout.trial_boot)
+    copy_atomic(uki_src, esp / layout.trial_uki)
     cmdline = with_subvol(found[1], prev["root"] or "@", None if prev["release"] == INSTALLED else prev["release"])
     require_zero_touch(cmdline)
     state["counter"] = state.get("counter", 0) + 1
+    state["esp_budget"] = budget
     state["trial"] = {
         "kind": "rollback", "release": prev["release"], "number": prev.get("number", 0), "root": prev["root"],
-        "boot": TRIAL_BOOT, "uki": TRIAL_UKI, "cmdline": cmdline,
+        "boot": layout.trial_boot, "uki": layout.trial_uki, "cmdline": cmdline,
         "phase": "staged", "staged_at": host.stamp(), "baseline": {"displays": host.displays()},
-        "signed": None, "carried": 0, "reached": False,
+        "signed": None, "carried": 0, "reached": False, "line": layout.line,
     }
     write_atomic(esp / "limine.conf",
-                 with_trial_entry(cfg_text, prev["release"], TRIAL_UKI, cmdline + " " + " ".join(TRIAL_ONLY_PARAMS)).encode(), 0o700)
+                 with_trial_entry(cfg_text, prev["release"], layout.trial_uki,
+                                  cmdline + " " + " ".join(TRIAL_ONLY_PARAMS)).encode(), 0o700)
     event(host, state, "started", release=prev["release"], previous=state["configured"].get("release"), kind="rollback")
     save_state(host, state)
     return state
@@ -1057,38 +2257,51 @@ def arm_trial(host: Host, state: dict) -> dict:
     trial = state.get("trial")
     if not trial or trial.get("phase") != "staged":
         raise Fail("nothing is staged", "not-found")
+    layout = host.layout()
     esp = host.esp()
     # the files must still check out, right before they can be booted
-    for rel in (trial["boot"], trial["uki"]):
+    need = [trial["uki"]]
+    if trial.get("boot"):
+        need.append(trial["boot"])
+    for rel in need:
         if not (esp / rel).is_file():
             raise Fail(f"staged file {rel} is missing")
     text = (esp / "limine.conf").read_text()
     if f"/{TRIAL_ENTRY_NAME}" not in text:
         raise Fail("the Limine trial entry is not in limine.conf")
-    # 1. Limine's one-shot, saved to U-Boot's variable file and read back
+    host.ensure_watchdog_module()
+    # 1. Limine's one-shot
     host.set_oneshot(TRIAL_ENTRY_ID)
     host.save_efi_vars()
     if not host.oneshot_saved():
         host.set_oneshot(None)
         with contextlib.suppress(Fail):
             host.save_efi_vars()
-        raise Fail("the Limine one-shot did not reach U-Boot's variable file; nothing is armed")
-    # 2. aura-try last: it is what arms the watchdog and starts the trial boot image
-    write_atomic(esp / MARKER, f"armed\n{trial['boot']}\n".encode(), 0o700)
+        raise Fail("the Limine one-shot did not persist; nothing is armed")
+    # 2. Studio: aura-try last (arms the hardware watchdog and starts the trial image).
+    #    Mini: ESP marker under smartroom-release/ (Limine one-shot is the switch).
+    if layout.uses_aura:
+        write_atomic(esp / MARKER, f"armed\n{trial['boot']}\n".encode(), 0o700)
+        event_path = trial["boot"]
+    else:
+        write_atomic(esp / STATE_DIR / MINI_MARKER, f"armed\n{trial['uki']}\n".encode(), 0o700)
+        event_path = trial["uki"]
     trial["phase"] = "armed"
     trial["armed_at"] = host.stamp()
     trial["armed_boot_id"] = host.boot_id()
-    event(host, state, "armed", release=trial["release"], path=trial["boot"])
+    event(host, state, "armed", release=trial["release"], path=event_path, line=layout.line)
     save_state(host, state)
     return state
 
 
 def clear_trial_files(host: Host, state: dict, keep_subvolume: bool = True) -> None:
+    layout = host.layout()
     esp = host.esp()
-    marker = esp / MARKER
-    remove(marker)
-    for rel in (TRIAL_BOOT, TRIAL_UKI):
-        remove(esp / rel)
+    remove(esp / MARKER)
+    remove(esp / STATE_DIR / MINI_MARKER)
+    for rel in (layout.trial_boot, layout.trial_uki, TRIAL_BOOT, TRIAL_UKI):
+        if rel:
+            remove(esp / rel)
     cfg = esp / "limine.conf"
     if cfg.is_file():
         text = cfg.read_text()
@@ -1184,12 +2397,12 @@ def cmd_restore(host: Host, args) -> int:
     """Room Controller contract: snapshots.rollback -> restore N --no-reboot."""
     require_root(host)
     state = load_state(host)
-    prev = state.get("previous") or {}
-    if prev.get("number") != args.number:
-        raise Fail(f"release number {args.number} is not on this room", "not-found")
     if state.get("trial"):
         raise Fail("a trial boot is already pending", "trial-pending")
-    promote_previous_as_trial(host, state)
+    entry = find_release_entry(state, number=args.number)
+    if entry.get("release") == (state.get("configured") or {}).get("release"):
+        raise Fail("that release is already configured", "not-found")
+    promote_previous_as_trial(host, state, entry=entry)
     arm_trial(host, state)
     out = {"accepted": True, "trialId": state["trial"]["armed_at"], "fallbackSnapshot": state["configured"].get("number"),
            "rebootAt": host.stamp()}
@@ -1203,41 +2416,110 @@ def cmd_restore(host: Host, args) -> int:
 # build-release: the producing side, from a room (or later, an image)
 
 
+def _aside_ephemeral_for_build(host: Host, out: Path) -> list[tuple[Path, Path]]:
+    """Park drift archives and leftover local release dirs off the root briefly.
+
+    build-release snapshots the live root; nested prior /root/*release* payloads
+    and /var/lib/smartroomos/drift-archive (which can hold multi-GB
+    root.btrfs.zst copies) would otherwise inflate every later stream and
+    ENOSPC Mini keep-5. Moved aside for the snapshot only, then restored.
+    """
+    moved: list[tuple[Path, Path]] = []
+    aside_root = host.p("/var/lib/smartroomos/build-aside")
+    if aside_root.exists():
+        shutil.rmtree(aside_root, ignore_errors=True)
+    aside_root.mkdir(parents=True, exist_ok=True)
+    out_resolved = out.resolve() if out.exists() else out
+    candidates: list[Path] = []
+    arch = host.p("/var/lib/smartroomos/drift-archive")
+    if arch.is_dir():
+        candidates.append(arch)
+    for parent_name in ("/root", "/home"):
+        root_dir = host.p(parent_name)
+        if not root_dir.is_dir():
+            continue
+        for child in sorted(root_dir.iterdir()):
+            name = child.name
+            if not (name.startswith("ws12-release") or name.startswith("ws13b-rel")
+                    or name.startswith("ws13-rel") or name.endswith("-rel")):
+                continue
+            try:
+                if child.resolve() == out_resolved or out_resolved.is_relative_to(child.resolve()):
+                    continue
+            except (OSError, ValueError):
+                continue
+            candidates.append(child)
+    for i, src in enumerate(candidates):
+        dst = aside_root / f"{i}-{src.name}"
+        try:
+            src.rename(dst)
+            moved.append((src, dst))
+        except OSError:
+            continue
+    return moved
+
+
 def cmd_build_release(host: Host, args) -> int:
     require_root(host)
+    layout = host.layout()
     release = safe_id(args.id)
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     esp = host.esp()
-    src_boot = Path(args.boot_from) if args.boot_from else esp / CONFIGURED_BOOT
-    src_uki = Path(args.uki_from) if args.uki_from else esp / CONFIGURED_UKI
-    with host.top() as top:
-        source = args.source_subvol or running_root(host)
-        snap = top / f"@build-{release}"
-        if snap.exists():
-            delete_subvolume(host, top, snap.name)
-        host.run(["btrfs", "subvolume", "snapshot", "-r", str(top / source), str(snap)])
-        try:
-            stream = out / "root.btrfs.zst"
-            with open(stream, "wb") as sink:
-                send = subprocess.Popen(["btrfs", "send", "-q", str(snap)], stdout=subprocess.PIPE)
-                comp = subprocess.Popen(["zstd", "-T0", "-3", "-c"], stdin=send.stdout, stdout=sink)
-                send.stdout.close()
-                comp.wait()
-                send.wait()
-            if send.returncode != 0 or comp.returncode != 0:
-                raise Fail("btrfs send | zstd failed")
-            used = host.run(["btrfs", "filesystem", "du", "-s", "--raw", str(snap)], check=False).stdout.decode()
-        finally:
-            delete_subvolume(host, top, snap.name)
+    src_uki = Path(args.uki_from) if args.uki_from else esp / layout.configured_uki
+    src_boot = Path(args.boot_from) if args.boot_from else (esp / layout.configured_boot if layout.configured_boot else None)
+    moved = _aside_ephemeral_for_build(host, out)
+    try:
+        with host.top() as top:
+            source = args.source_subvol or running_root(host)
+            snap = top / f"@build-{release}"
+            if snap.exists():
+                delete_subvolume(host, top, snap.name)
+            host.run(["btrfs", "subvolume", "snapshot", "-r", str(top / source), str(snap)])
+            try:
+                stream = out / "root.btrfs.zst"
+                with open(stream, "wb") as sink:
+                    send = subprocess.Popen(["btrfs", "send", "-q", str(snap)], stdout=subprocess.PIPE)
+                    comp = subprocess.Popen(["zstd", "-T0", "-3", "-c"], stdin=send.stdout, stdout=sink)
+                    send.stdout.close()
+                    comp.wait()
+                    send.wait()
+                if send.returncode != 0 or comp.returncode != 0:
+                    raise Fail("btrfs send | zstd failed")
+                used = host.run(["btrfs", "filesystem", "du", "-s", "--raw", str(snap)], check=False).stdout.decode()
+            finally:
+                delete_subvolume(host, top, snap.name)
+    finally:
+        for src, dst in reversed(moved):
+            try:
+                if src.exists():
+                    shutil.rmtree(src, ignore_errors=True)
+                dst.rename(src)
+            except OSError:
+                pass
+        aside_root = host.p("/var/lib/smartroomos/build-aside")
+        shutil.rmtree(aside_root, ignore_errors=True)
     boot = []
-    for role, src, rel in (("stage2", src_boot, "m1n1/boot.bin"), ("uki", src_uki, "EFI/Linux/omarchy_linux-aurora.efi")):
+    if layout.uses_aura:
+        if src_boot is None or not Path(src_boot).is_file():
+            raise Fail("Studio build-release needs the configured stage2 boot file")
+        rel = "m1n1/boot.bin"
         dst = out / rel
         dst.parent.mkdir(parents=True, exist_ok=True)
-        digest = copy_atomic(src, dst)
-        boot.append({"role": role, "path": rel, "sha256": digest, "size": dst.stat().st_size})
+        digest = copy_atomic(Path(src_boot), dst)
+        boot.append({"role": "stage2", "path": rel, "sha256": digest, "size": dst.stat().st_size})
+        uki_rel = "EFI/Linux/omarchy_linux-aurora.efi"
+    else:
+        uki_rel = "EFI/Linux/smartroomos_linux-t2.efi"
+    if not Path(src_uki).is_file():
+        raise Fail(f"build-release: UKI missing at {src_uki}")
+    dst = out / uki_rel
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    digest = copy_atomic(Path(src_uki), dst)
+    boot.append({"role": "uki", "path": uki_rel, "sha256": digest, "size": dst.stat().st_size})
     manifest = {
         "schema": SCHEMA, "id": release, "created": host.stamp(), "parent": args.parent or None,
+        "line": layout.line,
         "root": {"file": "root.btrfs.zst", "sha256": sha256_file(stream), "size": stream.stat().st_size},
         "boot": boot,
     }
@@ -1247,6 +2529,7 @@ def cmd_build_release(host: Host, args) -> int:
                   "--output", str(out / (MANIFEST + ".sig")), str(out / MANIFEST)])
     print(f"release {release} written to {out}")
     return 0
+
 
 
 # --------------------------------------------------------------------------
@@ -1267,12 +2550,31 @@ def finish_failed_trial(host: Host, state: dict, reason: str, **fields: Any) -> 
           to=(state.get("configured") or {}).get("release"), **fields)
     record_result(host, state, "rolled-back", reason=reason, **fields)
     state["trial"] = None
+    state["promoting"] = None
     save_state(host, state)
     clear_trial_files(host, state)
 
 
-def promote(host: Host, state: dict) -> None:
-    """Mark-good: fixed, resumable steps. limine.conf is the one switch."""
+def history_push(state: dict, entry: dict) -> None:
+    """Keep the last KEEP_GOOD good releases (excluding the configured one)."""
+    if not entry or not entry.get("release"):
+        return
+    hist = [h for h in (state.get("history") or []) if h and h.get("release") != entry.get("release")]
+    hist.insert(0, {
+        "release": entry["release"], "number": entry.get("number", 0), "root": entry.get("root"),
+        "uki": entry.get("uki"), "boot": entry.get("boot"),
+    })
+    # Configured + history together are the last KEEP_GOOD good releases.
+    state["history"] = hist[: max(0, KEEP_GOOD - 1)]
+    state["previous"] = state["history"][0] if state["history"] else None
+
+
+def _promote_steps(host: Host, state: dict) -> None:
+    """Mark-good body: fixed, resumable steps. limine.conf is the one switch.
+
+    ESP space for previous was reserved at stage time; durable copies live in boot-store.
+    """
+    layout = host.layout()
     esp = host.esp()
     trial = state["trial"]
     promo = state.get("promoting") or {"step": 0, "release": trial["release"]}
@@ -1280,6 +2582,10 @@ def promote(host: Host, state: dict) -> None:
     if state.get("trial") is None:
         raise Fail("nothing to promote")
     conf = dict(state["configured"])
+    configured_uki = layout.configured_uki
+    configured_boot = layout.configured_boot
+    previous_uki = layout.previous_uki
+    previous_boot = layout.previous_boot
 
     def save(step: int) -> None:
         promo["step"] = step
@@ -1288,31 +2594,49 @@ def promote(host: Host, state: dict) -> None:
     cfg = esp / "limine.conf"
     cmdline = with_subvol(trial["cmdline"], trial["root"] or "@",
                           None if trial["release"] == INSTALLED else trial["release"])
-    if promo["step"] < 1:                      # keep the configured set as the previous one
+    if promo["step"] < 1:                      # keep the configured set as history/previous
         if conf["release"] != trial["release"]:
-            copy_atomic(esp / conf["uki"], esp / PREVIOUS_UKI)
-            copy_atomic(esp / conf["boot"], esp / PREVIOUS_BOOT)
+            # Durable first (btrfs): promote must not depend on ESP store copies.
+            if conf.get("uki") and (esp / conf["uki"]).is_file():
+                boot_path = esp / conf["boot"] if layout.uses_aura and conf.get("boot") and (esp / conf["boot"]).is_file() else None
+                boot_store_put(host, conf["release"], esp / conf["uki"], boot_path)
+                copy_atomic(esp / conf["uki"], esp / previous_uki)
+            if layout.uses_aura and conf.get("boot") and (esp / conf["boot"]).is_file():
+                copy_atomic(esp / conf["boot"], esp / previous_boot)
             promo["old"] = {"release": conf["release"], "number": conf.get("number", 0), "root": conf["root"],
-                            "uki": PREVIOUS_UKI, "boot": PREVIOUS_BOOT}
+                            "uki": previous_uki if (esp / previous_uki).is_file() else conf.get("uki"),
+                            "boot": previous_boot if layout.uses_aura else conf.get("boot", "")}
         save(1)
     if promo["step"] < 2:                      # the switch: configured entry -> trial UKI + new root
         write_atomic(cfg, set_kernel_entry(strip_trial_entry(cfg.read_text()), trial["uki"], cmdline).encode(), 0o700)
         save(2)
-    if promo["step"] < 3:                      # stage 2
-        copy_atomic(esp / trial["boot"], esp / CONFIGURED_BOOT)
+    if promo["step"] < 3:                      # stage 2 (Studio only)
+        if layout.uses_aura and trial.get("boot"):
+            copy_atomic(esp / trial["boot"], esp / configured_boot)
         save(3)
     if promo["step"] < 4:                      # the UKI under its standard name
-        copy_atomic(esp / trial["uki"], esp / CONFIGURED_UKI)
+        copy_atomic(esp / trial["uki"], esp / configured_uki)
         save(4)
     if promo["step"] < 5:                      # the standard name is now the same bytes: use it
-        write_atomic(cfg, set_kernel_entry(cfg.read_text(), CONFIGURED_UKI, cmdline).encode(), 0o700)
+        write_atomic(cfg, set_kernel_entry(cfg.read_text(), configured_uki, cmdline).encode(), 0o700)
         save(5)
     # done: the trial files go, the marker goes, the state names the new configured release
-    old = promo.get("old") or state.get("previous")
+    old = promo.get("old")
     state["configured"] = {"release": trial["release"], "number": trial["number"], "root": trial["root"],
-                           "uki": CONFIGURED_UKI, "boot": CONFIGURED_BOOT}
+                           "uki": configured_uki, "boot": configured_boot}
     if old:
-        state["previous"] = old
+        history_push(state, old)
+    elif state.get("previous"):
+        history_push(state, state["previous"])
+    # Migration: keep the pre-migration @ root recorded until explicitly discarded.
+    if trial.get("kind") == "migrate" and old:
+        state["migration"] = {"old_root": old.get("root"), "old_release": old.get("release"),
+                              "kept_until_confirmed": True, "at": host.stamp()}
+    # Ensure the new configured release is in the boot-store too.
+    if (esp / configured_uki).is_file():
+        boot_path = esp / configured_boot if layout.uses_aura and configured_boot and (esp / configured_boot).is_file() else None
+        with contextlib.suppress(Fail):
+            boot_store_put(host, trial["release"], esp / configured_uki, boot_path)
     event(host, state, "marked-good", release=trial["release"], at_uptime=int(host.uptime()))
     record_result(host, state, "committed")
     state["trial"] = None
@@ -1320,16 +2644,175 @@ def promote(host: Host, state: dict) -> None:
     save_state(host, state)
     clear_trial_files(host, state)
     prune(host, state)
+    # Every promotion edit on the live root must finish BEFORE the as-installed
+    # snapshot (WS13b): limine defaults, pacman key, integrity manifest/store.
+    # Taking the snapshot earlier left /etc/default/limine and the manifest as
+    # permanent drift after every update.
+    conf_now = state["configured"]
+    finalize_promoted_root(host, conf_now["release"], conf_now["root"] or "@")
+    import_release_pacman_key(host, host.p("/"))
     host.record_integrity()
+    # Frozen "as installed" reference for full-disk drift (WS13). No cleanup
+    # algorithm so snapper-cleanup never deletes it; prune of the release root
+    # removes the nested .snapshots with the root. Last step on purpose.
+    take_as_installed_snapshot(host, conf_now["release"])
+    # Home as-installed on @home (survives the next root replace). WS13c.
+    take_as_installed_home_snapshot(host, conf_now["release"])
+
+
+def recover_promote_failure(host: Host, state: dict, exc: Fail) -> None:
+    """Leave the room on a release that boots alone; record promote-failed.
+
+    step < 2: Limine still names the configured UKI — fall back to configured, clear trial.
+    step >= 2: Limine names the trial UKI — keep trial files and finish naming the trial
+    release as configured (bootable via trial paths, then rename when possible).
+    """
+    layout = host.layout()
+    esp = host.esp()
+    trial = state.get("trial") or {}
+    promo = state.get("promoting") or {}
+    step = int(promo.get("step") or 0)
+    reason = exc.message
+    # Free anything we can; never touch limine until we know the target files exist.
+    with contextlib.suppress(Exception):
+        esp_offload_non_essential(host, state, for_trial=False)
+        migrate_esp_uki_store(host, state)
+
+    if step < 2:
+        # Configured files were not switched; fall back cleanly.
+        event(host, state, "promote-failed", step=step, reason=reason, action="fallback-configured")
+        finish_failed_trial(host, state, "promote-failed", step=step, detail=reason)
+        return
+
+    # Limine already points at the trial path + new root. Prefer finishing; if copies
+    # fail, keep limine on the trial UKI and record the trial as configured.
+    cfg = esp / "limine.conf"
+    cmdline = with_subvol(trial.get("cmdline") or "", trial.get("root") or "@",
+                          None if trial.get("release") == INSTALLED else trial.get("release"))
+    configured_uki = layout.configured_uki
+    configured_boot = layout.configured_boot
+    try:
+        if layout.uses_aura and trial.get("boot") and (esp / trial["boot"]).is_file():
+            copy_atomic(esp / trial["boot"], esp / configured_boot)
+        if trial.get("uki") and (esp / trial["uki"]).is_file():
+            copy_atomic(esp / trial["uki"], esp / configured_uki)
+        write_atomic(cfg, set_kernel_entry(strip_trial_entry(cfg.read_text()), configured_uki, cmdline).encode(), 0o700)
+        uki_name, boot_name = configured_uki, configured_boot
+    except Fail:
+        # Stay on trial paths — they boot the new root.
+        if trial.get("uki") and (esp / trial["uki"]).is_file():
+            write_atomic(cfg, set_kernel_entry(strip_trial_entry(cfg.read_text()), trial["uki"], cmdline).encode(), 0o700)
+            uki_name = trial["uki"]
+            boot_name = trial.get("boot") or configured_boot
+        else:
+            # Last resort: previous fallback if present.
+            prev_uki = layout.previous_uki
+            if (esp / prev_uki).is_file():
+                old = promo.get("old") or state.get("previous") or state.get("configured")
+                write_atomic(cfg, set_kernel_entry(strip_trial_entry(cfg.read_text()), prev_uki,
+                             with_subvol(cmdline, (old or {}).get("root") or "@",
+                                         None if (old or {}).get("release") == INSTALLED else (old or {}).get("release"))
+                             ).encode(), 0o700)
+                state["configured"] = {
+                    "release": (old or {}).get("release"), "number": (old or {}).get("number", 0),
+                    "root": (old or {}).get("root"), "uki": prev_uki,
+                    "boot": layout.previous_boot if layout.uses_aura else "",
+                }
+                event(host, state, "promote-failed", step=step, reason=reason, action="fallback-previous")
+                record_result(host, state, "rolled-back", reason="promote-failed", step=step, detail=reason)
+                state["trial"] = None
+                state["promoting"] = None
+                save_state(host, state)
+                clear_trial_files(host, state)
+                return
+            raise
+
+    old = promo.get("old")
+    state["configured"] = {
+        "release": trial.get("release"), "number": trial.get("number", 0), "root": trial.get("root"),
+        "uki": uki_name, "boot": boot_name,
+    }
+    if old:
+        history_push(state, old)
+    event(host, state, "promote-failed", step=step, reason=reason, action="configured-from-trial")
+    record_result(host, state, "committed", reason="promote-failed", step=step, detail=reason)
+    state["trial"] = None
+    state["promoting"] = None
+    save_state(host, state)
+    # Only remove trial files when limine no longer points at them.
+    if uki_name != trial.get("uki"):
+        clear_trial_files(host, state)
+    else:
+        remove(esp / MARKER)
+        remove(esp / STATE_DIR / MINI_MARKER)
+        cfg_text = cfg.read_text()
+        stripped = strip_trial_entry(cfg_text)
+        if stripped != cfg_text:
+            write_atomic(cfg, stripped.encode(), 0o700)
+    prune(host, state)
+
+
+def promote(host: Host, state: dict) -> None:
+    """Mark-good with defined failure: finish or fall back; never half-switched."""
+    if state.get("trial") is None and not state.get("promoting"):
+        raise Fail("nothing to promote")
+    try:
+        # One retry after offloading ESP leftovers (covers the WS13d full-ESP case).
+        try:
+            _promote_steps(host, state)
+        except Fail as first:
+            if first.code == "esp-full" or "esp full" in first.message.lower() \
+                    or "no space" in first.message.lower():
+                esp_offload_non_essential(host, state, for_trial=False)
+                migrate_esp_uki_store(host, state)
+                _promote_steps(host, state)
+            else:
+                raise
+    except Fail as exc:
+        recover_promote_failure(host, state, exc)
+        raise Fail(exc.message, "promote-failed")
 
 
 def prune(host: Host, state: dict) -> None:
-    keep = {(state.get("configured") or {}).get("root"), (state.get("previous") or {}).get("root"), running_root(host)}
+    keep = {(state.get("configured") or {}).get("root"), running_root(host)}
+    if state.get("previous"):
+        keep.add(state["previous"].get("root"))
+    for entry in state.get("history") or []:
+        if entry:
+            keep.add(entry.get("root"))
+    if state.get("trial"):
+        keep.add(state["trial"].get("root"))
+    # Migration: never delete the old @ until confirmed.
+    mig = state.get("migration") or {}
+    if mig.get("kept_until_confirmed") and mig.get("old_root"):
+        keep.add(mig["old_root"])
+    keep.discard(None)
+    keep.discard("")
     with contextlib.suppress(Fail):
         with host.top() as top:
             for child in sorted(top.glob("@r-*")):
                 if child.name not in keep:
                     delete_subvolume(host, top, child.name)
+            # Also allow pruning of unnamed failed receive leftovers only; never delete @ itself here.
+    # Boot files: drop btrfs boot-store and any legacy ESP UKI store copies not kept.
+    keep_ids = keep_release_ids(state)
+    keep_ids.add(INSTALLED)
+    root = boot_store_root(host)
+    if root.is_dir():
+        for child in sorted(root.iterdir()):
+            if child.is_dir() and child.name not in keep_ids and not child.name.startswith("esp-hold-"):
+                shutil.rmtree(child, ignore_errors=True)
+    esp = host.esp()
+    store = esp / STATE_DIR / "uki"
+    if store.is_dir():
+        for f in store.glob("*.efi"):
+            if f.stem not in keep_ids:
+                remove(f)
+    boot_legacy = esp / STATE_DIR / "boot"
+    if boot_legacy.is_dir():
+        for f in boot_legacy.glob("*.bin"):
+            if f.stem not in keep_ids:
+                remove(f)
 
 
 def healthy_window(samples: list[tuple[float, tuple[int, int, int]]], start: float, now: float,
@@ -1386,7 +2869,13 @@ def run_health(host: Host, state: dict) -> int:
         if healthy_window(samples, 0, elapsed, quiet, limit):
             event(host, state, "health-passed", release=trial["release"], seconds=int(elapsed))
             save_state(host, state)
-            promote(host, state)
+            try:
+                promote(host, state)
+            except Fail:
+                # Room is on a bootable release (recover_promote_failure). Do not reboot
+                # into a half-switched ESP; status JSON already has promote-failed.
+                dog.disarm()
+                return 1
             dog.disarm()
             return 0
         if elapsed >= limit:
@@ -1405,10 +2894,16 @@ def run_health(host: Host, state: dict) -> int:
 
 def cmd_health_run(host: Host, args) -> int:
     state = load_state(host)
+    layout = host.layout()
     boot_root = running_root(host)
-    trial_boot = host.dt_trial()
+    trial_boot = host.dt_trial() if layout.uses_aura else None
     if state.get("promoting") and state.get("trial"):
-        promote(host, state)                        # a power cut stopped mark-good half way: finish it
+        try:
+            promote(host, state)                    # a power cut stopped mark-good half way: finish it
+        except Fail as exc:
+            # recover_promote_failure already left a bootable release + status reason
+            event(host, load_state(host), "promote-gave-up", message=exc.message)
+            return 1
         return 0
     trial = state.get("trial")
     if not trial:
@@ -1417,27 +2912,240 @@ def cmd_health_run(host: Host, args) -> int:
         return 0
     if trial.get("armed_boot_id") and trial["armed_boot_id"] == host.boot_id():
         return 0                                    # armed, not rebooted yet
-    marker = host.esp() / MARKER
-    if marker.is_file() and marker.read_bytes().startswith(b"armed\n") and not host.dt_trial():
-        return 0                                    # aura has not taken the marker: not attempted yet
+    if layout.uses_aura:
+        marker = host.esp() / MARKER
+        if marker.is_file() and marker.read_bytes().startswith(b"armed\n") and not host.dt_trial():
+            return 0                                # aura has not taken the marker: not attempted yet
+    else:
+        marker = host.esp() / STATE_DIR / MINI_MARKER
+        # Mini: Limine consumes the one-shot on the trial boot; marker stays "armed"
+        # until we clear it. Presence alone does not mean "not yet attempted".
     configured_root = (state["configured"] or {}).get("root")
-    if boot_root == trial["root"] and trial_boot == trial["boot"]:
-        return run_health(host, state)
-    if boot_root == trial["root"] and trial_boot is None and boot_root != configured_root:
-        finish_failed_trial(host, state, "trial-did-not-start")
-        host.reboot()
-        return 1
-    if boot_root == configured_root:
-        if trial_boot == trial["boot"]:
-            finish_failed_trial(host, state, "trial-incomplete")
+    on_trial_root = boot_root == trial["root"]
+    if layout.uses_aura:
+        if on_trial_root and trial_boot == trial["boot"]:
+            return run_health(host, state)
+        if on_trial_root and trial_boot is None and boot_root != configured_root:
+            finish_failed_trial(host, state, "trial-did-not-start")
+            host.reboot()
+            return 1
+        if boot_root == configured_root:
+            if trial_boot == trial["boot"]:
+                finish_failed_trial(host, state, "trial-incomplete")
+                return 0
+            reason = "lost-after-userspace" if trial.get("reached") else "lost-before-userspace"
+            finish_failed_trial(host, state, reason)
             return 0
+        return 0
+    # Mini: trial = we booted the trial subvolume (one-shot consumed).
+    if on_trial_root:
+        if marker.is_file() and marker.read_bytes().startswith(b"armed\n"):
+            write_atomic(marker, marker.read_bytes().replace(b"armed", b"spent", 1), 0o700)
+        return run_health(host, state)
+    if boot_root == configured_root:
+        reason = "lost-after-userspace" if trial.get("reached") else "lost-before-userspace"
+        finish_failed_trial(host, state, reason)
+        return 0
+    # Bad UKI / firmware hang: rebooted (new boot_id) onto some other root
+    # (e.g. factory @) while a trial is still armed. Clear it so the next
+    # update/migrate is not blocked by "a trial boot is already pending".
+    if trial.get("armed_boot_id") and trial["armed_boot_id"] != host.boot_id():
         reason = "lost-after-userspace" if trial.get("reached") else "lost-before-userspace"
         finish_failed_trial(host, state, reason)
         return 0
     return 0
 
 
+
 # --------------------------------------------------------------------------
+
+
+
+# --------------------------------------------------------------------------
+# migrate: move an OLD Mini install onto a release trial (remote, no USB)
+
+
+def migrate_preflight(host: Host, force: bool = False) -> dict:
+    """Refuse safely when the room is not a known old Mini layout."""
+    layout = host.layout()
+    if layout.line != "mini":
+        raise Fail("migrate is for Intel Minis only (Studio already uses smartroom-release)", "wrong-line")
+    esp = host.esp()
+    report = {"line": "mini", "checks": []}
+
+    def check(name: str, ok: bool, detail: str = "") -> None:
+        report["checks"].append({"name": name, "ok": ok, "detail": detail})
+        if not ok and not force:
+            raise Fail(f"migrate refused: {name}: {detail or 'failed'}", "migrate-refused")
+
+    # btrfs root (plain @, or snapshot under sd-btrfs-overlayfs)
+    if host.prefix:
+        fstype = "btrfs"
+        check("btrfs-root", True, "prefix")
+    else:
+        try:
+            fstype = host.run(["findmnt", "-no", "FSTYPE", "/"], check=False).stdout.decode().strip()
+        except Fail:
+            fstype = ""
+        try:
+            device = host.btrfs_device()
+            check("btrfs-root", True, f"{fstype or '?'} via {device}")
+        except Fail as e:
+            check("btrfs-root", False, f"{fstype or 'unknown'}: {e}")
+
+    # limine.conf + known UKI entry
+    cfg = esp / "limine.conf"
+    check("limine.conf", cfg.is_file(), str(cfg))
+    text = cfg.read_text() if cfg.is_file() else ""
+    found = kernel_entry(text) if text else None
+    check("limine-uki-entry", found is not None, "no smartroomos_/omarchy_ UKI entry")
+
+    # unexpected / unknown entries: refuse when a password prompt or menu timeout is enabled
+    if "timeout:" in text:
+        # timeout: 0 or no is fine; positive timeout parks at a menu
+        import re as _re
+        m = _re.search(r"^timeout:\s*(\S+)", text, _re.M)
+        to = (m.group(1) if m else "").strip()
+        check("limine-timeout", to in ("0", "no", ""), f"timeout={to}")
+    check("no-hash-prompt", "hash_mismatch_panic: yes" not in text, "hash_mismatch_panic would wait for a key")
+
+    # EFI one-shot writable
+    efivars = host.p("/sys/firmware/efi/efivars")
+    check("efivarfs", host.prefix or efivars.is_dir(), str(efivars))
+
+    # free space: need roughly the size of the current root free on the btrfs device
+    with host.top() as top:
+        check("top-writable", top.exists() or host.prefix, str(top))
+        # require at least 8 GiB free on the filesystem that holds roots
+        try:
+            free = shutil.disk_usage(top if top.exists() else host.p("/")).free
+        except OSError:
+            free = 0
+        check("free-space", free >= 8 * 1024**3, f"{free // 2**30} GiB free (need >= 8)")
+
+    # firmware password / Secure Boot surprises: if SetupMode is 0 and SecureBoot is 1
+    # we still allow Limine one-shot (it uses BootNext-style LoaderEntryOneShot), but
+    # refuse when the ESP is not writable.
+    try:
+        esp_free = shutil.disk_usage(esp).free
+    except OSError:
+        esp_free = 0
+    check("esp-writable", esp_free >= ESP_MARGIN, f"{esp_free // 2**20} MiB ESP free")
+
+    # unknown boot entries: Limine conf should not contain non-SmartRoom OS entries at top level
+    for start, end, title in _entry_blocks(text.splitlines() if text else []):
+        if title in (TRIAL_ENTRY_NAME,):
+            continue
+        # nested // entries are fine; top-level / entries that are not SmartRoom* are suspicious
+        line0 = text.splitlines()[start] if text else ""
+        if line0.startswith("/") and not line0.startswith("//") and not title.lower().startswith("smartroom"):
+            # Allow the common Mini title variants
+            if title not in ("linux-t2",) and "smartroom" not in title.lower() and "omarchy" not in title.lower():
+                check("known-boot-entry", force, f"unexpected Limine entry {title!r}")
+
+    report["ok"] = all(c["ok"] for c in report["checks"])
+    return report
+
+
+def cmd_migrate_check(host: Host, args) -> int:
+    require_root(host)
+    report = migrate_preflight(host, force=True)  # always report; exit non-zero if any failed
+    if args.json:
+        print(json.dumps(report, sort_keys=True))
+    else:
+        for c in report["checks"]:
+            print(f"{'ok' if c['ok'] else 'FAIL'}  {c['name']}: {c.get('detail') or ''}")
+        print("ready" if report["ok"] else "not-ready")
+    return 0 if report["ok"] else 1
+
+
+def cmd_migrate(host: Host, args) -> int:
+    """Install a release beside the old Mini root and arm a trial; old @ is the fallback."""
+    require_root(host)
+    migrate_preflight(host, force=bool(args.force))
+    state = load_state(host)
+    # Ensure configured points at the live old root (@) as "installed".
+    layout = host.layout()
+    live = running_root(host)
+    state["configured"] = {
+        "release": INSTALLED, "number": 0, "root": live,
+        "uki": layout.configured_uki, "boot": layout.configured_boot,
+    }
+    state["previous"] = None
+    state["history"] = state.get("history") or []
+    state["migration"] = {"pending": True, "old_root": live, "at": host.stamp()}
+    save_state(host, state)
+    directory = fetch(host, args.release)
+    # Migration may run when the Room Controller is briefly disconnected; still prefer healthy.
+    stage_release(host, state, directory, args.unsigned, kind="migrate",
+                  require_healthy=not bool(args.force))
+    try:
+        arm_trial(host, state)
+    except Fail:
+        clear_trial_files(host, state)
+        state["trial"] = None
+        event(host, state, "files-written-not-armed", reason="arm failed")
+        save_state(host, state)
+        raise
+    print(f"armed migration trial {state['trial']['release']}: fallback root is {live}")
+    if args.reboot:
+        host.reboot()
+    return 0
+
+
+def cmd_esp_migrate(host: Host, args) -> int:
+    """Move legacy ESP UKI store + ws13d esp-hold files into the btrfs boot-store."""
+    require_root(host)
+    state = load_state(host)
+    hold = Path(args.esp_hold) if getattr(args, "esp_hold", None) else host.p(ESP_HOLD_DEFAULT)
+    moved = migrate_esp_uki_store(host, state)
+    hold_actions = ingest_esp_hold(host, state, hold=hold)
+    # Ensure every kept release is durable, then restore the one ESP fallback.
+    # Do not prune boot-store here: migrated orphans (and ws13d hold) stay until
+    # a later promote/update prune drops ids outside keep-5.
+    esp_offload_non_essential(host, state, for_trial=False)
+    with contextlib.suppress(Fail, OSError):
+        restore_previous_to_esp(host, state)
+    event(host, state, "esp-migrated", moved=len(moved), hold=len(hold_actions))
+    save_state(host, state)
+    doc = {
+        "moved": moved,
+        "esp_hold": hold_actions,
+        "bootStore": BOOT_STORE,
+        "esp": status_doc(host, state).get("esp"),
+    }
+    if args.json:
+        print(json.dumps(doc, sort_keys=True))
+    else:
+        print(f"boot-store {BOOT_STORE}: moved {len(moved)} ESP store entries, "
+              f"{len(hold_actions)} esp-hold actions")
+        for line in moved + hold_actions:
+            print(f"  {line}")
+    return 0
+
+
+def cmd_confirm_migration(host: Host, args) -> int:
+    """After a migrate promotion, allow pruning the old @ once the room is confirmed good."""
+    require_root(host)
+    state = load_state(host)
+    mig = state.get("migration")
+    if not mig:
+        raise Fail("no migration is pending confirmation", "not-found")
+    old = mig.get("old_root")
+    state["migration"] = {**mig, "kept_until_confirmed": False, "confirmed_at": host.stamp()}
+    event(host, state, "migration-confirmed", old_root=old)
+    save_state(host, state)
+    prune(host, state)
+    # Optionally delete the old @ when it is not the running root and not in history.
+    if old and old != "@" and old != running_root(host):
+        with host.top() as top:
+            if subvol_exists(top, old) and old not in {
+                (state.get("configured") or {}).get("root"),
+                *((h or {}).get("root") for h in (state.get("history") or [])),
+            }:
+                delete_subvolume(host, top, old)
+    print("migration confirmed")
+    return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1477,13 +3185,23 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--uki-from")
     p.add_argument("--parent")
     p.add_argument("--sign-key")
+    p = sub.add_parser("migrate-check")
+    p = sub.add_parser("migrate")
+    p.add_argument("release")
+    p.add_argument("--unsigned", action="store_true")
+    p.add_argument("--reboot", action="store_true")
+    p.add_argument("--force", action="store_true", help="override non-fatal preflight refusals (still refuses wrong line)")
+    sub.add_parser("confirm-migration")
+    p = sub.add_parser("esp-migrate")
+    p.add_argument("--esp-hold", help=f"parked ESP files directory (default {ESP_HOLD_DEFAULT})")
     return parser
 
 
 COMMANDS = {
     "status": cmd_status, "list": cmd_list, "update": cmd_update, "stage": cmd_stage, "arm": cmd_arm,
     "rollback": cmd_rollback, "discard": cmd_discard, "health-run": cmd_health_run, "restore": cmd_restore,
-    "build-release": cmd_build_release,
+    "build-release": cmd_build_release, "migrate": cmd_migrate, "migrate-check": cmd_migrate_check,
+    "confirm-migration": cmd_confirm_migration, "esp-migrate": cmd_esp_migrate,
 }
 
 

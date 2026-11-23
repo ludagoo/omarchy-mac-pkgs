@@ -15,12 +15,38 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
 
 HERE = Path(__file__).resolve().parent
 TOOL = HERE.parent / "bin" / "smartroom-release"
+
+# Scratch ESP images are hundreds of MiB. Mini /tmp is tmpfs — never put them there.
+# Prefer TMPDIR when it is already off /tmp; otherwise use <job>/tmp or ./tmp beside pkgs.
+def _prefer_disk_tmpdir() -> None:
+    cur = Path(os.environ.get("TMPDIR") or tempfile.gettempdir()).resolve()
+    if not (str(cur) == "/tmp" or str(cur).startswith("/tmp/")):
+        return
+    for candidate in (
+        HERE.parents[3] / "tmp",                 # .../smartroom-fw-ws14/tmp
+        HERE.parents[2] / "tmp",                 # .../pkgs/tmp
+        Path.home() / "smartroom-fw-ws14" / "tmp",
+    ):
+        try:
+            candidate.mkdir(parents=True, exist_ok=True)
+            probe = candidate / f".srel-tmpdir-{os.getpid()}"
+            probe.write_bytes(b"ok")
+            probe.unlink()
+        except OSError:
+            continue
+        os.environ["TMPDIR"] = str(candidate)
+        tempfile.tempdir = None
+        return
+
+
+_prefer_disk_tmpdir()
 
 loader = importlib.machinery.SourceFileLoader("smartroom_release", str(TOOL))
 spec = importlib.util.spec_from_loader("smartroom_release", loader)
@@ -808,19 +834,30 @@ class Promotion(unittest.TestCase):
 
     def test_a_failure_while_copying_the_previous_set_changes_nothing_that_boots(self):
         w = self.build()
-        before = w.limine()
+        before_path, before_cmd = sr.kernel_entry(w.limine())
         real = sr.copy_atomic
-        calls = {"n": 0}
 
         def failing(src, dst, expect=None):
-            calls["n"] += 1
-            raise sr.Fail("disk full")
+            # Fail the ESP previous-UKI copy (boot-store puts on btrfs still succeed).
+            if str(dst).endswith(sr.PREVIOUS_UKI) or str(dst).endswith(sr.PREVIOUS_UKI + ".new"):
+                raise sr.Fail("ESP full writing previous UKI", "esp-full")
+            return real(src, dst, expect)
+
         with mock.patch.object(sr, "copy_atomic", failing):
-            with self.assertRaises(sr.Fail):
+            with self.assertRaises(sr.Fail) as raised:
                 sr.promote(w.host, sr.load_state(w.host))
-        self.assertEqual(w.limine(), before)
+        self.assertEqual(raised.exception.code, "promote-failed")
+        # WS14: promote-failed is a defined state — fall back to configured, strip trial.
+        path, cmd = sr.kernel_entry(w.limine())
+        self.assertEqual(path, before_path)
+        self.assertEqual(cmd, before_cmd)
+        self.assertNotIn("Release Trial", w.limine())
         self.entry_ok(w)
         self.assertEqual((w.esp / "m1n1/boot.bin").read_bytes(), b"stage2-installed")
+        st = w.state()
+        self.assertEqual(st["last_result"]["reason"], "promote-failed")
+        self.assertIsNone(st.get("promoting"))
+        self.assertIsNone(st.get("trial"))
 
     def test_discard_refuses_a_trial_in_progress_and_cleans_a_staged_one(self):
         w = World(self)
@@ -954,6 +991,937 @@ class Cli(unittest.TestCase):
         self.assertIn("/etc/systemd/system/smartroom-agent.service", entries)
         self.assertIn("/opt/smartroom/agent", entries)
         self.assertNotIn("/etc/systemd/system/smartroom-agent.service.d", entries)
+
+
+# --------------------------------------------------------------------------
+# Intel Mini line (Limine one-shot + iTCO/softdog; no aura-try)
+
+
+MINI_LIMINE = """\
+timeout: 0
+quiet: yes
+hash_mismatch_panic: no
+
+/+SmartRoom Firmware
+comment: machine-id=e4c6
+  //linux-t2
+  comment: Kernel version: 7.2.15-arch1-1-t2
+  protocol: efi
+  path: boot():/EFI/Linux/smartroomos_linux-t2.efi
+  cmdline: root=UUID=4f4d rw rootflags=subvol=@ quiet panic=10 intel_iommu=on
+"""
+MINI_CMDLINE = "root=UUID=4f4d rw rootflags=subvol=@ quiet panic=10 intel_iommu=on"
+
+
+class MiniWorld(World):
+    def build_room(self):
+        p = self.prefix
+        (self.esp / "EFI/Linux").mkdir(parents=True)
+        (self.esp / "limine.conf").write_text(MINI_LIMINE)
+        (self.esp / "EFI/Linux/smartroomos_linux-t2.efi").write_bytes(b"uki-mini-installed")
+        (p / "proc/sys/kernel/random").mkdir(parents=True)
+        (p / "proc/sys/kernel/random/boot_id").write_text("boot-1\n")
+        (p / "proc/cmdline").write_text(MINI_CMDLINE + "\n")
+        (p / "proc/uptime").write_text("100.0 100.0\n")
+        (p / "dev").mkdir()
+        (p / "dev/watchdog").write_text("")
+        (p / "sys/firmware/efi/efivars").mkdir(parents=True)
+        root = p / "top/@"
+        (root / "etc/default").mkdir(parents=True)
+        (root / "etc/fstab").write_text(
+            "UUID=aa  /  btrfs  noatime,subvol=@  0 0\n")
+        (root / "etc/default/limine").write_text(
+            f'TARGET_OS_NAME="SmartRoom Firmware"\nKERNEL_CMDLINE[default]="{MINI_CMDLINE}"\n')
+        for rel, data in {
+            "etc/machine-id": "machine-M\n", "etc/hostname": "mini-A\n",
+            "etc/ssh/ssh_host_ed25519_key": "HOSTKEY-M", "etc/ssh/ssh_host_ed25519_key.pub": "HOSTPUB-M",
+            "etc/smartroomos/unique-id": "uid-M\n",
+            "opt/smartroom/config/agent.json": '{"serverUrl": "https://s.example"}',
+            "opt/smartroom/state/requirements.sha256": "abc\n",
+            "etc/NetworkManager/system-connections/wifi.nmconnection": "[connection]\nid=wifi\n",
+        }.items():
+            f = p / rel
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_text(data)
+
+    def release(self, name="2026.11.21-mini", cmdline=MINI_CMDLINE, uki=b"uki-mini-new", pad=0):
+        d = self.tmp / f"release-{name}"
+        (d / "EFI/Linux").mkdir(parents=True)
+        (d / "EFI/Linux/smartroomos_linux-t2.efi").write_bytes(uki)
+        tree = self.tmp / f"tree-{name}"
+        root = tree / "factory"
+        (root / "etc/default").mkdir(parents=True)
+        (root / "etc/fstab").write_text("UUID=aa  /  btrfs  noatime,subvol=@  0 0\n")
+        (root / "etc/default/limine").write_text(f'KERNEL_CMDLINE[default]="{cmdline}"\n')
+        (root / "usr/lib").mkdir(parents=True)
+        (root / "usr/lib/marker").write_text(f"release {name}\n")
+        tar = subprocess.run(["tar", "-C", str(tree), "-cf", "-", "factory"], capture_output=True, check=True).stdout
+        stream = subprocess.run(["zstd", "-q", "-c"], input=tar, capture_output=True, check=True).stdout
+        (d / "root.btrfs.zst").write_bytes(stream)
+        manifest = {
+            "schema": 1, "id": name, "created": "2026-11-21T00:00:00Z", "parent": None, "line": "mini",
+            "root": {"file": "root.btrfs.zst", "sha256": sha(stream), "size": len(stream)},
+            "boot": [
+                {"role": "uki", "path": "EFI/Linux/smartroomos_linux-t2.efi", "sha256": sha(uki), "size": len(uki) + pad},
+            ],
+        }
+        (d / "manifest.json").write_text(json.dumps(manifest))
+        return d
+
+    def trial_boot(self, name="2026.11.21-mini"):
+        """Reboot into the armed Mini trial: Limine took the one-shot."""
+        marker = self.esp / "smartroom-release/trial.marker"
+        if marker.is_file():
+            marker.write_bytes(marker.read_bytes())  # still armed; health-run marks spent
+        (self.prefix / "proc/cmdline").write_text(sr.trial_cmdline(MINI_CMDLINE, f"@r-{name}", name) + "\n")
+        (self.prefix / "proc/sys/kernel/random/boot_id").write_text("boot-2\n")
+        self.host.oneshot = None
+        self.host.saved = None
+
+
+
+class Ws13SnapperAndKey(unittest.TestCase):
+    """WS13: nested .snapshots, as-installed on promote, release key stamp."""
+
+    def test_fix_root_creates_snapshots_and_imports_key(self):
+        w = World(self)
+        new_root = w.prefix / "top" / "@r-2026.11.21-ws13"
+        new_root.mkdir(parents=True)
+        (new_root / "etc").mkdir()
+        (new_root / "usr/share/smartroomos").mkdir(parents=True)
+        (new_root / "usr/share/smartroomos/release-keyring.gpg").write_bytes(b"\x99fake")
+        (new_root / "etc/fstab").write_text("UUID=x / btrfs subvol=/@ 0 0\n")
+        sr.fix_root_files(w.host, new_root, "@r-2026.11.21-ws13", "2026.11.21-ws13")
+        self.assertTrue((new_root / ".snapshots").is_dir())
+        self.assertTrue((new_root / "var/lib/smartroomos/release-key-imported").is_file())
+        self.assertIn("26436A50", (new_root / "var/lib/smartroomos/release-key-imported").read_text())
+
+    def test_promote_imports_key_after_carry(self):
+        """Promote re-imports even when only the old carried gnupg is present."""
+        w = World(self)
+        # Simulate a carried gnupg with no release key stamp yet.
+        (w.prefix / "etc/pacman.d/gnupg").mkdir(parents=True)
+        (w.prefix / "etc/pacman.d/gnupg/pubring.gpg").write_text("ROOM-GPG")
+        (w.prefix / "usr/share/smartroomos").mkdir(parents=True)
+        (w.prefix / "usr/share/smartroomos/release-keyring.gpg").write_bytes(b"\x99fake")
+        stamp = w.prefix / "var/lib/smartroomos/release-key-imported"
+        if stamp.exists():
+            stamp.unlink()
+        w.run("update", str(w.release()), "--unsigned")
+        w.trial_boot()
+        self.assertEqual(w.run("health-run")[0], 0)
+        self.assertTrue(stamp.is_file(), "promote must import the release key on the live root")
+
+    def test_promote_writes_as_installed_marker(self):
+        w = World(self)
+        w.run("update", str(w.release()), "--unsigned")
+        w.trial_boot()
+        self.assertEqual(w.run("health-run")[0], 0)
+        marker = w.prefix / "var/lib/smartroomos/integrity/as-installed.json"
+        self.assertTrue(marker.is_file(), "as-installed marker missing after promote")
+        data = json.loads(marker.read_text())
+        self.assertEqual(data.get("kind"), "as-installed")
+        self.assertIn("as installed", data.get("description") or "")
+
+    def test_promote_writes_home_as_installed_marker(self):
+        """WS13c: home as-installed marker beside root marker."""
+        w = World(self)
+        (w.prefix / "home").mkdir(parents=True, exist_ok=True)
+        w.run("update", str(w.release()), "--unsigned")
+        w.trial_boot()
+        self.assertEqual(w.run("health-run")[0], 0)
+        marker = w.prefix / "var/lib/smartroomos/integrity/as-installed-home.json"
+        self.assertTrue(marker.is_file(), "home as-installed marker missing after promote")
+        data = json.loads(marker.read_text())
+        self.assertEqual(data.get("kind"), "as-installed")
+        self.assertIn("as installed", data.get("description") or "")
+
+    def test_stage_archives_outgoing_drift_when_present(self):
+        """WS13c: stage archives outgoing drift via integrity archive-outgoing."""
+        w = World(self)
+        tool = w.prefix / "usr/local/sbin/smartroomos-integrity"
+        tool.parent.mkdir(parents=True, exist_ok=True)
+        tool.write_text(
+            "#!/bin/bash\n"
+            "set -e\n"
+            "root=\"${SMARTROOMOS_ROOT:-/}\"\n"
+            "if [[ \"$1\" == archive-outgoing ]]; then\n"
+            "  id=\"old-20261121T000000Z\"\n"
+            "  d=\"$root/var/lib/smartroomos/drift-archive/$id\"\n"
+            "  mkdir -p \"$d\" \"$root/var/lib/smartroomos/integrity\"\n"
+            "  echo archived >\"$d/README.md\"\n"
+            "  printf '%s\\n' '{\"archives\":[{\"id\":\"old-20261121T000000Z\",\"acked\":false,\"count\":1,\"paths\":[\"/etc/x\"],\"old_release\":\"old\",\"new_release\":\"2026.11.21-2\"}]}' "
+            ">\"$root/var/lib/smartroomos/integrity/hand-changes-pending.json\"\n"
+            "  exit 0\n"
+            "fi\n"
+            "exit 0\n"
+        )
+        tool.chmod(0o755)
+        w.run("update", str(w.release()), "--unsigned")
+        w.trial_boot()
+        self.assertEqual(w.run("health-run")[0], 0)
+        rel = w.release(name="2026.11.21-2")
+        rc, out, err = w.run("stage", str(rel), "--unsigned")
+        self.assertEqual(rc, 0, err or out)
+        pending = w.prefix / "var/lib/smartroomos/integrity/hand-changes-pending.json"
+        self.assertTrue(pending.is_file(), "hand-changes-pending missing after stage")
+        self.assertTrue(
+            (w.prefix / "var/lib/smartroomos/drift-archive/old-20261121T000000Z/README.md").is_file()
+        )
+
+    def test_promote_snapshot_after_edits_leaves_zero_limine_drift(self):
+        """WS13b: as-installed is taken after limine finalize + record_integrity."""
+        w = World(self)
+        # Seed a limine defaults file the promote path rewrites.
+        limine = w.prefix / "etc/default/limine"
+        limine.parent.mkdir(parents=True, exist_ok=True)
+        limine.write_text(
+            'TARGET_OS_NAME="SmartRoom Firmware"\n'
+            f'KERNEL_CMDLINE[default]="{CMDLINE} smartroom.release=old watchdog.handle_boot_enabled=0"\n'
+        )
+        # Fake integrity tool records a stamp under MANIFEST_DIR so we can see
+        # it lands before the as-installed marker path is written.
+        tool = w.prefix / "usr/local/sbin/smartroomos-integrity"
+        tool.parent.mkdir(parents=True, exist_ok=True)
+        tool.write_text(
+            "#!/bin/bash\n"
+            "set -e\n"
+            "root=\"${SMARTROOMOS_ROOT:-/}\"\n"
+            "d=\"$root/usr/local/lib/smartroomos/integrity\"\n"
+            "mkdir -p \"$d/store\"\n"
+            "echo recorded >\"$d/manifest.json\"\n"
+            "echo blob >\"$d/store/deadbeef\"\n"
+            "exit 0\n"
+        )
+        tool.chmod(0o755)
+        # Also ship a tiny .py so precompile creates __pycache__ in the root.
+        lib = w.prefix / "usr/local/lib/smartroomos"
+        lib.mkdir(parents=True, exist_ok=True)
+        (lib / "hello_ws13b.py").write_text("x = 1\n")
+        w.run("update", str(w.release()), "--unsigned")
+        # Carry limine into the new root the way stage does for a real room.
+        new = w.prefix / "top" / "@r-2026.11.21-1"
+        (new / "etc/default").mkdir(parents=True, exist_ok=True)
+        (new / "etc/default/limine").write_text(limine.read_text())
+        (new / "usr/local/lib/smartroomos").mkdir(parents=True, exist_ok=True)
+        (new / "usr/local/lib/smartroomos/hello_ws13b.py").write_text("x = 1\n")
+        (new / "usr/local/sbin").mkdir(parents=True, exist_ok=True)
+        # Live root after trial boot is the new subvol content via prefix=/
+        # World uses prefix as /; trial_boot only rewrites cmdline. Promote
+        # edits host.p("/etc/default/limine") which is the prefix copy.
+        w.trial_boot()
+        self.assertEqual(w.run("health-run")[0], 0)
+        # After promote: limine has no trial-only param; release kept.
+        text = limine.read_text()
+        self.assertNotIn("watchdog.handle_boot_enabled", text)
+        self.assertIn("smartroom.release=2026.11.21-1", text)
+        # Manifest/store recorded (record_integrity ran before snapshot marker).
+        self.assertTrue((w.prefix / "usr/local/lib/smartroomos/integrity/manifest.json").is_file())
+        self.assertTrue((w.prefix / "usr/local/lib/smartroomos/integrity/store/deadbeef").is_file())
+        # Precompile left bytecode for our module.
+        pyc = list((w.prefix / "usr/local/lib/smartroomos").rglob("hello_ws13b*.pyc"))
+        self.assertTrue(pyc, "stage/promote must precompile smartroom Python")
+        # Status must not say trial boot after committed promote (dt still set).
+        doc = json.loads(w.run("status", "--json")[1])
+        self.assertIsNone(doc.get("trial"))
+        self.assertEqual(doc["release"]["boot"], "configured")
+        self.assertEqual(doc["release"]["configured"], "2026.11.21-1")
+
+    def test_status_not_trial_after_promote_while_dt_trial_lingers(self):
+        w = World(self)
+        w.run("update", str(w.release()), "--unsigned")
+        w.trial_boot()
+        self.assertEqual(w.run("health-run")[0], 0)
+        # Device-tree trial marker still present (no reboot yet).
+        self.assertTrue((w.prefix / "proc/device-tree/chosen/aurora,trial").is_file())
+        doc = json.loads(w.run("status", "--json")[1])
+        self.assertEqual(doc["release"]["boot"], "configured")
+        self.assertFalse(doc["running"]["trial"])
+
+    def test_as_installed_uses_pre_post_pair_and_removes_esp_uki(self):
+        """WS13b: snapper needs a real pre; post is excluded; remove cleans pre UKI."""
+        calls = []
+
+        class FakeDone:
+            def __init__(self, rc, out):
+                self.returncode = rc
+                self.stdout = out.encode() if isinstance(out, str) else out
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "var/lib/smartroomos/integrity").mkdir(parents=True)
+
+            class FakeHost:
+                prefix = None
+
+                def p(self, path):
+                    return root / path.lstrip("/")
+
+                def run(self, argv, check=False):
+                    calls.append(list(argv))
+                    if argv and argv[0] == "limine-snapper-remove":
+                        return FakeDone(0, "")
+                    if argv and argv[0] == "snapper" and "--type" in argv:
+                        t = argv[argv.index("--type") + 1]
+                        if t == "pre":
+                            return FakeDone(0, "10\n")
+                        if t == "post":
+                            assert "--pre-number" in argv
+                            assert argv[argv.index("--pre-number") + 1] == "10"
+                            return FakeDone(0, "11\n")
+                    return FakeDone(1, "")
+
+            with mock.patch.object(
+                sr, "write_atomic",
+                lambda path, data, mode=0o644: Path(path).write_bytes(data),
+            ):
+                num = sr.take_as_installed_snapshot(FakeHost(), "2026.11.21-t")
+            self.assertEqual(num, 11)
+            types = [
+                c[c.index("--type") + 1]
+                for c in calls
+                if c and c[0] == "snapper" and "--type" in c
+            ]
+            self.assertEqual(types, ["pre", "post"])
+            remove_nums = [c[1] for c in calls if c and c[0] == "limine-snapper-remove"]
+            self.assertEqual(remove_nums, ["10", "11"])
+            marker = json.loads(
+                (root / "var/lib/smartroomos/integrity/as-installed.json").read_text()
+            )
+            self.assertEqual(marker["snapshot"], 11)
+            self.assertEqual(marker["pre_snapshot"], 10)
+
+    def test_finalize_sets_limine_snapper_root_paths_for_release_subvol(self):
+        w = World(self)
+        limine = w.prefix / "etc/default/limine"
+        limine.parent.mkdir(parents=True, exist_ok=True)
+        limine.write_text(
+            'TARGET_OS_NAME="SmartRoom Firmware"\n'
+            f'KERNEL_CMDLINE[default]="{CMDLINE}"\n'
+            'ROOT_SUBVOLUME_PATH="/@"\n'
+            'ROOT_SNAPSHOTS_PATH="/@/.snapshots"\n'
+            'EXCLUDE_SNAPSHOT_TYPES="post"\n'
+        )
+        sync = w.prefix / "etc/limine-snapper-sync.conf"
+        sync.write_text(
+            'LIMIT_USAGE_PERCENT=70\n'
+            'ROOT_SUBVOLUME_PATH="/@"\n'
+            'ROOT_SNAPSHOTS_PATH="/@/.snapshots"\n'
+            'EXCLUDE_SNAPSHOT_TYPES="post"\n'
+        )
+        host = sr.Host(prefix=str(w.prefix))
+        sr.finalize_promoted_root(host, "2026.11.21-1", "@r-2026.11.21-1")
+        for path in (limine, sync):
+            text = path.read_text()
+            self.assertIn('ROOT_SUBVOLUME_PATH="/@r-2026.11.21-1"', text)
+            self.assertIn('ROOT_SNAPSHOTS_PATH="/@r-2026.11.21-1/.snapshots"', text)
+
+
+class MiniLine(unittest.TestCase):
+    def test_detects_mini_layout(self):
+        w = MiniWorld(self)
+        self.assertEqual(w.host.line(), "mini")
+        self.assertFalse(w.host.layout().uses_aura)
+
+    def test_update_trial_promote_and_status_json(self):
+        w = MiniWorld(self)
+        w.host.conf  # force defaults
+        (w.prefix / "etc/smartroomos").mkdir(parents=True, exist_ok=True)
+        (w.prefix / "etc/smartroomos/release.conf").write_text("quiet_seconds=60\nlimit_seconds=120\nsample_seconds=5\n")
+        w.host._conf = None
+        code, _, err = w.run("update", str(w.release()), "--unsigned")
+        self.assertEqual(code, 0, err)
+        self.assertTrue((w.esp / "smartroom-release/trial.marker").is_file())
+        self.assertFalse((w.esp / "aura-try").exists())
+        self.assertTrue((w.esp / sr.LAYOUT_MINI.trial_uki).is_file())
+        self.assertIn("/SmartRoom Release Trial", w.limine())
+        w.trial_boot()
+        code, _, err = w.run("health-run")
+        self.assertEqual(code, 0, err)
+        st = w.state()
+        self.assertEqual(st["configured"]["release"], "2026.11.21-mini")
+        self.assertEqual(st["previous"]["release"], "installed")
+        self.assertEqual(st["line"], "mini")
+        self.assertFalse((w.esp / "smartroom-release/trial.marker").exists())
+        doc = json.loads(w.run("status", "--json")[1])
+        self.assertEqual(doc["line"], "mini")
+        self.assertEqual(doc["backend"], "smartroom-release")
+        self.assertEqual(doc["keepGood"], 5)
+        self.assertEqual(doc["release"]["configured"], "2026.11.21-mini")
+        self.assertEqual(doc["trial"], None)
+
+    def test_unhealthy_trial_falls_back(self):
+        w = MiniWorld(self)
+        (w.prefix / "etc/smartroomos").mkdir(parents=True, exist_ok=True)
+        (w.prefix / "etc/smartroomos/release.conf").write_text("quiet_seconds=60\nlimit_seconds=90\nsample_seconds=5\n")
+        w.host._conf = None
+        w.run("update", str(w.release()), "--unsigned")
+        w.trial_boot()
+        w.host.connected = False
+        code, _, _ = w.run("health-run")
+        self.assertEqual(code, 1)
+        self.assertEqual(w.host.reboots, 1)
+        st = w.state()
+        self.assertEqual(st["last_result"]["reason"], "health-timeout")
+        self.assertEqual(st["configured"]["release"], "installed")
+
+    def test_keeps_five_good_release_roots(self):
+        w = MiniWorld(self)
+        (w.prefix / "etc/smartroomos").mkdir(parents=True, exist_ok=True)
+        (w.prefix / "etc/smartroomos/release.conf").write_text("quiet_seconds=30\nlimit_seconds=60\nsample_seconds=5\n")
+        w.host._conf = None
+        for i in range(1, 7):
+            name = f"2026.11.2{i}-mini"
+            code, _, err = w.run("update", str(w.release(name=name, uki=f"uki-{i}".encode())), "--unsigned")
+            self.assertEqual(code, 0, err)
+            w.trial_boot(name)
+            # after first promote, cmdline must name the running release
+            if i > 1:
+                prev = f"2026.11.2{i-1}-mini"
+                (w.prefix / "proc/cmdline").write_text(sr.trial_cmdline(MINI_CMDLINE, f"@r-{name}", name) + "\n")
+                (w.prefix / "proc/sys/kernel/random/boot_id").write_text(f"boot-{i+1}\n")
+            self.assertEqual(w.run("health-run")[0], 0)
+            (w.prefix / "proc/cmdline").write_text(sr.with_subvol(MINI_CMDLINE, f"@r-{name}", name) + "\n")
+            with contextlib.suppress(FileNotFoundError):
+                (w.esp / "smartroom-release/trial.marker").unlink()
+        st = w.state()
+        self.assertEqual(st["configured"]["release"], "2026.11.26-mini")
+        self.assertLessEqual(len(st.get("history") or []), 4)  # configured + 4 = 5
+        roots = {p.name for p in (w.prefix / "top").glob("@r-*")}
+        self.assertLessEqual(len(roots), 5)
+        self.assertIn("@r-2026.11.26-mini", roots)
+        # oldest of the six @r-* should be gone (configured + 4 history)
+        self.assertNotIn("@r-2026.11.21-mini", roots)
+
+    def test_migrate_check_and_migrate_trial(self):
+        w = MiniWorld(self)
+        (w.prefix / "etc/smartroomos").mkdir(parents=True, exist_ok=True)
+        (w.prefix / "etc/smartroomos/release.conf").write_text("quiet_seconds=30\nlimit_seconds=60\nsample_seconds=5\n")
+        w.host._conf = None
+        # fake free space via prefix disk_usage is real tmpfs/home; migrate-check uses shutil on top
+        code, out, err = w.run("migrate-check", "--json")
+        # may fail free-space on tiny tmp; force path is what agents use after review
+        code, _, err = w.run("migrate", str(w.release(name="2026.11.21-mig")), "--unsigned", "--force")
+        self.assertEqual(code, 0, err)
+        st = w.state()
+        self.assertEqual(st["trial"]["kind"], "migrate")
+        self.assertEqual(st["configured"]["root"], "@")
+        self.assertEqual(st["migration"]["old_root"], "@")
+        w.trial_boot("2026.11.21-mig")
+        self.assertEqual(w.run("health-run")[0], 0)
+        st = w.state()
+        self.assertEqual(st["configured"]["release"], "2026.11.21-mig")
+        self.assertTrue(st["migration"].get("kept_until_confirmed"))
+        self.assertTrue((w.prefix / "top/@").exists())
+        self.assertEqual(w.run("confirm-migration")[0], 0)
+
+    def test_migrate_refuses_studio(self):
+        w = World(self)
+        code, out, err = w.run("--json", "migrate-check")
+        self.assertEqual(code, 1)
+        self.assertIn("wrong-line", out + err)
+
+    def test_lost_before_userspace_on_mini(self):
+        w = MiniWorld(self)
+        w.run("update", str(w.release()), "--unsigned")
+        # came back on configured @ without ever reaching the trial root
+        w.back_on_configured(root="@", boot_id="boot-9")
+        self.assertEqual(w.run("health-run")[0], 0)
+        self.assertEqual(w.state()["last_result"]["reason"], "lost-before-userspace")
+
+    def test_lost_before_userspace_when_mini_lands_on_wrong_root(self):
+        """Bad UKI + reset can land on factory @ while configured is @r-…."""
+        w = MiniWorld(self)
+        (w.prefix / "etc/smartroomos").mkdir(parents=True, exist_ok=True)
+        (w.prefix / "etc/smartroomos/release.conf").write_text(
+            "quiet_seconds=30\nlimit_seconds=60\nsample_seconds=5\n")
+        w.host._conf = None
+        name = "2026.11.21-mini"
+        self.assertEqual(w.run("update", str(w.release(name=name)), "--unsigned")[0], 0)
+        w.trial_boot(name)
+        self.assertEqual(w.run("health-run")[0], 0)
+        # Promote left configured on @r-name. Arm a second trial, then land on @.
+        self.assertEqual(w.run("update", str(w.release(name="2026.11.21-bad", uki=b"BAD")), "--unsigned")[0], 0)
+        (w.prefix / "proc/cmdline").write_text(sr.with_subvol(MINI_CMDLINE, "@", None) + "\n")
+        (w.prefix / "proc/sys/kernel/random/boot_id").write_text("boot-after-reset\n")
+        self.assertEqual(w.run("health-run")[0], 0)
+        st = w.state()
+        self.assertIsNone(st.get("trial"))
+        self.assertEqual(st["last_result"]["reason"], "lost-before-userspace")
+        self.assertEqual(st["configured"]["release"], name)
+
+    def test_vm_marker_counts_as_connected(self):
+        w = MiniWorld(self)
+        host = sr.Host(str(w.prefix))
+        os.environ["SMARTROOM_RELEASE_VM"] = "1"
+        self.addCleanup(lambda: os.environ.pop("SMARTROOM_RELEASE_VM", None))
+        self.assertFalse(host.agent_connected())
+        (w.prefix / "etc/smartroomos").mkdir(parents=True, exist_ok=True)
+        (w.prefix / "etc/smartroomos/release-vm-healthy").write_text("1\n")
+        self.assertTrue(host.agent_connected())
+        (w.prefix / "etc/smartroomos/release-vm-healthy").unlink()
+        self.assertFalse(host.agent_connected())
+
+
+
+
+class TestDeleteSubvolumeRecursive(unittest.TestCase):
+    def test_delete_subvolume_uses_recursive(self):
+        """Nested .snapshots must not block prune of @r-* roots."""
+        calls = []
+        host = sr.Host()
+        host.prefix = None
+
+        def run(argv, check=True, input=None):
+            calls.append(list(argv))
+            return subprocess.CompletedProcess(argv, 0, b"", b"")
+
+        host.run = run  # type: ignore[method-assign]
+        top = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, top, ignore_errors=True)
+        target = top / "@r-old"
+        target.mkdir()
+        (target / ".snapshots").mkdir()
+        sr.delete_subvolume(host, top, "@r-old")
+        deleted = [c for c in calls if c[:3] == ["btrfs", "subvolume", "delete"]]
+        self.assertTrue(deleted, calls)
+        self.assertIn("--recursive", deleted[-1], deleted[-1])
+
+
+class TestBuildAsideEphemeral(unittest.TestCase):
+    def test_parks_drift_archive_and_old_release_dirs(self):
+        td = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, td, ignore_errors=True)
+        host = sr.Host(td)
+        arch = host.p("/var/lib/smartroomos/drift-archive")
+        arch.mkdir(parents=True)
+        (arch / "old").mkdir()
+        (arch / "old" / "f").write_text("x")
+        root = host.p("/root")
+        root.mkdir(parents=True)
+        old = root / "ws12-release-old"
+        old.mkdir()
+        (old / "x").write_text("y")
+        out = root / "ws12-release-keep"
+        out.mkdir()
+        moved = sr._aside_ephemeral_for_build(host, out)
+        self.assertFalse(arch.exists())
+        self.assertFalse(old.exists())
+        self.assertTrue(out.is_dir())
+        for src, dst in reversed(moved):
+            dst.rename(src)
+        self.assertTrue((arch / "old" / "f").is_file())
+
+    def test_carry_keeps_drift_archive_content(self):
+        """Hand-change archive must land in the NEW root (banner + content)."""
+        td = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, td, ignore_errors=True)
+        host = sr.Host(td)
+        src = host.p("/var/lib/smartroomos")
+        src.mkdir(parents=True)
+        (src / "latch").write_text("1")
+        aid = "old-20261123T120000Z"
+        arch = src / "drift-archive" / aid
+        arch.mkdir(parents=True)
+        (arch / "manifest.json").write_text('{"entries":[{"path":"/etc/hand.conf"}]}\n')
+        (arch / "files").mkdir()
+        (arch / "files" / "etc__hand.conf").write_text("hand\n")
+        (arch / "README.md").write_text("# drift\n")
+        integ = src / "integrity"
+        integ.mkdir(parents=True)
+        pending = {
+            "archives": [{
+                "id": aid, "acked": False, "count": 1,
+                "paths": ["/etc/hand.conf"],
+                "old_release": "old", "new_release": "new",
+                "path": str(arch),
+            }],
+        }
+        (integ / "hand-changes-pending.json").write_text(json.dumps(pending) + "\n")
+        (integ / "status.json").write_text(json.dumps({
+            "schema": 2, "state": "drift",
+            "hand_changes_pending": {
+                "archive_id": aid, "count": 1, "old_release": "old",
+                "new_release": "new",
+            },
+        }) + "\n")
+        cl = host.p("/usr/share/smartroomos/release-carry.list")
+        cl.parent.mkdir(parents=True, exist_ok=True)
+        cl.write_text("/var/lib/smartroomos\n")
+        new_root = Path(td) / "new-root"
+        new_root.mkdir()
+        copied = sr.carry_into(host, new_root)
+        self.assertIn("/var/lib/smartroomos", copied)
+        self.assertTrue((new_root / "var/lib/smartroomos/latch").is_file())
+        carried = new_root / "var/lib/smartroomos/drift-archive" / aid
+        self.assertTrue((carried / "files" / "etc__hand.conf").is_file())
+        self.assertTrue((carried / "manifest.json").is_file())
+        new_pending = json.loads(
+            (new_root / "var/lib/smartroomos/integrity/hand-changes-pending.json").read_text()
+        )
+        self.assertFalse(new_pending["archives"][0].get("content_pruned"))
+        self.assertEqual(new_pending["archives"][0]["id"], aid)
+
+    def test_carry_size_guard_marks_content_pruned(self):
+        """Over-budget archives keep manifest and are marked content_pruned."""
+        td = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, td, ignore_errors=True)
+        host = sr.Host(td)
+        src = host.p("/var/lib/smartroomos")
+        src.mkdir(parents=True)
+        (src / "latch").write_text("1")
+        arch_root = src / "drift-archive"
+        arch_root.mkdir()
+        # Oldest: large payload (will be pruned under a tiny budget).
+        old = arch_root / "rel-old-20261120T000000Z"
+        old.mkdir()
+        (old / "manifest.json").write_text('{"entries":[{"path":"/etc/old.conf"}]}\n')
+        (old / "files").mkdir()
+        (old / "files" / "big").write_bytes(b"O" * 200_000)
+        time.sleep(0.02)
+        # Newest: small, must survive.
+        new = arch_root / "rel-new-20261123T000000Z"
+        new.mkdir()
+        (new / "manifest.json").write_text('{"entries":[{"path":"/etc/new.conf"}]}\n')
+        (new / "files").mkdir()
+        (new / "files" / "small").write_text("ok\n")
+        integ = src / "integrity"
+        integ.mkdir(parents=True)
+        pending = {
+            "archives": [
+                {"id": old.name, "acked": False, "count": 1, "paths": ["/etc/old.conf"]},
+                {"id": new.name, "acked": False, "count": 1, "paths": ["/etc/new.conf"]},
+            ],
+        }
+        (integ / "hand-changes-pending.json").write_text(json.dumps(pending) + "\n")
+        (integ / "status.json").write_text(json.dumps({
+            "schema": 2,
+            "hand_changes_pending": {"archive_id": new.name, "count": 1},
+        }) + "\n")
+        cl = host.p("/usr/share/smartroomos/release-carry.list")
+        cl.parent.mkdir(parents=True, exist_ok=True)
+        cl.write_text("/var/lib/smartroomos\n")
+        new_root = Path(td) / "new-root"
+        new_root.mkdir()
+        # Patch the budget for the test so we do not need multi-hundred-MiB files.
+        old_max = sr.DRIFT_ARCHIVE_CARRY_MAX
+        sr.DRIFT_ARCHIVE_CARRY_MAX = 50_000
+        try:
+            sr.carry_into(host, new_root)
+        finally:
+            sr.DRIFT_ARCHIVE_CARRY_MAX = old_max
+        carried_old = new_root / "var/lib/smartroomos/drift-archive" / old.name
+        carried_new = new_root / "var/lib/smartroomos/drift-archive" / new.name
+        self.assertTrue((carried_old / "manifest.json").is_file())
+        self.assertFalse((carried_old / "files" / "big").exists())
+        self.assertTrue((carried_new / "files" / "small").is_file())
+        new_pending = json.loads(
+            (new_root / "var/lib/smartroomos/integrity/hand-changes-pending.json").read_text()
+        )
+        by_id = {a["id"]: a for a in new_pending["archives"]}
+        self.assertTrue(by_id[old.name].get("content_pruned"))
+        self.assertIn("carry_size_budget", by_id[old.name].get("content_pruned_reason") or "")
+        self.assertFalse(by_id[new.name].get("content_pruned"))
+        st = json.loads(
+            (new_root / "var/lib/smartroomos/integrity/status.json").read_text()
+        )
+        self.assertTrue(any(
+            p.get("id") == old.name and p.get("content_pruned")
+            for p in st.get("drift_archive_pruned") or []
+        ))
+
+
+
+
+class TestUnattendedLimine(unittest.TestCase):
+    def test_timeout_one_becomes_zero(self):
+        text = "timeout: 1\nquiet: yes\n"
+        out = sr.ensure_unattended_limine(text)
+        self.assertIn("timeout: 0\n", out)
+        self.assertNotIn("timeout: 1", out)
+
+    def test_inserts_timeout_when_missing(self):
+        out = sr.ensure_unattended_limine("quiet: yes\n")
+        self.assertTrue(out.startswith("timeout: 0\n"))
+
+
+class TestBtrfsDeviceUnderOverlay(unittest.TestCase):
+    """Live Host.btrfs_device must not return 'overlay' on a snapshot boot."""
+
+    def _host_with_findmnt(self, fstype, source, btrfs_sources, cmdline, existing):
+        host = sr.Host()
+        host.prefix = None
+
+        def run(argv, check=True, input=None):
+            if argv[:3] == ["findmnt", "-no", "FSTYPE"]:
+                return subprocess.CompletedProcess(argv, 0, (fstype + "\n").encode(), b"")
+            if argv[:3] == ["findmnt", "-no", "SOURCE"] and argv[-1] == "/":
+                return subprocess.CompletedProcess(argv, 0, (source + "\n").encode(), b"")
+            if argv[:3] == ["findmnt", "-nro", "SOURCE"]:
+                body = "".join(s + "\n" for s in btrfs_sources)
+                return subprocess.CompletedProcess(argv, 0, body.encode(), b"")
+            raise AssertionError(f"unexpected run: {argv}")
+
+        host.run = run  # type: ignore[method-assign]
+        host.cmdline = lambda: cmdline  # type: ignore[method-assign]
+        real_exists = Path.exists
+
+        def exists(self):
+            s = str(self)
+            if s in existing:
+                return True
+            if s.startswith("/dev/") or s.startswith("/run/"):
+                return s in existing
+            return real_exists(self)
+
+        self.addCleanup(setattr, Path, "exists", real_exists)
+        Path.exists = exists  # type: ignore[method-assign]
+        return host
+
+    def test_plain_btrfs_root(self):
+        host = self._host_with_findmnt(
+            "btrfs", "/dev/vda2[/@]", [], "root=UUID=x rootflags=subvol=@",
+            {"/dev/vda2"})
+        self.assertEqual(host.btrfs_device(), "/dev/vda2")
+
+    def test_overlay_uses_underlying_snapshot_mount(self):
+        host = self._host_with_findmnt(
+            "overlay", "overlay",
+            ["/dev/vda2[/@/.snapshots/3/snapshot]", "/dev/vda2[/@home]"],
+            "root=UUID=ba rootflags=subvol=/@/.snapshots/3/snapshot",
+            {"/dev/vda2"})
+        self.assertEqual(host.btrfs_device(), "/dev/vda2")
+
+    def test_overlay_falls_back_to_cmdline_uuid(self):
+        host = self._host_with_findmnt(
+            "overlay", "overlay", [],
+            "root=UUID=ba21474e-0579-415b-bcf4-2fc36ab0b138 rw rootflags=subvol=/@/.snapshots/3/snapshot",
+            {"/dev/disk/by-uuid/ba21474e-0579-415b-bcf4-2fc36ab0b138"})
+        self.assertEqual(
+            host.btrfs_device(),
+            "/dev/disk/by-uuid/ba21474e-0579-415b-bcf4-2fc36ab0b138")
+
+    def test_overlay_without_device_raises(self):
+        host = self._host_with_findmnt("overlay", "overlay", [], "quiet", set())
+        with self.assertRaises(sr.Fail) as ctx:
+            host.btrfs_device()
+        self.assertEqual(ctx.exception.code, "no-btrfs")
+
+
+class EspBudgetWS14(unittest.TestCase):
+    """WS14: ESP holds current + one fallback; history lives on btrfs boot-store.
+
+    Scratch ESP sized like the home Studio (499 MiB) with real-ish UKI/boot sizes.
+    """
+
+    UKI = 59 * 1024 * 1024
+    BOOT = 14 * 1024 * 1024
+    ESP_TOTAL = 499 * 1024 * 1024
+    # Non-boot firmware on the Studio ESP (vendorfw/aurora/asahi/limine/…);
+    # UKI + boot.bin live in EFI/ and m1n1/ and are counted via real files.
+    FIXED = 80 * 1024 * 1024
+
+    def _uki(self, tag: bytes) -> bytes:
+        # Distinct content per release; padded to real Studio UKI size.
+        body = tag + b"\0" * (self.UKI - len(tag))
+        return body[: self.UKI]
+
+    def _boot(self, tag: bytes) -> bytes:
+        body = tag + b"\0" * (self.BOOT - len(tag))
+        return body[: self.BOOT]
+
+    def _accounted_usage(self, w):
+        """Mock disk_usage: 499 MiB ESP minus bytes of files under the ESP + fixed."""
+        used = self.FIXED
+        for path in w.esp.rglob("*"):
+            if path.is_file():
+                used += path.stat().st_size
+        free = max(0, self.ESP_TOTAL - used)
+        return mock.Mock(total=self.ESP_TOTAL, used=used, free=free)
+
+    def _patch_esp_usage(self, w):
+        return mock.patch.object(shutil, "disk_usage", lambda p: self._accounted_usage(w))
+
+    def _quiet(self, w):
+        (w.prefix / "etc/smartroomos").mkdir(parents=True, exist_ok=True)
+        (w.prefix / "etc/smartroomos/release.conf").write_text(
+            "quiet_seconds=30\nlimit_seconds=60\nsample_seconds=5\n")
+        w.host._conf = None
+
+    def _promote_cycle(self, w, name, i):
+        code, _, err = w.run(
+            "update",
+            str(w.release(name=name, uki=self._uki(f"uki-{name}".encode()),
+                          stage2=self._boot(f"boot-{name}".encode()))),
+            "--unsigned",
+        )
+        self.assertEqual(code, 0, err)
+        w.trial_boot(name)
+        if i > 1:
+            (w.prefix / "proc/cmdline").write_text(
+                sr.trial_cmdline(CMDLINE, f"@r-{name}", name) + "\n")
+            (w.prefix / "proc/sys/kernel/random/boot_id").write_text(f"boot-{i + 1}\n")
+        self.assertEqual(w.run("health-run")[0], 0, name)
+        (w.prefix / "proc/cmdline").write_text(
+            sr.with_subvol(CMDLINE, f"@r-{name}", name) + "\n")
+        with contextlib.suppress(FileNotFoundError):
+            (w.prefix / "proc/device-tree/chosen/aurora,trial").unlink()
+
+    def test_five_releases_fit_on_499mb_esp_and_rollback_oldest(self):
+        w = World(self)
+        self._quiet(w)
+        names = [f"2026.11.2{i}-esp" for i in range(1, 6)]
+        with self._patch_esp_usage(w):
+            for i, name in enumerate(names, 1):
+                self._promote_cycle(w, name, i)
+                # ESP must not keep a growing UKI store (history is on btrfs).
+                legacy = list((w.esp / "smartroom-release/uki").glob("*.efi")) \
+                    if (w.esp / "smartroom-release/uki").is_dir() else []
+                self.assertEqual(legacy, [], f"legacy ESP UKI store after {name}: {legacy}")
+                store = w.prefix / "var/lib/smartroomos/boot-store"
+                self.assertTrue((store / name / "uki.efi").is_file(), name)
+                usage = self._accounted_usage(w)
+                self.assertLess(usage.used, self.ESP_TOTAL, f"ESP overflow after {name}")
+            st = w.state()
+            self.assertEqual(st["configured"]["release"], names[-1])
+            self.assertLessEqual(len(st.get("history") or []), 4)
+            oldest = names[0]
+            # History still has the oldest (5 kept = configured + 4).
+            hist_ids = {h["release"] for h in st.get("history") or []}
+            self.assertIn(oldest, hist_ids | {st["previous"]["release"]})
+            # Rollback to oldest kept via restore number.
+            rows = sr.release_rows(st)
+            oldest_row = next(r for r in rows if r["release"] == oldest)
+            code, out, err = w.run("restore", str(oldest_row["number"]), "--no-reboot")
+            self.assertEqual(code, 0, err)
+            self.assertEqual(w.state()["trial"]["release"], oldest)
+            self.assertTrue((w.esp / sr.TRIAL_UKI).is_file())
+            self.assertEqual((w.esp / sr.TRIAL_UKI).read_bytes()[:12], self._uki(f"uki-{oldest}".encode())[:12])
+
+    def test_stage_refused_when_esp_cannot_fit_is_in_status_json(self):
+        w = World(self)
+        self._quiet(w)
+        # Fill the ESP so even after offload there is no room for trial+reserve.
+        filler = w.esp / "vendorfw" / "blob.bin"
+        filler.parent.mkdir(parents=True, exist_ok=True)
+        # Leave only ~40 MiB free on a 499 MiB ESP (need is ~3*59+margin >> 40).
+        fill = self.ESP_TOTAL - self.FIXED - 40 * 1024 * 1024
+        filler.write_bytes(b"F" * max(0, fill))
+        d = w.release(name="2026.11.21-no-fit", uki=self._uki(b"uki-nofit"),
+                      stage2=self._boot(b"boot-nofit"))
+        with self._patch_esp_usage(w):
+            code, out, err = w.run("--json", "stage", str(d), "--unsigned")
+        self.assertEqual(code, 1)
+        self.assertIn("esp-full", out + err)
+        self.assertFalse((w.esp / sr.TRIAL_UKI).exists())
+        st = w.state()
+        self.assertEqual(st["configured"]["release"], "installed")
+        self.assertIsNone(st.get("trial"))
+        self.assertEqual(st["last_result"]["result"], "refused")
+        self.assertEqual(st["last_result"]["reason"], "esp-full")
+        doc = json.loads(w.run("status", "--json")[1])
+        self.assertEqual(doc["release"]["last_result"]["reason"], "esp-full")
+
+    def test_esp_migrate_moves_legacy_store_and_ws13d_hold(self):
+        w = World(self)
+        # Seed legacy ESP UKI store + previous-sized files.
+        uki_dir = w.esp / "smartroom-release/uki"
+        boot_dir = w.esp / "smartroom-release/boot"
+        uki_dir.mkdir(parents=True)
+        boot_dir.mkdir(parents=True)
+        uki = self._uki(b"uki-legacy")
+        boot = self._boot(b"boot-legacy")
+        (uki_dir / "2026.11.21-legacy.efi").write_bytes(uki)
+        (boot_dir / "2026.11.21-legacy.bin").write_bytes(boot)
+        hold = w.prefix / "var/lib/srbuild/esp-hold"
+        hold.mkdir(parents=True)
+        (hold / "ws13d-promote-omarchy_linux-aurora-previous.efi").write_bytes(uki)  # duplicate
+        (hold / "ws13d-promote-boot-previous.bin").write_bytes(boot)
+        (hold / "ws6-orig").mkdir()
+        (hold / "ws6-orig" / "keep.efi").write_bytes(b"safety")
+        (hold / "ws13-pre").mkdir()
+        code, out, err = w.run("esp-migrate", "--esp-hold", str(hold))
+        self.assertEqual(code, 0, err)
+        store = w.prefix / "var/lib/smartroomos/boot-store/2026.11.21-legacy"
+        self.assertTrue((store / "uki.efi").is_file())
+        self.assertEqual(sha((store / "uki.efi").read_bytes()), sha(uki))
+        self.assertFalse((uki_dir / "2026.11.21-legacy.efi").exists())
+        # duplicate hold file removed; safety folders untouched
+        self.assertFalse((hold / "ws13d-promote-omarchy_linux-aurora-previous.efi").exists())
+        self.assertTrue((hold / "ws6-orig" / "keep.efi").is_file())
+        self.assertTrue((hold / "ws13-pre").is_dir())
+
+    def test_fault_injection_esp_full_at_each_promote_copy(self):
+        """ESP full at each promote copy: room ends bootable with promote-failed or committed."""
+        # Targets match the ESP copies in _promote_steps (skip boot-store puts on btrfs).
+        targets = (
+            sr.PREVIOUS_UKI,
+            sr.PREVIOUS_BOOT,
+            sr.CONFIGURED_BOOT,
+            sr.CONFIGURED_UKI,
+        )
+        for target in targets:
+            w = World(self)
+            self._quiet(w)
+            tag = target.replace("/", "_")
+            name = f"2026.11.21-{tag[-12:]}"
+            w.run("update", str(w.release(name=name, uki=f"uki-{tag}".encode(),
+                                          stage2=f"boot-{tag}".encode())), "--unsigned")
+            w.trial_boot(name)
+            st = sr.load_state(w.host)
+            real = sr.copy_atomic
+
+            def flaky(src, dst, expect=None, _t=target):
+                if str(dst).endswith(_t) or str(dst).endswith(_t + ".new"):
+                    raise sr.Fail(f"ESP full writing {_t}", "esp-full")
+                return real(src, dst, expect)
+
+            with mock.patch.object(sr, "copy_atomic", flaky):
+                with self.assertRaises(sr.Fail):
+                    sr.promote(w.host, st)
+            path, cmd = sr.kernel_entry(w.limine())
+            uki = path.split("boot():/", 1)[1]
+            self.assertTrue((w.esp / uki).is_file(), f"target={target} missing {uki}")
+            subvol = __import__("re").search(r"subvol=(\S+?)(?:,|\s|$)", cmd).group(1)
+            self.assertTrue((w.prefix / "top" / subvol).is_dir() or subvol == "@")
+            st2 = w.state()
+            self.assertIsNone(st2.get("promoting"), target)
+            self.assertIn(st2["last_result"]["result"], ("rolled-back", "committed"), target)
+
+    def test_power_loss_between_promote_steps_via_scratch_harness(self):
+        """Existing resumable steps still finish after a cut; ESP never half-switched."""
+        w = World(self)
+        self._quiet(w)
+        name = "2026.11.21-cut"
+        w.run("update", str(w.release(name=name, uki=b"uki-cut", stage2=b"stage2-cut")), "--unsigned")
+        w.trial_boot(name)
+        real_save = sr.save_state
+        for cut in (2, 4):
+            w2 = World(self)
+            self._quiet(w2)
+            w2.run("update", str(w2.release(name=f"{name}-{cut}", uki=f"uki-{cut}".encode(),
+                                            stage2=f"boot-{cut}".encode())), "--unsigned")
+            w2.trial_boot(f"{name}-{cut}")
+            counter = {"n": 0}
+
+            def cutting(host, state, _cut=cut, _c=counter):
+                real_save(host, state)
+                if state.get("promoting"):
+                    _c["n"] += 1
+                    if _c["n"] == _cut:
+                        raise KeyboardInterrupt("power loss")
+
+            with mock.patch.object(sr, "save_state", cutting):
+                with self.assertRaises(KeyboardInterrupt):
+                    sr.promote(w2.host, sr.load_state(w2.host))
+            path, cmd = sr.kernel_entry(w2.limine())
+            uki = path.split("boot():/", 1)[1]
+            self.assertTrue((w2.esp / uki).is_file())
+            (w2.prefix / "proc/sys/kernel/random/boot_id").write_text(f"boot-cut-{cut}\n")
+            with mock.patch.object(sr, "save_state", real_save):
+                self.assertEqual(w2.run("health-run")[0], 0)
+            self.assertEqual(w2.state()["configured"]["release"], f"{name}-{cut}")
+            self.assertIsNone(w2.state().get("promoting"))
 
 
 if __name__ == "__main__":

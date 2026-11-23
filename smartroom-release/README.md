@@ -1,22 +1,37 @@
 # smartroom-release
 
-Update an Apple Silicon room Mac (a Studio) to a new SmartRoom release as a
-trial. The room keeps the new release only if it proves healthy. If it does not,
+Update a SmartRoom room (Apple Silicon Studio or Intel Mini) to a new release as
+a trial. The room keeps the new release only if it proves healthy. If it does not,
 the room comes back on the previous release by itself, with nobody there.
 
-Design: `~/smartroom-rollback/DESIGN.md` (decisions 1 to 6). This tool is the
-Studio half. A Linux snapshot layer on the Mini is a separate thing.
+Design: `~/smartroom-rollback/DESIGN.md` (decisions 1 to 6). One tool on both
+lines (WS6 Studio, WS12 Mini). The Mini's older pacman/snapshot update path is
+left in place for factory restore; Room Controller status/list/restore go through
+this tool.
+
+**Studio:** aura-try + Limine one-shot (U-Boot efivars) + Apple watchdog.  
+**Mini:** Limine one-shot (NVRAM) + iTCO_wdt/softdog; health service feeds
+`/dev/watchdog`. Keep the last 5 good releases on disk.
+
+**Old Mini migrate:** `smartroom-release migrate-check` then `migrate RELEASE`
+(or `bin/smartroom-release-migrate-bootstrap` over SSH). Installs the release
+beside the live `@`, arms a trial, keeps `@` until `confirm-migration`.
 
 ## What a release is
 
 One tested image: a btrfs root and the boot files that start it.
 
+Studio:
 ```
-manifest.json            what is in the release, with sha256 for each file
-manifest.json.sig        detached gpg signature of manifest.json
-root.btrfs.zst           `btrfs send` stream of the root, zstd compressed
-m1n1/boot.bin            aura stage 2 (m1n1 + U-Boot)
-EFI/Linux/omarchy_linux-aurora.efi   the UKI
+manifest.json / manifest.json.sig / root.btrfs.zst
+m1n1/boot.bin
+EFI/Linux/omarchy_linux-aurora.efi
+```
+
+Mini (`"line": "mini"` in the manifest; UKI only):
+```
+manifest.json / manifest.json.sig / root.btrfs.zst
+EFI/Linux/smartroomos_linux-t2.efi
 ```
 
 ```json
