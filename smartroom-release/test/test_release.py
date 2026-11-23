@@ -1462,6 +1462,32 @@ class MiniLine(unittest.TestCase):
         self.assertFalse(host.agent_connected())
 
 
+
+class TestBuildAsideEphemeral(unittest.TestCase):
+    def test_parks_drift_archive_and_old_release_dirs(self):
+        td = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, td, ignore_errors=True)
+        host = sr.Host(td)
+        arch = host.p("/var/lib/smartroomos/drift-archive")
+        arch.mkdir(parents=True)
+        (arch / "old").mkdir()
+        (arch / "old" / "f").write_text("x")
+        root = host.p("/root")
+        root.mkdir(parents=True)
+        old = root / "ws12-release-old"
+        old.mkdir()
+        (old / "x").write_text("y")
+        out = root / "ws12-release-keep"
+        out.mkdir()
+        moved = sr._aside_ephemeral_for_build(host, out)
+        self.assertFalse(arch.exists())
+        self.assertFalse(old.exists())
+        self.assertTrue(out.is_dir())
+        for src, dst in reversed(moved):
+            dst.rename(src)
+        self.assertTrue((arch / "old" / "f").is_file())
+
+
 class TestUnattendedLimine(unittest.TestCase):
     def test_timeout_one_becomes_zero(self):
         text = "timeout: 1\nquiet: yes\n"

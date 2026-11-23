@@ -2258,6 +2258,47 @@ def cmd_restore(host: Host, args) -> int:
 # build-release: the producing side, from a room (or later, an image)
 
 
+def _aside_ephemeral_for_build(host: Host, out: Path) -> list[tuple[Path, Path]]:
+    """Park drift archives and leftover local release dirs off the root briefly.
+
+    build-release snapshots the live root; nested prior /root/*release* payloads
+    and /var/lib/smartroomos/drift-archive (which can hold multi-GB
+    root.btrfs.zst copies) would otherwise inflate every later stream and
+    ENOSPC Mini keep-5. Moved aside for the snapshot only, then restored.
+    """
+    moved: list[tuple[Path, Path]] = []
+    aside_root = host.p("/var/lib/smartroomos/build-aside")
+    if aside_root.exists():
+        shutil.rmtree(aside_root, ignore_errors=True)
+    aside_root.mkdir(parents=True, exist_ok=True)
+    out_resolved = out.resolve() if out.exists() else out
+    candidates: list[Path] = []
+    arch = host.p("/var/lib/smartroomos/drift-archive")
+    if arch.is_dir():
+        candidates.append(arch)
+    root_dir = host.p("/root")
+    if root_dir.is_dir():
+        for child in sorted(root_dir.iterdir()):
+            name = child.name
+            if not (name.startswith("ws12-release") or name.startswith("ws13b-rel")
+                    or name.startswith("ws13-rel") or name.endswith("-rel")):
+                continue
+            try:
+                if child.resolve() == out_resolved or out_resolved.is_relative_to(child.resolve()):
+                    continue
+            except (OSError, ValueError):
+                continue
+            candidates.append(child)
+    for i, src in enumerate(candidates):
+        dst = aside_root / f"{i}-{src.name}"
+        try:
+            src.rename(dst)
+            moved.append((src, dst))
+        except OSError:
+            continue
+    return moved
+
+
 def cmd_build_release(host: Host, args) -> int:
     require_root(host)
     layout = host.layout()
@@ -2267,25 +2308,37 @@ def cmd_build_release(host: Host, args) -> int:
     esp = host.esp()
     src_uki = Path(args.uki_from) if args.uki_from else esp / layout.configured_uki
     src_boot = Path(args.boot_from) if args.boot_from else (esp / layout.configured_boot if layout.configured_boot else None)
-    with host.top() as top:
-        source = args.source_subvol or running_root(host)
-        snap = top / f"@build-{release}"
-        if snap.exists():
-            delete_subvolume(host, top, snap.name)
-        host.run(["btrfs", "subvolume", "snapshot", "-r", str(top / source), str(snap)])
-        try:
-            stream = out / "root.btrfs.zst"
-            with open(stream, "wb") as sink:
-                send = subprocess.Popen(["btrfs", "send", "-q", str(snap)], stdout=subprocess.PIPE)
-                comp = subprocess.Popen(["zstd", "-T0", "-3", "-c"], stdin=send.stdout, stdout=sink)
-                send.stdout.close()
-                comp.wait()
-                send.wait()
-            if send.returncode != 0 or comp.returncode != 0:
-                raise Fail("btrfs send | zstd failed")
-            used = host.run(["btrfs", "filesystem", "du", "-s", "--raw", str(snap)], check=False).stdout.decode()
-        finally:
-            delete_subvolume(host, top, snap.name)
+    moved = _aside_ephemeral_for_build(host, out)
+    try:
+        with host.top() as top:
+            source = args.source_subvol or running_root(host)
+            snap = top / f"@build-{release}"
+            if snap.exists():
+                delete_subvolume(host, top, snap.name)
+            host.run(["btrfs", "subvolume", "snapshot", "-r", str(top / source), str(snap)])
+            try:
+                stream = out / "root.btrfs.zst"
+                with open(stream, "wb") as sink:
+                    send = subprocess.Popen(["btrfs", "send", "-q", str(snap)], stdout=subprocess.PIPE)
+                    comp = subprocess.Popen(["zstd", "-T0", "-3", "-c"], stdin=send.stdout, stdout=sink)
+                    send.stdout.close()
+                    comp.wait()
+                    send.wait()
+                if send.returncode != 0 or comp.returncode != 0:
+                    raise Fail("btrfs send | zstd failed")
+                used = host.run(["btrfs", "filesystem", "du", "-s", "--raw", str(snap)], check=False).stdout.decode()
+            finally:
+                delete_subvolume(host, top, snap.name)
+    finally:
+        for src, dst in reversed(moved):
+            try:
+                if src.exists():
+                    shutil.rmtree(src, ignore_errors=True)
+                dst.rename(src)
+            except OSError:
+                pass
+        aside_root = host.p("/var/lib/smartroomos/build-aside")
+        shutil.rmtree(aside_root, ignore_errors=True)
     boot = []
     if layout.uses_aura:
         if src_boot is None or not Path(src_boot).is_file():
