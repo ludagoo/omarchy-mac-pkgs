@@ -726,5 +726,163 @@ class JournalBeforeReboot(unittest.TestCase):
                          ["journalctl --flush", "journalctl --sync", "systemctl reboot --no-block"])
 
 
+class RoomPages(unittest.TestCase):
+    """Waiting on Lucas: "room pages up when a display is connected" as a trial health
+    condition. Written and tested, off by default (require_room_pages=no)."""
+
+    def trial(self, world, conf=None):
+        if conf:
+            (world.prefix / "etc/smartroomos").mkdir(parents=True, exist_ok=True)
+            (world.prefix / "etc/smartroomos/release.conf").write_text(conf)
+            world.host._conf = None
+        code, _, err = world.run("update", str(world.release()), "--unsigned")
+        self.assertEqual(code, 0, err)
+        world.trial_boot()
+
+    def test_off_by_default_a_trial_without_room_pages_is_still_kept(self):
+        w = World(self)
+        w.host.room_pages_up = lambda: 0
+        self.trial(w)
+        self.assertEqual(sr.DEFAULTS["require_room_pages"], "no")
+        code, _, _ = w.run("health-run")
+        self.assertEqual(code, 0)
+        self.assertEqual(w.state()["configured"]["release"], "2026.11.21-1")
+
+    def test_on_a_trial_whose_room_pages_never_start_rolls_back(self):
+        w = World(self)
+        w.host.room_pages_up = lambda: 0
+        self.trial(w, "require_room_pages=yes\n")
+        code, _, _ = w.run("health-run")
+        self.assertEqual(code, 1)
+        st = w.state()
+        self.assertEqual(st["configured"]["release"], sr.INSTALLED)
+        self.assertEqual(st["last_result"]["reason"], "health-timeout")
+        self.assertFalse(st["last_result"]["displays_ok"])
+        self.assertEqual(st["last_result"]["room_pages_required"], "display")
+
+    def test_always_requires_pages_also_without_a_drm_display(self):
+        w = World(self)
+        w.host.screens = 0                  # a test Studio: Hyprland headless outputs only
+        w.host.room_pages_up = lambda: 0
+        self.trial(w, "require_room_pages=always\n")
+        code, _, _ = w.run("health-run")
+        self.assertEqual(code, 1)
+        self.assertEqual(w.state()["last_result"]["room_pages_required"], "always")
+
+    def test_on_with_room_pages_up_the_trial_is_kept(self):
+        w = World(self)
+        w.host.room_pages_up = lambda: 1
+        self.trial(w, "require_room_pages=yes\n")
+        code, _, _ = w.run("health-run")
+        self.assertEqual(code, 0)
+
+    def test_on_without_a_display_no_page_is_required(self):
+        w = World(self)
+        w.host.screens = 0
+        w.host.room_pages_up = lambda: 0
+        self.trial(w, "require_room_pages=yes\n")
+        code, _, _ = w.run("health-run")
+        self.assertEqual(code, 0)
+
+    def test_room_pages_are_kiosk_browser_mains_with_a_room_url(self):
+        tmp = Path(tempfile.mkdtemp(prefix="srel-pages-"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        (tmp / "etc").mkdir()
+        (tmp / "etc/passwd").write_text("root:x:0:0::/root:/bin/bash\nsmartroomcontroller:x:1000:1000::/h:/bin/sh\n")
+
+        def proc(pid, comm, uid, *args):
+            d = tmp / "proc" / str(pid)
+            d.mkdir(parents=True)
+            (d / "comm").write_text(comm + "\n")
+            (d / "status").write_text(f"Name:\t{comm}\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\n")
+            (d / "cmdline").write_bytes(b"\0".join(a.encode() for a in args) + b"\0")
+
+        host = sr.Host(str(tmp))
+        (tmp / "proc").mkdir()
+        self.assertEqual(host.room_pages_up(), 0)
+        proc(10, "chromium", 1000, "/usr/lib/chromium/chromium", "--type=renderer",
+             "https://s.example/test-full?role=presentationDisplay")                      # a renderer
+        proc(11, "chromium", 0, "/usr/lib/chromium/chromium", "https://s.example/r?role=x")   # not the kiosk user
+        proc(12, "chromium", 1000, "/usr/lib/chromium/chromium", "about:blank")               # no room page
+        proc(13, "bash", 1000, "bash", "https://s.example/r?role=x")
+        self.assertEqual(host.room_pages_up(), 0)
+        # Chromium's rewritten title (one space-joined string), as on the Home Studio
+        proc(15, "chromium", 1000, "/usr/lib/chromium/chromium --type=zygote --no-zygote-sandbox")
+        self.assertEqual(host.room_pages_up(), 0)
+        proc(14, "chromium", 1000, "/usr/lib/chromium/chromium --user-data-dir=/opt/smartroom/chrome-profiles/x "
+             "--kiosk --app=https://dev.example/test-full?role=presentationDisplay")
+        self.assertEqual(host.room_pages_up(), 1)
+        proc(16, "chromium", 1000, "/usr/lib/chromium/chromium", "--kiosk",
+             "https://dev.example/test-full?role=extraDisplay1")                   # NUL-separated
+        self.assertEqual(host.room_pages_up(), 2)
+
+
+class RollbackRefusal(unittest.TestCase):
+    """Waiting on Lucas: refuse a rollback/restore to a root that fails the invariant.
+    Written and tested behind refuse_unsafe_rollback=no (default: today's behaviour)."""
+
+    two_releases = RefusalKeepsTheFallback.two_releases
+
+    def spoil_previous(self, w):
+        real = w.host.check_root
+
+        def spoiled(path):
+            w.host.owners = {"etc": (1000, 1000)} if Path(path).name == "@r-2026.11.21-1" else {}
+            try:
+                return real(path)
+            finally:
+                w.host.owners = {}
+        w.host.check_root = spoiled
+
+    def conf(self, w, text):
+        (w.prefix / "etc/smartroomos").mkdir(parents=True, exist_ok=True)
+        (w.prefix / "etc/smartroomos/release.conf").write_text(text)
+        w.host._conf = None
+
+    def test_off_by_default_the_rollback_is_armed_and_the_trial_refuses_it(self):
+        w = self.two_releases()
+        self.spoil_previous(w)
+        self.assertEqual(sr.DEFAULTS["refuse_unsafe_rollback"], "no")
+        code, _, err = w.run("rollback")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(w.state()["trial"]["release"], "2026.11.21-1")
+
+    def test_on_a_rollback_to_an_unsafe_root_is_refused_before_arming(self):
+        w = self.two_releases()
+        self.conf(w, "refuse_unsafe_rollback=yes\n")
+        self.spoil_previous(w)
+        code, _, err = w.run("rollback")
+        self.assertEqual(code, 1)
+        self.assertIn("not armed", err)
+        st = w.state()
+        self.assertIsNone(st.get("trial"))
+        self.assertEqual((st["last_result"]["result"], st["last_result"]["reason"]), ("refused", "unsafe-root"))
+        self.assertFalse((w.esp / sr.LAYOUT_STUDIO.trial_uki).exists())
+        self.assertEqual((w.esp / sr.LAYOUT_STUDIO.previous_uki).read_bytes(), b"uki-2026.11.21-1")
+
+    def test_a_failed_rollback_keeps_the_previous_boot_files_on_the_esp(self):
+        w = self.two_releases()
+        prev_uki = w.esp / sr.LAYOUT_STUDIO.previous_uki
+        with mock.patch.object(sr, "esp_free_bytes", return_value=0):      # esp-full after the cleanup
+            code, _, err = w.run("rollback")
+        self.assertEqual(code, 1)
+        self.assertIn("ESP", err)
+        self.assertEqual(prev_uki.read_bytes(), b"uki-2026.11.21-1")
+
+    def test_on_a_good_root_and_a_check_error_still_roll_back(self):
+        w = self.two_releases()
+        self.conf(w, "refuse_unsafe_rollback=yes\n")
+        code, _, err = w.run("rollback")
+        self.assertEqual(code, 0, err)
+        w2 = self.two_releases()
+        self.conf(w2, "refuse_unsafe_rollback=yes\n")
+
+        def boom(_path):
+            raise RuntimeError("a bug")
+        w2.host.check_root = boom
+        code, _, err = w2.run("rollback")
+        self.assertEqual(code, 0, err)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -160,6 +160,15 @@ DEFAULTS = {
     "sample_seconds": 5,
     "min_displays": "",
     "reboot_hook": "",
+    # Waiting on Lucas (2026-11-24): "the room pages are up when a display is
+    # connected" as a trial health condition. Off until he decides. `yes`: when a
+    # display is connected; `always`: also without one (a test Studio's screens are
+    # Hyprland headless outputs, which DRM does not count).
+    "require_room_pages": "no",
+    # Waiting on Lucas (2026-11-24): refuse a rollback or restore whose root fails the
+    # root invariant before anything is armed. Off: today such a trial boots once and
+    # health-run's own check sends the room back (unsafe-root). `yes` turns it on.
+    "refuse_unsafe_rollback": "no",
     "keyring": "/usr/share/smartroomos/release-keyring.gpg",
     "watchdog_device": "/dev/watchdog",
 }
@@ -868,6 +877,32 @@ class Host:
             if len(fields) > 3 and fields[1] == "00000000" and int(fields[3], 16) & 1:
                 return True
         return False
+
+    def room_pages_up(self) -> int:
+        """Room pages running: kiosk browser main processes (no --type=) of the Room
+        Controller user whose URL names a room role. 2026-11-24: on edge-c the kiosk
+        Chromium could not start (a missing library) and the trial still passed."""
+        uid = _id_by_name(_read_small(str(self.p("/etc/passwd"))), RC_USER)
+        if uid is None:
+            return 0
+        count = 0
+        for proc in self.p("/proc").glob("[0-9]*"):
+            try:
+                if (proc / "comm").read_text().strip() not in ("chromium", "chrome"):
+                    continue
+                owner = next((line.split()[1] for line in (proc / "status").read_text().splitlines()
+                              if line.startswith("Uid:")), None)
+                if owner != str(uid):
+                    continue
+                # Chromium rewrites its process title: one space-joined string, not NUL-separated.
+                args = re.split(rb"[\0 ]+", (proc / "cmdline").read_bytes())
+            except (OSError, IndexError, StopIteration):
+                continue
+            if any(a.startswith(b"--type=") for a in args):
+                continue
+            if any(re.match(rb"(--app=)?https?://\S*[?&]role=\w", a) for a in args):
+                count += 1
+        return count
 
     def displays(self) -> int:
         count = 0
@@ -1944,15 +1979,29 @@ def space_check(host: Host, manifest: dict, esp: Path, state: Optional[dict] = N
     return budget
 
 
+def room_pages_required(host: Host) -> str:
+    """"" (off), "display" (when a display is connected) or "always"."""
+    value = str(host.conf.get("require_room_pages", "no")).lower()
+    return {"yes": "display", "1": "display", "true": "display", "always": "always"}.get(value, "")
+
+
 def health_now(host: Host) -> dict:
-    return {"connected": host.agent_connected(), "network": host.network_up(), "displays": host.displays()}
+    now = {"connected": host.agent_connected(), "network": host.network_up(), "displays": host.displays()}
+    need = room_pages_required(host)
+    if need == "always" or (need == "display" and now["displays"] > 0):
+        now["pages"] = host.room_pages_up()
+    return now
 
 
 def healthy_sample(host: Host, baseline: dict) -> tuple[int, int, int]:
+    """(Room Controller connected, network up, screens ok). Screens ok: no fewer
+    displays than before the update and, only when require_room_pages=yes and a
+    display is connected, at least one room page running."""
     now = health_now(host)
     want = host.conf["min_displays"]
     need = int(want) if str(want) != "" else int(baseline.get("displays", 0))
-    return (1 if now["connected"] else 0, 1 if now["network"] else 0, 1 if now["displays"] >= need else 0)
+    screens = now["displays"] >= need and now.get("pages", 1) > 0
+    return (1 if now["connected"] else 0, 1 if now["network"] else 0, 1 if screens else 0)
 
 
 # --------------------------------------------------------------------------
@@ -2345,10 +2394,24 @@ def promote_previous_as_trial(host: Host, state: dict, entry: Optional[dict] = N
     esp = host.esp()
     # Ensure durable store is populated from any legacy ESP copies first.
     esp_offload_non_essential(host, state, for_trial=True)
+    try:
+        return _rollback_trial_after_offload(host, state, prev, layout, esp)
+    except BaseException:
+        # As in stage: a rollback that is refused or fails after the cleanup above puts
+        # the previous release's boot files back on the ESP (the room's one fallback).
+        with contextlib.suppress(Exception):
+            restore_previous_to_esp(host, state)
+            save_state(host, state)
+        raise
+
+
+def _rollback_trial_after_offload(host: Host, state: dict, prev: dict, layout: BootLayout, esp: Path) -> dict:
     uki_src, boot_src = resolve_boot_files(host, prev, state=state)
     with host.top() as top:
         if prev["root"] and not subvol_exists(top, prev["root"]):
             raise Fail(f"the previous root {prev['root']} is gone", "not-found")
+        if prev["root"] and str(host.conf.get("refuse_unsafe_rollback", "no")).lower() in ("yes", "1", "true"):
+            refuse_unsafe_target(host, state, prev, top / prev["root"])
     # Budget: trial files + promote previous reserve (same as an update).
     uki_sz = file_size(uki_src)
     boot_sz = file_size(boot_src) if boot_src else 0
@@ -2384,6 +2447,25 @@ def promote_previous_as_trial(host: Host, state: dict, entry: Optional[dict] = N
     event(host, state, "started", release=prev["release"], previous=state["configured"].get("release"), kind="rollback")
     save_state(host, state)
     return state
+
+
+def refuse_unsafe_target(host: Host, state: dict, entry: dict, root: Path) -> None:
+    """refuse_unsafe_rollback=yes: a kept root that fails the invariant is never armed.
+    A check that cannot run does not refuse (as on a trial)."""
+    try:
+        report = host.check_root(root)
+    except Exception as exc:   # noqa: BLE001
+        message = exc.message if isinstance(exc, Fail) else f"{type(exc).__name__}: {exc}"
+        event(host, state, "root-check-error", release=entry.get("release"), message=message[:300])
+        save_state(host, state)
+        return
+    if report.ok:
+        return
+    record_result(host, state, "refused", reason="unsafe-root", release=entry.get("release"),
+                  message=report.summary(), findings=report.findings[:20])
+    event(host, state, "rollback-refused", reason="unsafe-root", release=entry.get("release"), count=report.count)
+    save_state(host, state)
+    raise Fail(f"release {entry.get('release')} not armed: {report.summary()}", "unsafe-root")
 
 
 def arm_trial(host: Host, state: dict) -> dict:
@@ -3671,7 +3753,8 @@ def run_health(host: Host, state: dict) -> int:
     # already spent, so the next boot is the configured release.
     last = samples[-1][1] if samples else (0, 0, 0)
     finish_failed_trial(host, state, "health-timeout",
-                        connected=bool(last[0]), network=bool(last[1]), displays_ok=bool(last[2]))
+                        connected=bool(last[0]), network=bool(last[1]), displays_ok=bool(last[2]),
+                        **({"room_pages_required": room_pages_required(host)} if room_pages_required(host) else {}))
     host.reboot()
     host.sleep(120)
     host.hard_reboot()

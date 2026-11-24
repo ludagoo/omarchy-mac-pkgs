@@ -82,6 +82,18 @@ Any refusal of `stage`/`update` after it has moved the previous release's boot f
 
 The firmware's `check-image`, the installer's `desk-check`, `smartroomos-integrity` and `smartroomos-release-sign` call this same command; the firmware's `overlay/usr/bin/smartroom-release` is a byte copy of this file.
 
+## Room pages as a trial condition (written, off)
+
+Waiting on Lucas: should a trial also need "the room pages are up when a display is connected"? On `2026.11.24-studio-edge-c` the kiosk Chromium could not start (a missing library), and the trial still passed: health samples the Room Controller's connection, the network and the display count, and the Room Controller reported `chrome=yes` (installed, not running).
+
+The condition is written and tested, and off: `require_room_pages=no` (default) in `/etc/smartroomos/release.conf`. A room page is a kiosk Chromium main process of the Room Controller user whose URL names a room role (`?role=presentationDisplay`). With `yes`, a sample whose room has a connected display (DRM) and no room page counts as not healthy, so a trial whose pages never start ends in `health-timeout` and rolls back (`last_result.room_pages_required`). `always` requires a page also without a DRM display: a test Studio's screens are Hyprland headless outputs, which DRM does not count, so `yes` would not have caught edge-c on the Home Studio, and `always` would have.
+
+## Refusing a rollback to an unsafe root (written, off)
+
+Waiting on Lucas. Today `rollback` and `restore` arm a kept root without checking it; if it fails the invariant, its trial's `health-run` refuses it at boot (`unsafe-root`) and the room returns to the configured release after one reboot. With `refuse_unsafe_rollback=yes` in `/etc/smartroomos/release.conf`, they check the target first and refuse before anything is armed (`last_result` `refused`, `unsafe-root`, event `rollback-refused`); a check that cannot run does not refuse. Default `no`. `check-kept` shows today which kept roots would be refused.
+
+A rollback or restore that fails after moving the previous release's boot files off the ESP puts them back, as `stage` does.
+
 ## Commands
 
 ```
