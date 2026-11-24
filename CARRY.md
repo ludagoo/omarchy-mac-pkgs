@@ -80,6 +80,7 @@ connected, network up, no screen lost, five quiet minutes inside fifteen); other
 boots the previous set by itself. It is the production form of the offline prototype
 in `smartroom/aura-try/` (which stays as the design reference and its own test).
 `smartroom-release/test/all` runs the whole path offline with a fake `btrfs` and a fake clock.
+It also holds the root invariant, `smartroom-release check-root` (2026-11-24): the one rule for every root a room can boot (no system path a login id or the Room Controller user owns, root-owned system dirs and sudoers, `visudo -c`). `build-release` refuses to send or sign a root that fails it, `stage` refuses to arm one, and the trial's `health-run` rolls back a trial that fails it (`unsafe-root`). The firmware's image checks and integrity report and the installer's `desk-check` call this command; the firmware's `overlay/usr/bin/smartroom-release` stays a byte copy. `build-release --source-path` makes the Studio release from a built image (installer `smartroom/release-pack`).
 
 #### smartroom-release: the process
 
@@ -90,7 +91,7 @@ in `smartroom/aura-try/` (which stays as the design reference and its own test).
 - **How to rebuild it reproducibly.** It is a Python script plus data files, `arch=any`, built
   from this repository at one commit by ludagoo/omarchy-mac-installer `smartroom/build-packages`
   (`smartroom-release` is in its package list): `pkgver` is the commit date, `_commit` the
-  commit. `check()` runs `smartroom-release/test/all` (needs `python3`, `tar`, `zstd`, `gpg`).
+  commit. `check()` runs `smartroom-release/test/all` (needs `python3`, `tar`, `zstd`, `gpg`, `visudo`).
 - **How to re-sync.** There is no upstream. Three things outside it can move and are the
   reason to re-test: aura's `trial.rs` (marker format `armed\n<path>\n`, the `chosen/aurora,trial`
   property, the 10 s fall-back), omarchy-mac-boot's Limine entry layout (`limine.conf`'s kernel entry
