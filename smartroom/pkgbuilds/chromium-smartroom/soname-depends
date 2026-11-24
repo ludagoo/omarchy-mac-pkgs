@@ -1,0 +1,57 @@
+#!/bin/bash
+# The shared libraries chromium-smartroom links against, from the built package's
+# own ELF NEEDED entries (not a hand list): every NEEDED soname that the package
+# does not ship itself and that a repository package provides by soname
+# (for example simdutf: libsimdutf.so=36-64).
+#
+#   soname-depends PACKAGE.pkg.tar.*   print the record: "soname provider" per line
+#                                      (provider "-": glibc, gcc-libs and the like
+#                                      declare no soname provide)
+#   soname-depends --names RECORD      the depends entries (libfoo.so) from a record
+#
+# PKGBUILD's _soname_depends is --names of the record NEEDED beside it. makepkg turns
+# each libfoo.so into the version the build linked (libsimdutf.so=36-64), so pacman,
+# and with it the image build, refuses a package set whose provider has another soname.
+# Run on the build host, with the repositories the package is built against.
+set -euo pipefail
+
+names() {
+  sed -e '/^#/d' -e '/ -$/d' "$1" | while read -r soname _; do
+    echo "${soname%%.so.*}.so"
+  done | sort -u
+}
+
+record() {
+  local package=$1 work file soname provider
+  [[ -f $package ]] || { echo "soname-depends: no $package" >&2; exit 1; }
+  work=$(mktemp -d)
+  trap 'rm -rf "$work"' RETURN
+  bsdtar -xf "$package" -C "$work" --exclude '.*'
+  declare -A shipped=() needed=()
+  while IFS= read -r -d '' file; do
+    shipped[${file##*/}]=1
+  done < <(find "$work" \( -type f -o -type l \) -name '*.so*' -print0)
+  while IFS= read -r -d '' file; do
+    LC_ALL=C readelf -h "$file" >/dev/null 2>&1 || continue
+    while read -r soname; do
+      needed[$soname]=1
+    done < <(LC_ALL=C readelf -d "$file" 2>/dev/null | sed -n 's/.*Shared library: \[\(.*\)\].*/\1/p')
+  done < <(find "$work" -type f -print0)
+  echo "# soname-depends record of ${package##*/} ($(sha256sum "$package" | cut -d' ' -f1))"
+  echo "# soname provider (- = no repository package provides this soname)"
+  for soname in $(printf '%s\n' "${!needed[@]}" | sort); do
+    [[ -z ${shipped[$soname]:-} ]] || continue
+    provider=-
+    if [[ $soname == *.so.* ]]; then
+      provider=$(pacman -Sddp --print-format '%n' "${soname%%.so.*}.so=${soname##*.so.}-64" 2>/dev/null | head -n1) || provider=-
+      [[ -n $provider ]] || provider=-
+    fi
+    echo "$soname $provider"
+  done
+}
+
+case ${1:-} in
+  --names) names "${2:?--names RECORD}" ;;
+  -*|"") sed -n '2,15p' "$0"; exit 2 ;;
+  *) record "$1" ;;
+esac

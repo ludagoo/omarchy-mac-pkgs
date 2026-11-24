@@ -54,8 +54,22 @@ PKGBUILD.
 `smartroom/build-packages` copies the built file (`room/prebuilt.sha256`)
 instead of building it. `smartroom/test/chromium-smartroom-recipe-test.sh`
 fails when the recipe here is not the one that built that file
-(`.BUILDINFO`'s `pkgbuild_sha256sum`). `smartroom/chromium-148-v4l2/` records
+(`.BUILDINFO`'s `pkgbuild_sha256sum`), unless `BUILT` names the change as
+`recipe_after_build` (a recipe change waiting for its build). `smartroom/chromium-148-v4l2/` records
 the earlier 148 attempt, which never shipped.
+
+The recipe declares the shared libraries the package links (`_soname_depends`,
+2026-11-24). They are not a hand list: `soname-depends PACKAGE` reads the built
+package's ELF NEEDED entries and keeps each soname a repository package provides
+(`NEEDED` holds that record for the shipped build; the recipe test checks the
+PKGBUILD list against it). makepkg turns `libsimdutf.so` into the version the
+build linked (`libsimdutf.so=36-64`), so pacman, and the image build with it,
+refuse a package set whose provider ships another soname. That is how
+`2026.11.24-studio-edge-c` shipped a Chromium that could not start (simdutf
+9.3.0 ships `.so.37`). After each build: run `soname-depends` on the new package,
+write `NEEDED`, update `_soname_depends` if it changed, and drop
+`recipe_after_build` from `BUILT`. The shipped `158.0.8127.36-3` predates this;
+pkgrel 4 is the first build that declares them.
 
 How each of these reaches a room: the installer's `smartroom/build-packages`
 builds it from the `_commit` here (or `copy-prebuilt` copies the pinned

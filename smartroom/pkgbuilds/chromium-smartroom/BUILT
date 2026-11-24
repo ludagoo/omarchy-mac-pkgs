@@ -9,3 +9,8 @@ pkgbuild_sha256=6be583326eab6f0e49fad223b7905053c28b67e9738ef0a0d09521401f0a6d53
 builddate=1795200034
 built_on=home Studio (j475c), user srbuild, room-158-makepkg.sh prep then build
 rust=rustup 1.99.0-aarch64-unknown-linux-gnu (SR_RUST_SYSROOT)
+# The recipe changed after that build (2026-11-24, WS17): pkgrel 4 declares the
+# shared libraries it links (_soname_depends, from the package's NEEDED; record in
+# NEEDED). The shipped package is still -3 until the next build, which replaces
+# the values above and drops this line.
+recipe_after_build=78f1fb2c746d31556a3dff1288a29e9bd19820e65c7476c7761a6345cc5d40cb
