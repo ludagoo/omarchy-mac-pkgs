@@ -76,6 +76,22 @@ def sha(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+SUDOERS = "root ALL=(ALL:ALL) ALL\n@includedir /etc/sudoers.d\n"
+SUDOERS_RC = "smartroomcontroller ALL=(root) NOPASSWD: /usr/bin/smartroom-release ^status --json$\n"
+
+
+def plant_system(root: Path) -> None:
+    """What every root has that the root invariant reads: sudoers, passwd, group."""
+    (root / "etc/sudoers.d").mkdir(parents=True, exist_ok=True)
+    (root / "etc/sudoers.d").chmod(0o750)
+    for rel, data in {"etc/sudoers": SUDOERS, "etc/sudoers.d/smartroomcontroller": SUDOERS_RC}.items():
+        (root / rel).write_text(data)
+        (root / rel).chmod(0o440)
+    (root / "etc/passwd").write_text("root:x:0:0::/root:/bin/bash\n"
+                                     "smartroomcontroller:x:1000:1000::/home/smartroomcontroller:/bin/bash\n")
+    (root / "etc/group").write_text("root:x:0:\nsmartroomcontroller:x:1000:\n")
+
+
 class FakeHost(sr.Host):
     """A Host whose paths are under a temp prefix and whose clock is fake."""
 
@@ -92,6 +108,13 @@ class FakeHost(sr.Host):
         self.save_works = True
         self.dog_writes = []
         self.health_log = []
+        self.owners = {}     # rel path (from the checked root) -> (uid, gid) as the invariant sees it
+
+    def root_ids(self, rel, uid, gid):
+        """The test runner owns every fake file: it plays root. owners plants others."""
+        if rel in self.owners:
+            return self.owners[rel]
+        return (0 if uid == os.getuid() else uid), (0 if gid == os.getgid() else gid)
 
     def now(self):
         return self.clock
@@ -176,6 +199,8 @@ class World:
             "UUID=aa  /  btrfs  noatime,subvol=@  0 0\nUUID=aa  /home  btrfs  noatime,subvol=@home  0 0\n")
         (root / "etc/default/limine").write_text(
             f'TARGET_OS_NAME="SmartRoom Firmware"\nKERNEL_CMDLINE[default]="{CMDLINE}"\n')
+        plant_system(root)
+        plant_system(p)
         # the room's own files, in the running root (which is the prefix itself)
         for rel, data in {
             "etc/machine-id": "machine-A\n", "etc/hostname": "room-A\n",
@@ -204,6 +229,7 @@ class World:
         (root / "etc/hostname").write_text("release-default\n")
         (root / "usr/lib").mkdir(parents=True)
         (root / "usr/lib/marker").write_text(f"release {name}\n")
+        plant_system(root)
         tar = subprocess.run(["tar", "-C", str(tree), "-cf", "-", "factory"], capture_output=True, check=True).stdout
         stream = subprocess.run(["zstd", "-q", "-c"], input=tar, capture_output=True, check=True).stdout
         (d / "root.btrfs.zst").write_bytes(stream)
@@ -517,6 +543,7 @@ class Stage(unittest.TestCase):
             f = root / rel
             f.parent.mkdir(parents=True, exist_ok=True)
             f.write_text(data)
+        plant_system(root)
         tar = subprocess.run(["tar", "-C", str(tree), "-cf", "-", "factory"], capture_output=True, check=True).stdout
         stream = subprocess.run(["zstd", "-q", "-c"], input=tar, capture_output=True, check=True).stdout
         (d / "root.btrfs.zst").write_bytes(stream)
@@ -1057,6 +1084,8 @@ class MiniWorld(World):
             "UUID=aa  /  btrfs  noatime,subvol=@  0 0\n")
         (root / "etc/default/limine").write_text(
             f'TARGET_OS_NAME="SmartRoom Firmware"\nKERNEL_CMDLINE[default]="{MINI_CMDLINE}"\n')
+        plant_system(root)
+        plant_system(p)
         for rel, data in {
             "etc/machine-id": "machine-M\n", "etc/hostname": "mini-A\n",
             "etc/ssh/ssh_host_ed25519_key": "HOSTKEY-M", "etc/ssh/ssh_host_ed25519_key.pub": "HOSTPUB-M",
@@ -1080,6 +1109,7 @@ class MiniWorld(World):
         (root / "etc/default/limine").write_text(f'KERNEL_CMDLINE[default]="{cmdline}"\n')
         (root / "usr/lib").mkdir(parents=True)
         (root / "usr/lib/marker").write_text(f"release {name}\n")
+        plant_system(root)
         tar = subprocess.run(["tar", "-C", str(tree), "-cf", "-", "factory"], capture_output=True, check=True).stdout
         stream = subprocess.run(["zstd", "-q", "-c"], input=tar, capture_output=True, check=True).stdout
         (d / "root.btrfs.zst").write_bytes(stream)

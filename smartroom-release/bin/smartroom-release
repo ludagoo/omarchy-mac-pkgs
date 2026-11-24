@@ -21,11 +21,17 @@ boot chain boots the previous release by itself.
   smartroom-release health-run                      the boot-time service
   smartroom-release build-release --id ID --out DIR [--source-subvol NAME]
                                   [--sign-key FPR]  make a release from this room
+  smartroom-release build-release --id ID --out DIR --source-path SUBVOL --line LINE
+                                  --uki-from F [--boot-from F] [--source-info K=V]...
+                                                    make a release from an image root (build host)
+  Every release root passes check-root before it is sent or signed.
   smartroom-release restore N [--no-reboot]         Room Controller contract
   smartroom-release migrate RELEASE [--reboot] [--unsigned] [--force]
                                   old Mini -> release trial (fallback = current @)
   smartroom-release migrate-check                   refuse safely if the room cannot move
   smartroom-release esp-migrate [--esp-hold DIR]    move ESP UKI store + ws13d hold into boot-store
+  smartroom-release check-root [ROOT] [--json]      the root invariant (owners, system dirs, sudoers)
+                                                    on a directory, a root.btrfs.zst, or /
 
 RELEASE is a directory holding manifest.json (see README.md), or an https URL
 of one. Nothing here asks a question. Exit status is non-zero on error; with
@@ -55,6 +61,8 @@ import os
 import re
 import shutil
 import signal
+import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -97,6 +105,7 @@ REASONS = (
     "trial-did-not-start",   # Limine ran the trial entry but the trial boot image never ran
     "trial-incomplete",      # the trial boot image ran but Limine booted the configured entry
     "promote-failed",        # mark-good could not finish; room left on a bootable release
+    "unsafe-root",           # the trial root fails the root invariant (check-root): never kept
 )
 
 
@@ -942,6 +951,14 @@ class Host:
         with contextlib.suppress(OSError):
             Path("/proc/sys/kernel/sysrq").write_text("1")
             Path("/proc/sysrq-trigger").write_text("b")
+
+    # the root invariant ---------------------------------------------------------
+    def root_ids(self, rel: str, uid: int, gid: int) -> tuple[int, int]:
+        """Owners as the invariant sees them: the real ones (tests map theirs)."""
+        return uid, gid
+
+    def check_root(self, path: Path) -> "RootReport":
+        return check_root(path, self.root_ids)
 
     def record_integrity(self) -> None:
         tool = self.p("/usr/local/sbin/smartroomos-integrity")
@@ -2155,6 +2172,15 @@ def stage_release(host: Host, state: dict, directory: Path, unsigned: bool, kind
         cmdline = new_root_cmdline(new_root, found[1])
         require_zero_touch(cmdline)
         fix_root_files(host, new_root, subvol, release)
+        report = host.check_root(new_root)
+        if not report.ok:
+            delete_subvolume(host, top, subvol)
+            record_result(host, state, "refused", reason="unsafe-root", message=report.summary(),
+                          release=release, findings=report.findings[:20])
+            event(host, state, "stage-refused", reason="unsafe-root", release=release, count=report.count)
+            save_state(host, state)
+            print(report.text(), file=sys.stderr)
+            raise Fail(f"release {release} refused: {report.summary()}", "unsafe-root")
     # boot files, beside the configured ones (ESP); durable copy on btrfs boot-store.
     trial_uki = layout.trial_uki
     trial_boot = layout.trial_boot
@@ -2459,46 +2485,84 @@ def _aside_ephemeral_for_build(host: Host, out: Path) -> list[tuple[Path, Path]]
     return moved
 
 
+def _check_then_send(host: Host, snap: Path, stream: Path) -> None:
+    """The root invariant on the read-only snapshot, then send exactly that snapshot."""
+    report = host.check_root(snap)
+    if not report.ok:
+        print(report.text(), file=sys.stderr)
+        raise Fail(f"build-release refused, nothing sent or signed: {report.summary()}", "unsafe-root")
+    with open(stream, "wb") as sink:
+        send = subprocess.Popen(["btrfs", "send", "-q", str(snap)], stdout=subprocess.PIPE)
+        comp = subprocess.Popen(["zstd", "-T0", "-3", "-c"], stdin=send.stdout, stdout=sink)
+        send.stdout.close()
+        comp.wait()
+        send.wait()
+    if send.returncode != 0 or comp.returncode != 0:
+        raise Fail("btrfs send | zstd failed")
+
+
 def cmd_build_release(host: Host, args) -> int:
     require_root(host)
-    layout = host.layout()
     release = safe_id(args.id)
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
-    esp = host.esp()
-    src_uki = Path(args.uki_from) if args.uki_from else esp / layout.configured_uki
-    src_boot = Path(args.boot_from) if args.boot_from else (esp / layout.configured_boot if layout.configured_boot else None)
-    moved = _aside_ephemeral_for_build(host, out)
-    try:
-        with host.top() as top:
-            source = args.source_subvol or running_root(host)
-            snap = top / f"@build-{release}"
-            if snap.exists():
-                delete_subvolume(host, top, snap.name)
-            host.run(["btrfs", "subvolume", "snapshot", "-r", str(top / source), str(snap)])
-            try:
-                stream = out / "root.btrfs.zst"
-                with open(stream, "wb") as sink:
-                    send = subprocess.Popen(["btrfs", "send", "-q", str(snap)], stdout=subprocess.PIPE)
-                    comp = subprocess.Popen(["zstd", "-T0", "-3", "-c"], stdin=send.stdout, stdout=sink)
-                    send.stdout.close()
-                    comp.wait()
-                    send.wait()
-                if send.returncode != 0 or comp.returncode != 0:
-                    raise Fail("btrfs send | zstd failed")
-                used = host.run(["btrfs", "filesystem", "du", "-s", "--raw", str(snap)], check=False).stdout.decode()
-            finally:
-                delete_subvolume(host, top, snap.name)
-    finally:
-        for src, dst in reversed(moved):
-            try:
-                if src.exists():
-                    shutil.rmtree(src, ignore_errors=True)
-                dst.rename(src)
-            except OSError:
-                pass
-        aside_root = host.p("/var/lib/smartroomos/build-aside")
-        shutil.rmtree(aside_root, ignore_errors=True)
+    stream = out / "root.btrfs.zst"
+    # A refused or failed build leaves no manifest or signature, not even an older one.
+    for name in (MANIFEST, MANIFEST + ".sig", stream.name):
+        remove(out / name)
+    source_info = {}
+    for item in args.source_info:
+        key, sep, value = item.partition("=")
+        if not sep or not re.fullmatch(r"[a-z][a-z0-9_-]*", key):
+            raise Fail(f"--source-info wants KEY=VALUE, not {item}", "usage")
+        source_info[key] = value
+    if args.source_path:
+        # A build host: release the image's root subvolume, with the boot files given.
+        if not args.line or not args.uki_from or (args.line == "studio" and not args.boot_from):
+            raise Fail("--source-path needs --line, --uki-from and (studio) --boot-from", "usage")
+        layout = LAYOUT_STUDIO if args.line == "studio" else LAYOUT_MINI
+        src_uki = Path(args.uki_from)
+        src_boot = Path(args.boot_from) if args.boot_from else None
+        source = Path(args.source_path)
+        if not source.is_dir():
+            raise Fail(f"{source} is not a directory", "not-found")
+        snap = source.parent / f"@build-{release}"
+        if snap.exists():
+            delete_subvolume(host, source.parent, snap.name)
+        host.run(["btrfs", "subvolume", "snapshot", "-r", str(source), str(snap)])
+        try:
+            _check_then_send(host, snap, stream)
+        finally:
+            delete_subvolume(host, source.parent, snap.name)
+    else:
+        layout = host.layout()
+        if args.line and args.line != layout.line:
+            raise Fail(f"this room is {layout.line}, not {args.line}", "wrong-line")
+        esp = host.esp()
+        src_uki = Path(args.uki_from) if args.uki_from else esp / layout.configured_uki
+        src_boot = Path(args.boot_from) if args.boot_from else (esp / layout.configured_boot if layout.configured_boot else None)
+        moved = _aside_ephemeral_for_build(host, out)
+        try:
+            with host.top() as top:
+                source_name = args.source_subvol or running_root(host)
+                snap = top / f"@build-{release}"
+                if snap.exists():
+                    delete_subvolume(host, top, snap.name)
+                host.run(["btrfs", "subvolume", "snapshot", "-r", str(top / source_name), str(snap)])
+                try:
+                    _check_then_send(host, snap, stream)
+                finally:
+                    delete_subvolume(host, top, snap.name)
+        finally:
+            for src, dst in reversed(moved):
+                try:
+                    if src.exists():
+                        shutil.rmtree(src, ignore_errors=True)
+                    dst.rename(src)
+                except OSError:
+                    pass
+            aside_root = host.p("/var/lib/smartroomos/build-aside")
+            shutil.rmtree(aside_root, ignore_errors=True)
     boot = []
     if layout.uses_aura:
         if src_boot is None or not Path(src_boot).is_file():
@@ -2523,12 +2587,512 @@ def cmd_build_release(host: Host, args) -> int:
         "root": {"file": "root.btrfs.zst", "sha256": sha256_file(stream), "size": stream.stat().st_size},
         "boot": boot,
     }
+    if source_info:
+        manifest["source"] = source_info
     write_atomic(out / MANIFEST, (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode(), 0o644)
     if args.sign_key:
         host.run(["gpg", "--batch", "--yes", "--detach-sign", "--local-user", args.sign_key,
                   "--output", str(out / (MANIFEST + ".sig")), str(out / MANIFEST)])
     print(f"release {release} written to {out}")
     return 0
+
+
+
+# --------------------------------------------------------------------------
+# check-root: the root invariant (one rule for every root a room can boot)
+#
+# 2026-11-24: the Studio releases 2026.11.24-studio-edge and -edge-b shipped
+# about 200 system paths owned by uid/gid 1000 (/, /etc, /usr, /usr/bin,
+# /usr/lib, units, initcpio hooks, pacman.conf, /etc/sudoers.d). uid 1000 is
+# smartroomcontroller, the kiosk and Room Controller user. sudo ignored its
+# rules, and the kiosk user could have become root. A job script had rsynced
+# the overlay with the build user's owner, and no gate ran on that path.
+#
+# This is the only implementation. Every caller runs this code:
+#   smartroom-release build-release   the root it is about to send and sign
+#   smartroom-release stage/update    the received root, before a trial is armed
+#   smartroom-release health-run      the running trial root, before mark-good
+#   smartroomos-integrity             the running room (reason unsafe-root)
+#   fw builder/image/check-image(-x86_64), installer smartroom/desk-check,
+#   fw bin/smartroomos-release-sign   `smartroom-release check-root ...`
+# fw overlay/usr/bin/smartroom-release is a byte copy of this file
+# (fw test/unit/mini-release-tool.sh), so the Studio and the Mini run the same rule.
+#
+# A root fails on any of:
+#   login-owner      a path outside the exempt trees whose uid or gid is a login
+#                    id (>= 1000, except 65534 nobody/nogroup)
+#   rc-owner         a path outside the exempt trees owned by the Room Controller
+#                    user or group, looked up by name in the root's own
+#                    /etc/passwd and /etc/group (whatever number it has)
+#   system-dir       /, /etc, /usr, a direct child of /usr, /etc/sudoers,
+#                    /etc/sudoers.d or a file in it: not root:root, or (not a
+#                    symlink) writable by group or other
+#   sudoers-missing  no /etc/sudoers
+#   visudo           `visudo -c` fails on the root's sudoers and sudoers.d
+#   unreadable       a directory the check cannot list (it cannot vouch for it)
+
+RC_USER = "smartroomcontroller"
+LOGIN_ID_MIN = 1000
+OVERFLOW_ID = 65534  # nobody / nogroup
+
+# Trees where a login id may own paths. Derived 2026-11-24 from the good
+# release root 2026.11.21-studio-ws14b, the Mini image 2026.11.21-mini and
+# the repaired Home Studio. (path, the path itself is exempt too, why)
+ROOT_EXEMPT_TREES = (
+    ("home", False,
+     "users' homes (kiosk profile, ssh keys). /home itself stays root's."),
+    ("opt/smartroom", True,
+     "the Room Controller's own directory: it self-updates (agent-next beside agent) and "
+     "writes logs/. The firmware gives it to the Room Controller "
+     "(usr/lib/tmpfiles.d/smartroom-room-controller.conf)."),
+    ("tmp", False, "sticky world-writable scratch (tmpfs on a room, empty in an image)"),
+    ("var/tmp", False, "sticky world-writable scratch, as /tmp"),
+)
+# systemd DynamicUser= ids (61184..65519) own their StateDirectory/CacheDirectory/
+# LogsDirectory under these 0700 root directories, where no login reaches them
+# (speakersafetyd on the Studio). Only those ids are exempt there.
+ROOT_DYNAMIC_IDS = (61184, 65519)
+ROOT_DYNAMIC_TREES = ("var/lib/private", "var/cache/private", "var/log/private")
+# Not walked below (the path itself is still checked): kernel and runtime
+# filesystems of a running room (empty in an image), and snapper history
+# (read-only snapshots, never part of a release; old ones may keep owners a
+# release has since fixed).
+ROOT_NO_DESCEND = ("proc", "sys", "dev", "run", ".snapshots")
+ROOT_SYSTEM_DIRS = ("", "etc", "usr", "etc/sudoers.d", "etc/sudoers")
+SUDOERS_REL = "etc/sudoers"
+SUDOERS_D_REL = "etc/sudoers.d"
+ROOT_FINDINGS_CAP = 200
+
+
+def _login_id(n: int) -> bool:
+    return n >= LOGIN_ID_MIN and n != OVERFLOW_ID
+
+
+def _root_exempt(rel: str, uid: int, gid: int) -> bool:
+    for top, self_too, _why in ROOT_EXEMPT_TREES:
+        if rel.startswith(top + "/") or (self_too and rel == top):
+            return True
+    lo, hi = ROOT_DYNAMIC_IDS
+    for top in ROOT_DYNAMIC_TREES:
+        if rel.startswith(top + "/"):
+            ids = [i for i in (uid, gid) if _login_id(i)]
+            if ids and all(lo <= i <= hi for i in ids):
+                return True
+    return False
+
+
+def _root_skip_below(rel: str) -> bool:
+    if rel in ROOT_NO_DESCEND:
+        return True
+    return any(rel == top for top, _s, _w in ROOT_EXEMPT_TREES)
+
+
+def _is_system_dir(rel: str) -> bool:
+    if rel in ROOT_SYSTEM_DIRS:
+        return True
+    if rel.startswith("usr/") and "/" not in rel[4:]:
+        return True
+    return rel.startswith(SUDOERS_D_REL + "/") and "/" not in rel[len(SUDOERS_D_REL) + 1:]
+
+
+def _id_by_name(data: Optional[bytes], name: str) -> Optional[int]:
+    for line in (data or b"").decode("utf-8", "replace").splitlines():
+        parts = line.split(":")
+        if len(parts) >= 3 and parts[0] == name:
+            try:
+                return int(parts[2])
+            except ValueError:
+                return None
+    return None
+
+
+class RootReport:
+    def __init__(self, root: str):
+        self.root = root
+        self.checked = 0
+        self.count = 0
+        self.findings: list[dict] = []
+        self.rc_uid: Optional[int] = None
+        self.rc_gid: Optional[int] = None
+
+    def add(self, rule: str, rel: str, detail: str, uid=None, gid=None, mode=None) -> None:
+        self.count += 1
+        if len(self.findings) < ROOT_FINDINGS_CAP:
+            item = {"rule": rule, "path": "/" + rel, "detail": detail}
+            if uid is not None:
+                item["owner"] = f"{uid}:{gid}"
+            if mode is not None:
+                item["mode"] = "%04o" % stat.S_IMODE(mode)
+            self.findings.append(item)
+
+    @property
+    def ok(self) -> bool:
+        return self.count == 0
+
+    def as_dict(self) -> dict:
+        rules: dict[str, int] = {}
+        for f in self.findings:
+            rules[f["rule"]] = rules.get(f["rule"], 0) + 1
+        return {"ok": self.ok, "root": self.root, "checked": self.checked, "count": self.count,
+                "rules": rules, "findings": self.findings,
+                "truncated": self.count > len(self.findings),
+                "rc_user": {"name": RC_USER, "uid": self.rc_uid, "gid": self.rc_gid}}
+
+    def summary(self, limit: int = 5) -> str:
+        if self.ok:
+            return f"root invariant ok ({self.checked} paths)"
+        head = ", ".join(f"{f['path']} {f['rule']}" + (f" {f['owner']}" if "owner" in f else "")
+                         for f in self.findings[:limit])
+        more = f" and {self.count - limit} more" if self.count > limit else ""
+        return f"root invariant failed: {self.count} problems: {head}{more}"
+
+    def text(self, limit: int = 40) -> str:
+        lines = [f"check-root: {self.root}: {'ok' if self.ok else 'FAIL'} "
+                 f"({self.checked} paths, {self.count} problems)"]
+        for f in self.findings[:limit]:
+            owner = f" {f['owner']}" if "owner" in f else ""
+            mode = f" mode {f['mode']}" if "mode" in f else ""
+            lines.append(f"  {f['rule']:<15} {f['path']}{owner}{mode}  {f['detail']}")
+        if self.count > limit:
+            lines.append(f"  ... {self.count - limit} more")
+        return "\n".join(lines)
+
+
+def _check_root_entry(report: RootReport, rel: str, uid: int, gid: int, mode: int) -> None:
+    report.checked += 1
+    exempt = _root_exempt(rel, uid, gid)
+    rc_ids = (uid == report.rc_uid and report.rc_uid is not None) or \
+             (gid == report.rc_gid and report.rc_gid is not None)
+    if rc_ids and not exempt:
+        report.add("rc-owner", rel, f"owned by the Room Controller user {RC_USER}", uid, gid, mode)
+    elif (_login_id(uid) or _login_id(gid)) and not exempt:
+        report.add("login-owner", rel, "owned by a login id (>= 1000)", uid, gid, mode)
+    if _is_system_dir(rel):
+        if uid != 0 or gid != 0:
+            report.add("system-dir", rel, "must be root:root", uid, gid, mode)
+        elif not stat.S_ISLNK(mode) and stat.S_IMODE(mode) & 0o022:
+            report.add("system-dir", rel, "writable by group or other", uid, gid, mode)
+
+
+_SUDO_INCLUDE = re.compile(r"^(\s*[@#]include(?:dir)?\s+)(\S+)(.*)$")
+
+
+def visudo_check(files: dict) -> tuple[bool, str]:
+    """files: {"etc/sudoers": bytes, "etc/sudoers.d/NAME": bytes}. Runs this host's
+    `visudo -c` on a private copy whose includes point into the copy."""
+    visudo = shutil.which("visudo") or next(
+        (p for p in ("/usr/bin/visudo", "/usr/sbin/visudo") if os.path.exists(p)), None)
+    if not visudo:
+        return False, "visudo is not installed here; the sudoers cannot be checked"
+    tmp = tempfile.mkdtemp(prefix="smartroom-visudo.")
+    try:
+        os.makedirs(os.path.join(tmp, SUDOERS_D_REL))
+
+        def rewrite(data: bytes) -> bytes:
+            out = []
+            for line in data.decode("utf-8", "replace").splitlines():
+                m = _SUDO_INCLUDE.match(line)
+                if m and m.group(2).startswith("/etc/"):
+                    line = m.group(1) + tmp + m.group(2) + m.group(3)
+                out.append(line)
+            return ("\n".join(out) + "\n").encode()
+
+        for rel, data in files.items():
+            dest = os.path.join(tmp, rel)
+            with open(dest, "wb") as fh:
+                fh.write(rewrite(data))
+            os.chmod(dest, 0o440)
+        done = subprocess.run([visudo, "-c", "-f", os.path.join(tmp, SUDOERS_REL)],
+                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        return done.returncode == 0, done.stdout.replace(tmp, "").strip()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _finish_sudoers(report: RootReport, files: dict, has_sudoers: bool) -> None:
+    if not has_sudoers:
+        report.add("sudoers-missing", SUDOERS_REL, "no /etc/sudoers (the Room Controller needs sudo)")
+        return
+    ok, msg = visudo_check(files)
+    if not ok:
+        report.add("visudo", SUDOERS_REL, "visudo -c failed: " + " | ".join(msg.splitlines()[-6:]))
+
+
+def _read_small(path: str) -> Optional[bytes]:
+    try:
+        if os.path.isfile(path) and not os.path.islink(path):
+            with open(path, "rb") as fh:
+                return fh.read()
+    except OSError:
+        return None
+    return None
+
+
+def check_root_tree(root: str, translate=None) -> RootReport:
+    """The invariant on a directory tree: an image or release root, a staged
+    root, or / on a running room. Never follows symlinks. translate(rel, uid,
+    gid) -> (uid, gid) is Host.root_ids (the offline tests' fake owners)."""
+    root = os.path.abspath(root)
+    ids = translate or (lambda _rel, uid, gid: (uid, gid))
+    report = RootReport(root)
+    report.rc_uid = _id_by_name(_read_small(os.path.join(root, "etc/passwd")), RC_USER)
+    report.rc_gid = _id_by_name(_read_small(os.path.join(root, "etc/group")), RC_USER)
+    st = os.lstat(root)
+    _check_root_entry(report, "", *ids("", st.st_uid, st.st_gid), st.st_mode)
+    stack = [""]
+    while stack:
+        rel_dir = stack.pop()
+        try:
+            it = os.scandir(os.path.join(root, rel_dir) if rel_dir else root)
+        except (FileNotFoundError, NotADirectoryError):
+            continue
+        except PermissionError as exc:
+            report.add("unreadable", rel_dir, f"cannot list: {exc.strerror}")
+            continue
+        with it:
+            for entry in it:
+                rel = entry.name if not rel_dir else f"{rel_dir}/{entry.name}"
+                try:
+                    s = entry.stat(follow_symlinks=False)
+                except FileNotFoundError:
+                    continue
+                _check_root_entry(report, rel, *ids(rel, s.st_uid, s.st_gid), s.st_mode)
+                if stat.S_ISDIR(s.st_mode) and not _root_skip_below(rel):
+                    stack.append(rel)
+    files = {}
+    data = _read_small(os.path.join(root, SUDOERS_REL))
+    if data is not None:
+        files[SUDOERS_REL] = data
+        d = os.path.join(root, SUDOERS_D_REL)
+        if os.path.isdir(d) and not os.path.islink(d):
+            for name in sorted(os.listdir(d)):
+                more = _read_small(os.path.join(d, name))
+                if more is not None:
+                    files[f"{SUDOERS_D_REL}/{name}"] = more
+    _finish_sudoers(report, files, data is not None)
+    return report
+
+
+# A full btrfs send stream (root.btrfs.zst), replayed for paths, owners and modes
+# only, without privileges. File data is kept for sudoers, passwd and group.
+_BTRFS_MAGIC = b"btrfs-stream\0"
+(_C_SUBVOL, _C_SNAPSHOT, _C_MKFILE, _C_MKDIR, _C_MKNOD, _C_MKFIFO, _C_MKSOCK, _C_SYMLINK,
+ _C_RENAME, _C_LINK, _C_UNLINK, _C_RMDIR) = range(1, 13)
+_C_WRITE, _C_TRUNCATE, _C_CHMOD, _C_CHOWN, _C_END = 15, 17, 18, 19, 21
+_A_SIZE, _A_MODE, _A_UID, _A_GID, _A_PATH, _A_PATH_TO, _A_PATH_LINK, _A_OFFSET, _A_DATA = \
+    4, 5, 6, 7, 15, 16, 17, 18, 19
+_ORPHAN = re.compile(r"^o\d+-\d+-\d+$")
+_STREAM_DATA = {SUDOERS_REL, "etc/passwd", "etc/group"}
+
+
+class _Ino:
+    __slots__ = ("kind", "uid", "gid", "mode", "data")
+
+    def __init__(self, kind: str):
+        self.kind = kind
+        self.uid = self.gid = 0
+        self.mode = {"d": stat.S_IFDIR | 0o755, "l": stat.S_IFLNK | 0o777}.get(kind, stat.S_IFREG | 0o644)
+        self.data: Optional[bytes] = None
+
+
+class _Node:
+    __slots__ = ("ino", "kids")
+
+    def __init__(self, ino: _Ino):
+        self.ino = ino
+        self.kids: Optional[dict] = {} if ino.kind == "d" else None
+
+
+class _StreamTree:
+    def __init__(self):
+        self.root = _Node(_Ino("d"))
+        self.subvol: Optional[str] = None
+
+    @staticmethod
+    def _split(path: str) -> list[str]:
+        return [p for p in path.strip("/").split("/") if p and p != "."]
+
+    def lookup(self, path: str) -> _Node:
+        node = self.root
+        for part in self._split(path):
+            if node.kids is None or part not in node.kids:
+                raise Fail(f"stream names a missing path: {path}", "bad-stream")
+            node = node.kids[part]
+        return node
+
+    def _parent(self, path: str) -> tuple[_Node, str]:
+        parts = self._split(path)
+        if not parts:
+            raise Fail("stream creates the root again", "bad-stream")
+        node = self.lookup("/".join(parts[:-1]))
+        if node.kids is None:
+            raise Fail(f"not a directory in stream: {path}", "bad-stream")
+        return node, parts[-1]
+
+    def _wants_data(self, path: str) -> bool:
+        parts = self._split(path)
+        rel = "/".join(parts)
+        if rel in _STREAM_DATA or (len(parts) == 3 and rel.startswith(SUDOERS_D_REL + "/")):
+            return True
+        return bool(parts) and bool(_ORPHAN.match(parts[-1]))
+
+    def apply(self, cmd: int, attrs: dict) -> None:
+        path = attrs.get(_A_PATH, b"").decode("utf-8", "surrogateescape")
+        u64 = lambda key: struct.unpack("<Q", attrs[key])[0]  # noqa: E731
+        if cmd == _C_SUBVOL:
+            self.subvol = path
+        elif cmd == _C_SNAPSHOT:
+            raise Fail("incremental stream (sent with a parent): only a full stream can be checked", "bad-stream")
+        elif cmd in (_C_MKDIR, _C_MKFILE, _C_SYMLINK, _C_MKNOD, _C_MKFIFO, _C_MKSOCK):
+            kind = {_C_MKDIR: "d", _C_MKFILE: "f", _C_SYMLINK: "l"}.get(cmd, "o")
+            parent, name = self._parent(path)
+            node = _Node(_Ino(kind))
+            if kind == "o" and _A_MODE in attrs:
+                node.ino.mode = u64(_A_MODE)
+            parent.kids[name] = node
+        elif cmd == _C_RENAME:
+            sp, sn = self._parent(path)
+            node = sp.kids.pop(sn, None)
+            if node is None:
+                raise Fail(f"stream renames a missing path: {path}", "bad-stream")
+            dp, dn = self._parent(attrs[_A_PATH_TO].decode("utf-8", "surrogateescape"))
+            dp.kids[dn] = node
+        elif cmd == _C_LINK:
+            target = self.lookup(attrs[_A_PATH_LINK].decode("utf-8", "surrogateescape"))
+            parent, name = self._parent(path)
+            parent.kids[name] = _Node(target.ino)
+        elif cmd in (_C_UNLINK, _C_RMDIR):
+            parent, name = self._parent(path)
+            parent.kids.pop(name, None)
+        elif cmd == _C_CHOWN:
+            ino = self.lookup(path).ino
+            ino.uid, ino.gid = u64(_A_UID), u64(_A_GID)
+        elif cmd == _C_CHMOD:
+            ino = self.lookup(path).ino
+            ino.mode = (ino.mode & ~0o7777) | (u64(_A_MODE) & 0o7777)
+        elif cmd == _C_WRITE and self._wants_data(path):
+            ino = self.lookup(path).ino
+            off = u64(_A_OFFSET)
+            buf = bytearray(ino.data or b"")
+            if len(buf) < off:
+                buf.extend(b"\0" * (off - len(buf)))
+            chunk = attrs.get(_A_DATA, b"")
+            buf[off:off + len(chunk)] = chunk
+            ino.data = bytes(buf)
+        elif cmd == _C_TRUNCATE:
+            ino = self.lookup(path).ino
+            if ino.data is not None:
+                ino.data = ino.data[:u64(_A_SIZE)]
+        # utimes, xattrs, clone, fallocate, fileattr: owners and modes untouched
+
+    def walk(self):
+        stack = [("", self.root)]
+        while stack:
+            rel, node = stack.pop()
+            yield rel, node
+            if node.kids and not _root_skip_below(rel):
+                for name, child in node.kids.items():
+                    stack.append((name if not rel else f"{rel}/{name}", child))
+
+
+def _read_btrfs_stream(fh) -> _StreamTree:
+    head = fh.read(len(_BTRFS_MAGIC) + 4)
+    if len(head) < len(_BTRFS_MAGIC) + 4 or head[:len(_BTRFS_MAGIC)] != _BTRFS_MAGIC:
+        raise Fail("not a btrfs send stream", "bad-stream")
+    version = struct.unpack("<I", head[len(_BTRFS_MAGIC):])[0]
+    if not 1 <= version <= 3:
+        raise Fail(f"unknown btrfs send stream version {version}", "bad-stream")
+    tree = _StreamTree()
+    while True:
+        h = fh.read(10)
+        if not h:
+            raise Fail("stream has no end command (truncated?)", "bad-stream")
+        if len(h) < 10:
+            raise Fail("stream ends inside a command header", "bad-stream")
+        length, cmd, _crc = struct.unpack("<IHI", h)
+        payload = fh.read(length)
+        if len(payload) < length:
+            raise Fail("stream ends inside a command", "bad-stream")
+        if cmd == _C_END:
+            break
+        attrs = {}
+        off = 0
+        while off < length:
+            (atype,) = struct.unpack_from("<H", payload, off)
+            if version >= 2 and atype == _A_DATA:
+                attrs[atype] = payload[off + 2:]
+                break
+            (alen,) = struct.unpack_from("<H", payload, off + 2)
+            attrs[atype] = payload[off + 4:off + 4 + alen]
+            off += 4 + alen
+        tree.apply(cmd, attrs)
+    if tree.subvol is None:
+        raise Fail("stream has no subvolume", "bad-stream")
+    return tree
+
+
+def check_root_stream(path: str) -> RootReport:
+    """The invariant on a release's root.btrfs.zst (or an uncompressed stream)."""
+    proc = None
+    if path.endswith(".zst"):
+        if not shutil.which("zstd"):
+            raise Fail("zstd is not installed")
+        proc = subprocess.Popen(["zstd", "-dcq", path], stdout=subprocess.PIPE, bufsize=1 << 20)
+        fh = proc.stdout
+    else:
+        fh = open(path, "rb")
+    try:
+        tree = _read_btrfs_stream(fh)
+    finally:
+        fh.close()
+        if proc is not None:
+            proc.kill()
+            proc.wait()
+    report = RootReport(f"{path} (subvolume {tree.subvol})")
+
+    def data(rel: str) -> Optional[bytes]:
+        try:
+            node = tree.lookup(rel)
+        except Fail:
+            return None
+        return (node.ino.data or b"") if node.ino.kind == "f" else None
+
+    report.rc_uid = _id_by_name(data("etc/passwd"), RC_USER)
+    report.rc_gid = _id_by_name(data("etc/group"), RC_USER)
+    for rel, node in tree.walk():
+        _check_root_entry(report, rel, node.ino.uid, node.ino.gid, node.ino.mode)
+    files = {}
+    sudoers = data(SUDOERS_REL)
+    if sudoers is not None:
+        files[SUDOERS_REL] = sudoers
+        try:
+            d = tree.lookup(SUDOERS_D_REL)
+            for name, child in sorted((d.kids or {}).items()):
+                if child.ino.kind == "f":
+                    files[f"{SUDOERS_D_REL}/{name}"] = child.ino.data or b""
+        except Fail:
+            pass
+    _finish_sudoers(report, files, sudoers is not None)
+    return report
+
+
+def check_root(path: Path, translate=None) -> RootReport:
+    """A directory tree, or a btrfs send stream file."""
+    if path.is_dir():
+        return check_root_tree(str(path), translate)
+    return check_root_stream(str(path))
+
+
+def cmd_check_root(host: Host, args) -> int:
+    target = Path(args.root) if args.root else host.p("/")
+    if not target.exists():
+        raise Fail(f"{target} does not exist", "not-found")
+    report = host.check_root(target)
+    if args.json:
+        print(json.dumps(report.as_dict(), indent=2, sort_keys=True))
+    else:
+        print(report.text())
+    return 0 if report.ok else 1
 
 
 
@@ -2835,6 +3399,20 @@ def healthy_window(samples: list[tuple[float, tuple[int, int, int]]], start: flo
     return False
 
 
+def unsafe_trial(host: Host, state: dict) -> bool:
+    """The root invariant on the running trial root. A trial that fails it is never
+    kept: record why (ops shows last_result), reboot, the configured release boots."""
+    report = host.check_root(host.p("/"))
+    if report.ok:
+        return False
+    finish_failed_trial(host, state, "unsafe-root", message=report.summary(),
+                        count=report.count, findings=report.findings[:20])
+    host.reboot()
+    host.sleep(120)
+    host.hard_reboot()
+    return True
+
+
 def run_health(host: Host, state: dict) -> int:
     trial = state["trial"]
     trial["phase"] = "booting"
@@ -2853,6 +3431,8 @@ def run_health(host: Host, state: dict) -> int:
         stopping["flag"] = True
 
     signal.signal(signal.SIGTERM, term)
+    if unsafe_trial(host, state):
+        return 1
     quiet = host.conf["quiet_seconds"]
     limit = host.conf["limit_seconds"]
     step = host.conf["sample_seconds"]
@@ -2867,6 +3447,8 @@ def run_health(host: Host, state: dict) -> int:
         samples.append((elapsed, flags))
         dog.feed()
         if healthy_window(samples, 0, elapsed, quiet, limit):
+            if unsafe_trial(host, state):           # again: the room ran five minutes on it
+                return 1
             event(host, state, "health-passed", release=trial["release"], seconds=int(elapsed))
             save_state(host, state)
             try:
@@ -3185,6 +3767,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--uki-from")
     p.add_argument("--parent")
     p.add_argument("--sign-key")
+    p.add_argument("--source-path", help="a btrfs subvolume to release instead of this room's root "
+                   "(a build host: the @ of a mounted image root.img)")
+    p.add_argument("--line", choices=("studio", "mini"), help="the release's line (default: this room's)")
+    p.add_argument("--source-info", action="append", default=[], metavar="KEY=VALUE",
+                   help="recorded in manifest source (firmware=COMMIT, pkgs=COMMIT, ...)")
+    p = sub.add_parser("check-root", help="the root invariant on a root directory or a root.btrfs.zst")
+    p.add_argument("root", nargs="?", help="directory or btrfs send stream (default: this room's /)")
     p = sub.add_parser("migrate-check")
     p = sub.add_parser("migrate")
     p.add_argument("release")
@@ -3202,6 +3791,7 @@ COMMANDS = {
     "rollback": cmd_rollback, "discard": cmd_discard, "health-run": cmd_health_run, "restore": cmd_restore,
     "build-release": cmd_build_release, "migrate": cmd_migrate, "migrate-check": cmd_migrate_check,
     "confirm-migration": cmd_confirm_migration, "esp-migrate": cmd_esp_migrate,
+    "check-root": cmd_check_root,
 }
 
 
