@@ -58,6 +58,7 @@ Never assemble a release root by hand or by a job script (patching an older root
 
 - `login-owner`: a path whose uid or gid is a login id (1000 and up, except 65534);
 - `rc-owner`: a path owned by `smartroomcontroller`, looked up by name in the root's `/etc/passwd` and `/etc/group`;
+- `system-owner`: a path under `/etc`, `/usr` or `/opt` whose owner is not root (system groups are fine);
 - `system-dir`: `/`, `/etc`, `/usr`, any direct child of `/usr`, `/etc/sudoers`, `/etc/sudoers.d` or a file in it that is not `root:root`, or is writable by group or other;
 - `sudoers-missing` and `visudo` (`visudo -c` on the root's sudoers and sudoers.d);
 - `unreadable`: a directory it cannot list.

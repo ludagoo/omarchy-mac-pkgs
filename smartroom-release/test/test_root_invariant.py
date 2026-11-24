@@ -73,9 +73,19 @@ class Invariant(unittest.TestCase):
         self.assertIn(("login-owner", "/etc/pacman.conf"), rules(report))
         self.assertIn(("login-owner", "/usr/share"), rules(report))
 
-    def test_nobody_is_not_a_login(self):
+    def test_nobody_owns_nothing_outside_etc_usr_opt(self):
         root = fake_root(self)
-        self.assertTrue(self.check(root, {"etc/pacman.conf": (65534, 65534)}).ok)
+        (root / "var/lib/nobody").mkdir(parents=True)
+        self.assertTrue(self.check(root, {"var/lib/nobody": (65534, 65534)}).ok)
+
+    def test_a_system_user_owns_nothing_under_etc_usr_opt(self):
+        root = fake_root(self)
+        (root / "var/lib/polkit").mkdir(parents=True)
+        report = self.check(root, {"etc/pacman.conf": (102, 0), "usr/share": (65534, 0),
+                                   "usr/bin/sudo": (0, 102),             # a system group is fine
+                                   "var/lib/polkit": (102, 102)})        # outside etc/usr/opt is fine
+        self.assertEqual(rules(report), {("system-owner", "/etc/pacman.conf"), ("system-owner", "/usr/share"),
+                                         ("system-dir", "/usr/share")})
 
     def test_sudoers_owned_by_1000_fails(self):
         root = fake_root(self)

@@ -2624,6 +2624,8 @@ def cmd_build_release(host: Host, args) -> int:
 #   rc-owner         a path outside the exempt trees owned by the Room Controller
 #                    user or group, looked up by name in the root's own
 #                    /etc/passwd and /etc/group (whatever number it has)
+#   system-owner     a path under /etc, /usr or /opt outside the exempt trees whose
+#                    owner is not root (system groups are fine; installer desk-check's rule)
 #   system-dir       /, /etc, /usr, a direct child of /usr, /etc/sudoers,
 #                    /etc/sudoers.d or a file in it: not root:root, or (not a
 #                    symlink) writable by group or other
@@ -2659,6 +2661,7 @@ ROOT_DYNAMIC_TREES = ("var/lib/private", "var/cache/private", "var/log/private")
 # release has since fixed).
 ROOT_NO_DESCEND = ("proc", "sys", "dev", "run", ".snapshots")
 ROOT_SYSTEM_DIRS = ("", "etc", "usr", "etc/sudoers.d", "etc/sudoers")
+ROOT_SYSTEM_TREES = ("etc", "usr", "opt")
 SUDOERS_REL = "etc/sudoers"
 SUDOERS_D_REL = "etc/sudoers.d"
 ROOT_FINDINGS_CAP = 200
@@ -2767,6 +2770,8 @@ def _check_root_entry(report: RootReport, rel: str, uid: int, gid: int, mode: in
         report.add("rc-owner", rel, f"owned by the Room Controller user {RC_USER}", uid, gid, mode)
     elif (_login_id(uid) or _login_id(gid)) and not exempt:
         report.add("login-owner", rel, "owned by a login id (>= 1000)", uid, gid, mode)
+    elif uid != 0 and not exempt and rel.split("/", 1)[0] in ROOT_SYSTEM_TREES:
+        report.add("system-owner", rel, "under /etc, /usr or /opt and not root's", uid, gid, mode)
     if _is_system_dir(rel):
         if uid != 0 or gid != 0:
             report.add("system-dir", rel, "must be root:root", uid, gid, mode)
