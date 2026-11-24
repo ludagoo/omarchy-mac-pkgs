@@ -60,8 +60,13 @@ Never assemble a release root by hand or by a job script (patching an older root
 - `rc-owner`: a path owned by `smartroomcontroller`, looked up by name in the root's `/etc/passwd` and `/etc/group`;
 - `system-owner`: a path under `/etc`, `/usr` or `/opt` whose owner is not root (system groups are fine);
 - `system-dir`: `/`, `/etc`, `/usr`, any direct child of `/usr`, `/etc/sudoers`, `/etc/sudoers.d` or a file in it that is not `root:root`, or is writable by group or other;
+- `sudoers-mode`: `/etc/sudoers` or a file in `/etc/sudoers.d` with a mode bit beyond `0440` (what plain `visudo -c` enforces);
 - `sudoers-missing` and `visudo` (`visudo -c` on the root's sudoers and sudoers.d);
-- `unreadable`: a directory it cannot list.
+- `unreadable`: a path it cannot list or stat, or, in a stream, a sudoers, passwd or group file whose contents the stream does not carry (no data, a shared copy or an encoded write). An empty sudoers would pass `visudo`, and an empty passwd would hide the Room Controller user.
+
+It stays on the root's own filesystem; on btrfs that is the root's own subvolume, exactly what a release contains. A directory on another filesystem or subvolume (`/boot`, the ESP, `@log`, `@home`, `/mnt`, `/media`, a USB stick) is neither judged nor walked; `other_filesystems` in the JSON lists it, and `smartroomos-integrity` shows it as information. A tech's uid-1000 USB stick never makes a room unsafe.
+
+Exit codes: `0` the root passes, `1` it fails (unsafe), `3` the check itself could not run (a missing path, a bad stream, a crash). `3` is never a verdict on the root. The build side (`build-release`, `desk-check`, `check-image`, `release-pack`) refuses on any non-zero exit. A room never refuses a trial on `3`: `health-run` and the Mini's `smartroomos-boot-commit` log it, show it on ops (`status --json` `release.root_check`, integrity reason `root-check-error`) and treat it as not proven unsafe, because a tool bug must never strand a room. `stage` refuses on it (reason `root-check-error`), since nothing is armed yet.
 
 The exceptions are in the code with their reasons (`ROOT_EXEMPT_TREES`): what is below `/home`, `/opt/smartroom` itself and below (the Room Controller's own directory), what is below `/tmp` and `/var/tmp`, and systemd DynamicUser ids under `/var/lib/private` and the like. `/proc`, `/sys`, `/dev`, `/run` and `.snapshots` are not walked. They were derived from the good root `2026.11.21-studio-ws14b` (86,739 paths, ok), the Mini image `2026.11.21-mini` (98,635 paths, ok) and the repaired Home Studio (87,632 paths, ok); `2026.11.24-studio-edge-b` fails with 207 problems.
 
@@ -69,7 +74,11 @@ Every place a root comes from runs it, and a root that fails is refused:
 
 - `build-release`: before it sends or signs (reason code `unsafe-root`);
 - `stage`/`update`: on the received root, before anything is armed (`last_result` `refused`, `unsafe-root`);
-- `health-run`: on the running trial, at the start and again before mark-good. A trial that fails is rolled back at once (no wait): reason `unsafe-root`, with the first paths in `last_result.findings`, for ops.
+- `health-run`: on the running trial, at the start and again before mark-good. A trial that fails is rolled back at once (no wait): reason `unsafe-root`, with the first paths in `last_result.findings`, for ops. The journal is flushed to disk before the rollback reboot, so the failed boot's log survives.
+
+Any refusal of `stage`/`update` after it has moved the previous release's boot files off the ESP puts them back, so the room keeps its one fallback.
+
+`check-kept [--json] [--max-age S]` runs the invariant on every kept root this room could roll back or restore to (not the running root, which integrity checks). The result is cached in `/var/lib/smartroomos/release-kept-roots.json` and shown, as information, in `status --json` (`keptRootsCheck`, and `rootCheck` on each release row); `status` never walks a root. `smartroomos-integrity`'s live check runs it at most every six hours. Rollback and restore do not refuse on it yet.
 
 The firmware's `check-image`, the installer's `desk-check`, `smartroomos-integrity` and `smartroomos-release-sign` call this same command; the firmware's `overlay/usr/bin/smartroom-release` is a byte copy of this file.
 
@@ -85,7 +94,8 @@ smartroom-release rollback [--reboot]   trial of the previous release
 smartroom-release discard               drop a staged or armed (not yet booted) trial
 smartroom-release restore N --no-reboot --json   the Room Controller's call (see below)
 smartroom-release health-run            the boot service (not run by hand)
-smartroom-release check-root [ROOT] [--json]   the root invariant (exit 1 on a problem)
+smartroom-release check-root [ROOT] [--json]   the root invariant (exit 1 unsafe, 3 the check could not run)
+smartroom-release check-kept [--json] [--max-age S]   the invariant on the kept rollback roots (information)
 smartroom-release build-release ...     make a release (see above)
 ```
 

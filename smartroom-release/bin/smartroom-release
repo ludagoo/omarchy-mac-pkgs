@@ -941,7 +941,15 @@ class Host:
                 return
 
     # reboot ---------------------------------------------------------------------------
+    def save_journal(self) -> None:
+        """Put this boot's journal on disk before a rollback reboot, so the health-run
+        log of the boot that failed survives it. Bounded; never stops the reboot."""
+        for flag in ("--flush", "--sync"):
+            with contextlib.suppress(OSError, subprocess.SubprocessError):
+                subprocess.run(["journalctl", flag], capture_output=True, check=False, timeout=15)
+
     def reboot(self) -> None:
+        self.save_journal()
         hook = self.conf["reboot_hook"]
         if hook:
             subprocess.run(hook, shell=True, check=False)
@@ -2058,6 +2066,16 @@ def status_doc(host: Host, state: dict) -> dict:
         },
         "events": state.get("events", [])[-20:],
     }
+    doc["release"]["root_check"] = state.get("root_check")
+    kept = load_kept_check(host)
+    if kept is not None:
+        by_root = {r.get("root"): r for r in kept.get("roots", [])}
+        for row in rows:
+            found = by_root.get(row.get("root"))
+            if found and found.get("release") == row.get("release"):
+                row["rootCheck"] = {k: found.get(k) for k in ("ok", "count", "rules", "error", "at")}
+        doc["keptRootsCheck"] = {"at": kept.get("at"), "ok": kept.get("ok"),
+                                 "note": "information: rollback and restore do not refuse on it yet"}
     if trial_state:
         layers = ["limine", "aura"] if layout.uses_aura else ["limine", "watchdog"]
         doc["trial"] = {"kind": trial_state.get("kind", "update"), "armed": trial_state.get("armed_at"),
@@ -2066,6 +2084,74 @@ def status_doc(host: Host, state: dict) -> dict:
     if last and last.get("result") == "rolled-back":
         doc["fallback"] = {"of": last.get("number"), "since": last.get("at"), "reason": last.get("reason")}
     return doc
+
+
+KEPT_CHECK_FILE = "/var/lib/smartroomos/release-kept-roots.json"   # a cache on the root, not on the ESP
+KEPT_FINDINGS = 10
+
+
+def kept_check_path(host: Host) -> Path:
+    return host.p(KEPT_CHECK_FILE)
+
+
+def load_kept_check(host: Host) -> Optional[dict]:
+    with contextlib.suppress(OSError, ValueError):
+        doc = json.loads(kept_check_path(host).read_text())
+        if isinstance(doc, dict):
+            return doc
+    return None
+
+
+def check_kept_roots(host: Host, state: dict) -> dict:
+    """The root invariant on every kept release root this room could roll back or
+    restore to (not the running root: integrity checks that one). Information only."""
+    running = running_root(host)
+    roots = []
+    targets = [r for r in release_rows(state) if r.get("root") and r.get("root") != running]
+    if not targets:
+        return {"at": host.stamp(), "checked_unix": host.now(), "ok": True, "running": running, "roots": []}
+    with host.top() as top:
+        for row in targets:
+            item = {"release": row["release"], "root": row["root"], "role": row["role"], "at": host.stamp()}
+            path = top / row["root"]
+            try:
+                if not path.is_dir():
+                    raise Fail(f"{row['root']} is not on this disk", "not-found")
+                report = host.check_root(path)
+                item.update(ok=report.ok, count=report.count, checked=report.checked,
+                            rules=report.as_dict()["rules"], findings=report.findings[:KEPT_FINDINGS])
+            except Exception as exc:   # noqa: BLE001 - information only
+                item.update(ok=None, error=(exc.message if isinstance(exc, Fail) else
+                                            f"{type(exc).__name__}: {exc}")[:300])
+            roots.append(item)
+    verdicts = [r["ok"] for r in roots]
+    ok = False if False in verdicts else (None if None in verdicts else True)
+    return {"at": host.stamp(), "checked_unix": host.now(), "ok": ok, "running": running,
+            "roots": roots}
+
+
+def cmd_check_kept(host: Host, args) -> int:
+    """check-kept [--max-age S]: run (or reuse, when younger than S and the same
+    roots) the invariant on the kept rollback targets; cached for status --json."""
+    state = load_state(host)
+    want = sorted((r["release"], r["root"]) for r in release_rows(state)
+                  if r.get("root") and r.get("root") != running_root(host))
+    doc = load_kept_check(host)
+    fresh = (doc is not None and args.max_age is not None
+             and host.now() - float(doc.get("checked_unix") or 0) < args.max_age
+             and sorted((r.get("release"), r.get("root")) for r in doc.get("roots", [])) == want)
+    if not fresh:
+        require_root(host)
+        doc = check_kept_roots(host, state)
+        write_atomic(kept_check_path(host), json.dumps(doc, indent=2, sort_keys=True).encode(), 0o644)
+    if args.json:
+        print(json.dumps(doc, sort_keys=True))
+    else:
+        for r in doc["roots"]:
+            verdict = {True: "ok", False: "FAIL", None: "not checked"}[r.get("ok")]
+            detail = r.get("error") or ", ".join(f"{k} {v}" for k, v in (r.get("rules") or {}).items())
+            print(f"{r['role']:<10} {r['release']:<36} {verdict}  {detail}".rstrip())
+    return 0
 
 
 def cmd_status(host: Host, args) -> int:
@@ -2143,14 +2229,26 @@ def stage_release(host: Host, state: dict, directory: Path, unsigned: bool, kind
     # WS14: move legacy ESP UKI store + previous fallback off the ESP before budgeting.
     esp_offload_non_essential(host, state, for_trial=True)
     try:
+        return _stage_after_offload(host, state, directory, manifest, release, layout, esp,
+                                    baseline, roles, signed, kind)
+    except BaseException:
+        # Refused or failed after the cleanup above moved the previous release's boot
+        # files off the ESP: put that one fallback back, whatever the refusal was.
+        with contextlib.suppress(Exception):
+            restore_previous_to_esp(host, state)
+            save_state(host, state)
+        raise
+
+
+def _stage_after_offload(host: Host, state: dict, directory: Path, manifest: dict, release: str,
+                         layout: BootLayout, esp: Path, baseline: dict, roles: dict, signed: bool,
+                         kind: str) -> dict:
+    try:
         budget = space_check(host, manifest, esp, state)
     except Fail as exc:
         if exc.code == "esp-full":
             record_result(host, state, "refused", reason="esp-full", message=exc.message)
             event(host, state, "stage-refused", reason="esp-full", message=exc.message)
-            # Put the one fallback (previous) back on the ESP when we are not staging.
-            with contextlib.suppress(Fail, OSError):
-                restore_previous_to_esp(host, state)
             save_state(host, state)
         raise
     subvol = subvol_name(release)
@@ -2172,7 +2270,16 @@ def stage_release(host: Host, state: dict, directory: Path, unsigned: bool, kind
         cmdline = new_root_cmdline(new_root, found[1])
         require_zero_touch(cmdline)
         fix_root_files(host, new_root, subvol, release)
-        report = host.check_root(new_root)
+        try:
+            report = host.check_root(new_root)
+        except Exception as exc:   # noqa: BLE001 - nothing is armed yet: refusing strands nothing
+            delete_subvolume(host, top, subvol)
+            message = exc.message if isinstance(exc, Fail) else f"{type(exc).__name__}: {exc}"
+            record_result(host, state, "refused", reason="root-check-error", message=message, release=release)
+            event(host, state, "stage-refused", reason="root-check-error", release=release, message=message)
+            save_state(host, state)
+            raise Fail(f"release {release} not staged: the root check could not run: {message}",
+                       "root-check-error")
         if not report.ok:
             delete_subvolume(host, top, subvol)
             record_result(host, state, "refused", reason="unsafe-root", message=report.summary(),
@@ -2629,9 +2736,24 @@ def cmd_build_release(host: Host, args) -> int:
 #   system-dir       /, /etc, /usr, a direct child of /usr, /etc/sudoers,
 #                    /etc/sudoers.d or a file in it: not root:root, or (not a
 #                    symlink) writable by group or other
+#   sudoers-mode     /etc/sudoers or a file in /etc/sudoers.d (not a symlink)
+#                    has a mode bit beyond 0440 (what plain `visudo -c` enforces)
 #   sudoers-missing  no /etc/sudoers
 #   visudo           `visudo -c` fails on the root's sudoers and sudoers.d
-#   unreadable       a directory the check cannot list (it cannot vouch for it)
+#   unreadable       a path the check cannot list or stat, or (stream) sudoers,
+#                    passwd or group whose contents the stream does not carry:
+#                    the check cannot vouch for it
+#
+# The check stays on the root's own filesystem (on btrfs: its own subvolume,
+# exactly what a release contains). A directory on another filesystem or
+# subvolume (/boot, the ESP, @log, @home, /mnt, /media, a USB stick, a nested
+# subvolume) is neither judged nor walked; `other_filesystems` lists it.
+#
+# Exit codes of `check-root`: 0 the root passes, 1 the root fails (unsafe),
+# 3 the check itself failed (a bad stream, a missing path, a crash): that is
+# not a verdict on the root. A room's trial treats 3 as "not proven unsafe"
+# (it logs it and shows it on ops, and never refuses on it; a tool bug must
+# never strand a room). The build side refuses on any non-zero exit.
 
 RC_USER = "smartroomcontroller"
 LOGIN_ID_MIN = 1000
@@ -2665,6 +2787,9 @@ ROOT_SYSTEM_TREES = ("etc", "usr", "opt")
 SUDOERS_REL = "etc/sudoers"
 SUDOERS_D_REL = "etc/sudoers.d"
 ROOT_FINDINGS_CAP = 200
+ROOT_OTHER_FS_CAP = 50
+SUDOERS_MODE_MAX = 0o440
+CHECK_ROOT_ERROR = 3   # check-root's exit code when the check could not run
 
 
 def _login_id(n: int) -> bool:
@@ -2688,6 +2813,10 @@ def _root_skip_below(rel: str) -> bool:
     if rel in ROOT_NO_DESCEND:
         return True
     return any(rel == top for top, _s, _w in ROOT_EXEMPT_TREES)
+
+
+def _is_sudoers_file(rel: str) -> bool:
+    return rel == SUDOERS_REL or (rel.startswith(SUDOERS_D_REL + "/") and "/" not in rel[len(SUDOERS_D_REL) + 1:])
 
 
 def _is_system_dir(rel: str) -> bool:
@@ -2717,6 +2846,7 @@ class RootReport:
         self.findings: list[dict] = []
         self.rc_uid: Optional[int] = None
         self.rc_gid: Optional[int] = None
+        self.other_fs: list[dict] = []
 
     def add(self, rule: str, rel: str, detail: str, uid=None, gid=None, mode=None) -> None:
         self.count += 1
@@ -2732,6 +2862,11 @@ class RootReport:
     def ok(self) -> bool:
         return self.count == 0
 
+    def other(self, rel: str, uid: int, gid: int, mode: int) -> None:
+        if len(self.other_fs) < ROOT_OTHER_FS_CAP:
+            self.other_fs.append({"path": "/" + rel, "owner": f"{uid}:{gid}",
+                                  "mode": "%04o" % stat.S_IMODE(mode)})
+
     def as_dict(self) -> dict:
         rules: dict[str, int] = {}
         for f in self.findings:
@@ -2739,6 +2874,7 @@ class RootReport:
         return {"ok": self.ok, "root": self.root, "checked": self.checked, "count": self.count,
                 "rules": rules, "findings": self.findings,
                 "truncated": self.count > len(self.findings),
+                "other_filesystems": self.other_fs,
                 "rc_user": {"name": RC_USER, "uid": self.rc_uid, "gid": self.rc_gid}}
 
     def summary(self, limit: int = 5) -> str:
@@ -2758,6 +2894,8 @@ class RootReport:
             lines.append(f"  {f['rule']:<15} {f['path']}{owner}{mode}  {f['detail']}")
         if self.count > limit:
             lines.append(f"  ... {self.count - limit} more")
+        if self.other_fs:
+            lines.append("  not checked (other filesystems): " + " ".join(o["path"] for o in self.other_fs))
         return "\n".join(lines)
 
 
@@ -2777,6 +2915,8 @@ def _check_root_entry(report: RootReport, rel: str, uid: int, gid: int, mode: in
             report.add("system-dir", rel, "must be root:root", uid, gid, mode)
         elif not stat.S_ISLNK(mode) and stat.S_IMODE(mode) & 0o022:
             report.add("system-dir", rel, "writable by group or other", uid, gid, mode)
+    if _is_sudoers_file(rel) and stat.S_ISREG(mode) and stat.S_IMODE(mode) & ~SUDOERS_MODE_MAX:
+        report.add("sudoers-mode", rel, "a sudoers file is 0440 (visudo -c)", uid, gid, mode)
 
 
 _SUDO_INCLUDE = re.compile(r"^(\s*[@#]include(?:dir)?\s+)(\S+)(.*)$")
@@ -2843,6 +2983,7 @@ def check_root_tree(root: str, translate=None) -> RootReport:
     report.rc_uid = _id_by_name(_read_small(os.path.join(root, "etc/passwd")), RC_USER)
     report.rc_gid = _id_by_name(_read_small(os.path.join(root, "etc/group")), RC_USER)
     st = os.lstat(root)
+    root_dev = st.st_dev
     _check_root_entry(report, "", *ids("", st.st_uid, st.st_gid), st.st_mode)
     stack = [""]
     while stack:
@@ -2851,15 +2992,29 @@ def check_root_tree(root: str, translate=None) -> RootReport:
             it = os.scandir(os.path.join(root, rel_dir) if rel_dir else root)
         except (FileNotFoundError, NotADirectoryError):
             continue
-        except PermissionError as exc:
-            report.add("unreadable", rel_dir, f"cannot list: {exc.strerror}")
+        except OSError as exc:
+            report.add("unreadable", rel_dir, f"cannot list: {exc.strerror or exc}")
             continue
         with it:
-            for entry in it:
+            while True:
+                try:
+                    entry = next(it)
+                except StopIteration:
+                    break
+                except OSError as exc:
+                    report.add("unreadable", rel_dir, f"cannot list: {exc.strerror or exc}")
+                    break
                 rel = entry.name if not rel_dir else f"{rel_dir}/{entry.name}"
                 try:
                     s = entry.stat(follow_symlinks=False)
                 except FileNotFoundError:
+                    continue
+                except OSError as exc:
+                    report.add("unreadable", rel, f"cannot stat: {exc.strerror or exc}")
+                    continue
+                if stat.S_ISDIR(s.st_mode) and s.st_dev != root_dev:
+                    # another filesystem or subvolume: not part of this root (nor of a release)
+                    report.other(rel, s.st_uid, s.st_gid, s.st_mode)
                     continue
                 _check_root_entry(report, rel, *ids(rel, s.st_uid, s.st_gid), s.st_mode)
                 if stat.S_ISDIR(s.st_mode) and not _root_skip_below(rel):
@@ -2884,6 +3039,9 @@ _BTRFS_MAGIC = b"btrfs-stream\0"
 (_C_SUBVOL, _C_SNAPSHOT, _C_MKFILE, _C_MKDIR, _C_MKNOD, _C_MKFIFO, _C_MKSOCK, _C_SYMLINK,
  _C_RENAME, _C_LINK, _C_UNLINK, _C_RMDIR) = range(1, 13)
 _C_WRITE, _C_TRUNCATE, _C_CHMOD, _C_CHOWN, _C_END = 15, 17, 18, 19, 21
+# Commands that change a file's contents without plain data: shared-copy
+# (clone), no-data sends (update-extent), compressed passthrough (encoded write).
+_C_CLONE, _C_UPDATE_EXTENT, _C_ENCODED_WRITE = 16, 22, 25
 _A_SIZE, _A_MODE, _A_UID, _A_GID, _A_PATH, _A_PATH_TO, _A_PATH_LINK, _A_OFFSET, _A_DATA = \
     4, 5, 6, 7, 15, 16, 17, 18, 19
 _ORPHAN = re.compile(r"^o\d+-\d+-\d+$")
@@ -2891,13 +3049,14 @@ _STREAM_DATA = {SUDOERS_REL, "etc/passwd", "etc/group"}
 
 
 class _Ino:
-    __slots__ = ("kind", "uid", "gid", "mode", "data")
+    __slots__ = ("kind", "uid", "gid", "mode", "data", "opaque")
 
     def __init__(self, kind: str):
         self.kind = kind
         self.uid = self.gid = 0
         self.mode = {"d": stat.S_IFDIR | 0o755, "l": stat.S_IFLNK | 0o777}.get(kind, stat.S_IFREG | 0o644)
         self.data: Optional[bytes] = None
+        self.opaque = False   # contents arrived in a form this reader does not replay (clone, encoded write)
 
 
 class _Node:
@@ -2988,6 +3147,8 @@ class _StreamTree:
             ino = self.lookup(path).ino
             if ino.data is not None:
                 ino.data = ino.data[:u64(_A_SIZE)]
+        elif cmd in (_C_CLONE, _C_UPDATE_EXTENT, _C_ENCODED_WRITE) and self._wants_data(path):
+            self.lookup(path).ino.opaque = True
         # utimes, xattrs, clone, fallocate, fileattr: owners and modes untouched
 
     def walk(self):
@@ -3055,28 +3216,42 @@ def check_root_stream(path: str) -> RootReport:
             proc.wait()
     report = RootReport(f"{path} (subvolume {tree.subvol})")
 
-    def data(rel: str) -> Optional[bytes]:
+    def node_at(rel: str) -> Optional[_Node]:
         try:
-            node = tree.lookup(rel)
+            return tree.lookup(rel)
         except Fail:
             return None
-        return (node.ino.data or b"") if node.ino.kind == "f" else None
 
-    report.rc_uid = _id_by_name(data("etc/passwd"), RC_USER)
-    report.rc_gid = _id_by_name(data("etc/group"), RC_USER)
+    def data(rel: str, required: bool) -> Optional[bytes]:
+        """A file's replayed contents. None when it is not a file here. Contents the
+        stream does not carry (clone, encoded write; or none at all for a file that
+        is never empty) are `unreadable`: an empty sudoers passes visudo, and an
+        empty passwd hides the Room Controller user."""
+        node = node_at(rel)
+        if node is None or node.ino.kind != "f":
+            if required and node is not None:
+                report.add("unreadable", rel, "not a regular file in the stream")
+            return None
+        if node.ino.opaque or (required and not node.ino.data):
+            report.add("unreadable", rel, "the stream does not carry its contents (shared copy, "
+                       "encoded write, or none): the check cannot read it")
+        return node.ino.data or b""
+
+    for rel in ("etc/passwd", "etc/group"):
+        if node_at(rel) is None:
+            report.add("unreadable", rel, "missing: the Room Controller user cannot be looked up")
+    report.rc_uid = _id_by_name(data("etc/passwd", True), RC_USER)
+    report.rc_gid = _id_by_name(data("etc/group", True), RC_USER)
     for rel, node in tree.walk():
         _check_root_entry(report, rel, node.ino.uid, node.ino.gid, node.ino.mode)
     files = {}
-    sudoers = data(SUDOERS_REL)
+    sudoers = data(SUDOERS_REL, True)
     if sudoers is not None:
         files[SUDOERS_REL] = sudoers
-        try:
-            d = tree.lookup(SUDOERS_D_REL)
-            for name, child in sorted((d.kids or {}).items()):
-                if child.ino.kind == "f":
-                    files[f"{SUDOERS_D_REL}/{name}"] = child.ino.data or b""
-        except Fail:
-            pass
+        d = node_at(SUDOERS_D_REL)
+        for name, child in sorted(((d.kids or {}) if d else {}).items()):
+            if child.ino.kind == "f":
+                files[f"{SUDOERS_D_REL}/{name}"] = data(f"{SUDOERS_D_REL}/{name}", False)
     _finish_sudoers(report, files, sudoers is not None)
     return report
 
@@ -3089,10 +3264,18 @@ def check_root(path: Path, translate=None) -> RootReport:
 
 
 def cmd_check_root(host: Host, args) -> int:
+    """0 passes, 1 fails (unsafe), CHECK_ROOT_ERROR when the check could not run."""
     target = Path(args.root) if args.root else host.p("/")
-    if not target.exists():
-        raise Fail(f"{target} does not exist", "not-found")
-    report = host.check_root(target)
+    try:
+        if not target.exists():
+            raise Fail(f"{target} does not exist", "not-found")
+        report = host.check_root(target)
+    except Exception as exc:   # noqa: BLE001 - any failure of the check is "check failed", never "unsafe"
+        message = exc.message if isinstance(exc, Fail) else f"{type(exc).__name__}: {exc}"
+        if args.json:
+            print(json.dumps({"ok": None, "error": {"code": "check-failed", "message": message}}))
+        print(f"smartroom-release: check-root could not check {target}: {message}", file=sys.stderr)
+        return CHECK_ROOT_ERROR
     if args.json:
         print(json.dumps(report.as_dict(), indent=2, sort_keys=True))
     else:
@@ -3406,9 +3589,25 @@ def healthy_window(samples: list[tuple[float, tuple[int, int, int]]], start: flo
 
 def unsafe_trial(host: Host, state: dict) -> bool:
     """The root invariant on the running trial root. A trial that fails it is never
-    kept: record why (ops shows last_result), reboot, the configured release boots."""
-    report = host.check_root(host.p("/"))
+    kept: record why (ops shows last_result), reboot, the configured release boots.
+    A check that cannot run (a tool bug, an error) is not proof of an unsafe root:
+    it is logged and shown on ops (status --json rootCheck), and the trial goes on
+    as if the check had not run. A tool bug must never strand a room."""
+    trial = state.get("trial") or {}
+    try:
+        report = host.check_root(host.p("/"))
+    except Exception as exc:   # noqa: BLE001
+        message = exc.message if isinstance(exc, Fail) else f"{type(exc).__name__}: {exc}"
+        print(f"smartroom-release: the root check could not run on the trial root: {message}", file=sys.stderr)
+        state["root_check"] = {"ok": None, "error": message[:300], "at": host.stamp(),
+                               "release": trial.get("release")}
+        event(host, state, "root-check-error", release=trial.get("release"), message=message[:300])
+        save_state(host, state)
+        return False
+    state["root_check"] = {"ok": report.ok, "count": report.count, "checked": report.checked,
+                           "at": host.stamp(), "release": trial.get("release")}
     if report.ok:
+        save_state(host, state)
         return False
     finish_failed_trial(host, state, "unsafe-root", message=report.summary(),
                         count=report.count, findings=report.findings[:20])
@@ -3777,8 +3976,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--line", choices=("studio", "mini"), help="the release's line (default: this room's)")
     p.add_argument("--source-info", action="append", default=[], metavar="KEY=VALUE",
                    help="recorded in manifest source (firmware=COMMIT, pkgs=COMMIT, ...)")
-    p = sub.add_parser("check-root", help="the root invariant on a root directory or a root.btrfs.zst")
+    p = sub.add_parser("check-root", help="the root invariant on a root directory or a root.btrfs.zst "
+                       "(exit 0 ok, 1 unsafe, 3 the check could not run)")
     p.add_argument("root", nargs="?", help="directory or btrfs send stream (default: this room's /)")
+    p = sub.add_parser("check-kept", help="the root invariant on the kept rollback roots (information; "
+                       "cached for status --json)")
+    p.add_argument("--max-age", type=int, default=None,
+                   help="reuse the last result when younger than this many seconds and the same roots")
     p = sub.add_parser("migrate-check")
     p = sub.add_parser("migrate")
     p.add_argument("release")
@@ -3796,7 +4000,7 @@ COMMANDS = {
     "rollback": cmd_rollback, "discard": cmd_discard, "health-run": cmd_health_run, "restore": cmd_restore,
     "build-release": cmd_build_release, "migrate": cmd_migrate, "migrate-check": cmd_migrate_check,
     "confirm-migration": cmd_confirm_migration, "esp-migrate": cmd_esp_migrate,
-    "check-root": cmd_check_root,
+    "check-root": cmd_check_root, "check-kept": cmd_check_kept,
 }
 
 

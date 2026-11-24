@@ -10,6 +10,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from test_release import CMDLINE, TOOL, MiniWorld, World, plant_system, sr
 
@@ -97,7 +98,21 @@ class Invariant(unittest.TestCase):
         root = fake_root(self)
         (root / "etc/sudoers.d/smartroomcontroller").chmod(0o666)
         report = self.check(root)
-        self.assertEqual(rules(report), {("system-dir", "/etc/sudoers.d/smartroomcontroller")})
+        self.assertEqual(rules(report), {("system-dir", "/etc/sudoers.d/smartroomcontroller"),
+                                         ("sudoers-mode", "/etc/sudoers.d/smartroomcontroller")})
+
+    def test_a_sudoers_file_is_0440_as_plain_visudo_c_requires(self):
+        root = fake_root(self)
+        (root / "etc/sudoers.d/smartroomcontroller").chmod(0o644)     # readable by every user
+        (root / "etc/sudoers").chmod(0o640)
+        report = self.check(root)
+        self.assertEqual(rules(report), {("sudoers-mode", "/etc/sudoers.d/smartroomcontroller"),
+                                         ("sudoers-mode", "/etc/sudoers")})
+        (root / "etc/sudoers.d/smartroomcontroller").chmod(0o400)     # stricter is fine
+        (root / "etc/sudoers").chmod(0o440)
+        self.assertTrue(self.check(root).ok)
+        (root / "etc/sudoers.d").chmod(0o750)                          # the directory is not a sudoers file
+        self.assertTrue(self.check(root).ok)
 
     def test_etc_owned_by_the_room_controller_fails_whatever_its_number(self):
         root = fake_root(self)
@@ -167,18 +182,25 @@ def u64(attr, n):
     return (attr, struct.pack("<Q", n))
 
 
-def root_stream(owner_of_sudoers_d=0, sudoers_mode=0o440):
-    """mkdir/mkfile under orphan names then rename, as btrfs send writes them."""
+def root_stream(owner_of_sudoers_d=0, sudoers_mode=0o440, no_data=(), shared=(), omit=()):
+    """mkdir/mkfile under orphan names then rename, as btrfs send writes them.
+    no_data: files sent without a write; shared: files whose contents arrive as a
+    clone (shared copy) instead; omit: files not in the stream."""
     cmds = [(1, [p("@r-test")])]
     for d in ("etc", "usr", "usr/bin", "etc/sudoers.d", "home", "home/smartroomcontroller"):
         cmds += [(4, [p("o%d-1-0" % len(cmds))]), (9, [p("o%d-1-0" % len(cmds)), (16, d.encode())])]
         cmds += [(19, [p(d), u64(6, 0), u64(7, 0)]), (18, [p(d), u64(5, 0o755)])]
     files = {"etc/sudoers": SUDO, "etc/sudoers.d/rc": RC, "etc/passwd": PASSWD, "etc/group": GROUP}
     for path, data in files.items():
+        if path in omit:
+            continue
         orphan = "o%d-2-0" % len(cmds)
-        cmds += [(3, [p(orphan)]), (9, [p(orphan), (16, path.encode())]),
-                 (15, [p(path), u64(18, 0), (19, data)]),
-                 (19, [p(path), u64(6, 0), u64(7, 0)]), (18, [p(path), u64(5, 0o644)])]
+        cmds += [(3, [p(orphan)]), (9, [p(orphan), (16, path.encode())])]
+        if path in shared:
+            cmds += [(16, [p(path), u64(18, 0), u64(8, len(data))])]
+        elif path not in no_data:
+            cmds += [(15, [p(path), u64(18, 0), (19, data)])]
+        cmds += [(19, [p(path), u64(6, 0), u64(7, 0)]), (18, [p(path), u64(5, 0o644)])]
     cmds += [(18, [p("etc/sudoers"), u64(5, 0o440)]), (18, [p("etc/sudoers.d/rc"), u64(5, sudoers_mode)]),
              (19, [p("etc/sudoers.d"), u64(6, owner_of_sudoers_d), u64(7, owner_of_sudoers_d)]),
              (19, [p("home/smartroomcontroller"), u64(6, 1000), u64(7, 1000)])]
@@ -213,7 +235,7 @@ class Stream(unittest.TestCase):
 
     def test_a_world_writable_sudoers_file_in_a_stream_fails(self):
         report = sr.check_root(self.write(root_stream(sudoers_mode=0o666)))
-        self.assertEqual(rules(report), {("system-dir", "/etc/sudoers.d/rc")})
+        self.assertEqual(rules(report), {("system-dir", "/etc/sudoers.d/rc"), ("sudoers-mode", "/etc/sudoers.d/rc")})
 
     def test_a_truncated_stream_is_an_error_not_a_pass(self):
         data = root_stream()[:-10]
@@ -391,6 +413,317 @@ class TrialRefuses(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertEqual(w.state()["last_result"]["reason"], "unsafe-root")
         self.assertIsNone(w.state()["trial"])
+
+
+class Boundary(unittest.TestCase):
+    """The check stays on the root's own filesystem, and a walk error is a finding, not a crash."""
+
+    def scandir_with(self, root, other=(), list_error=(), stat_error=()):
+        real = os.scandir
+
+        class Entry:
+            def __init__(self, entry, rel):
+                self.entry, self.name, self.rel = entry, entry.name, rel
+
+            def stat(self, follow_symlinks=True):
+                if self.rel in stat_error:
+                    raise OSError(5, "Input/output error")
+                s = self.entry.stat(follow_symlinks=follow_symlinks)
+                if self.rel in other:
+                    fields = list(s[:10])
+                    fields[2] = s.st_dev + 1           # st_dev: another filesystem
+                    fields[4] = fields[5] = 1000        # a tech's USB stick, uid 1000
+                    return os.stat_result(fields)
+                return s
+
+        class It:
+            def __new__(cls, path):
+                if not isinstance(path, str) or not (path == root or path.startswith(root + "/")):
+                    return real(path)                  # not the walk (visudo's scratch cleanup)
+                return super().__new__(cls)
+
+            def __init__(self, path):
+                rel = os.path.relpath(path, root)
+                self.rel = "" if rel == "." else rel
+                if self.rel in list_error:
+                    raise OSError(5, "Input/output error")
+                self.it = real(path)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                self.it.close()
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                e = next(self.it)
+                return Entry(e, e.name if not self.rel else f"{self.rel}/{e.name}")
+
+        return mock.patch.object(sr.os, "scandir", It)
+
+    def test_other_filesystems_are_listed_not_judged_or_walked(self):
+        root = fake_root(self)
+        for d in ("media/usb/inner", "var/log/journal", "boot/efi"):
+            (root / d).mkdir(parents=True)
+        with self.scandir_with(str(root), other=("media/usb", "var/log", "boot/efi")):
+            report = sr.check_root_tree(str(root), Ids({"media/usb/inner": (1000, 1000)}))
+        self.assertTrue(report.ok, report.text())
+        self.assertEqual({o["path"] for o in report.other_fs}, {"/media/usb", "/var/log", "/boot/efi"})
+        self.assertEqual(report.as_dict()["other_filesystems"][0]["owner"], "1000:1000")
+        self.assertIn("not checked (other filesystems)", report.text())
+        # the same tree on one filesystem: its uid-1000 directory fails
+        report = sr.check_root_tree(str(root), Ids({"media/usb/inner": (1000, 1000)}))
+        self.assertIn(("rc-owner", "/media/usb/inner"), rules(report))
+
+    def test_a_walk_error_is_unreadable_not_a_crash(self):
+        root = fake_root(self)
+        with self.scandir_with(str(root), list_error=("usr/share",), stat_error=("etc/pacman.conf",)):
+            report = sr.check_root_tree(str(root), Ids())
+        self.assertEqual(rules(report), {("unreadable", "/usr/share"), ("unreadable", "/etc/pacman.conf")})
+
+    @unittest.skipUnless(shutil.which("unshare") and subprocess.run(
+        ["unshare", "--map-auto", "--map-root-user", "--mount", "true"], capture_output=True).returncode == 0,
+        "no user and mount namespace")
+    def test_a_real_mount_inside_the_root_is_not_walked(self):
+        root = fake_root(self)
+        (root / "media").mkdir()
+        self.addCleanup(subprocess.run, ["unshare", "--map-auto", "--map-root-user", "rm", "-rf", str(root)],
+                        capture_output=True)
+        script = ('chown -R 0:0 "$0"; chown -R 1000:1000 "$0/home/smartroomcontroller" "$0/opt/smartroom"; '
+                  'mount -t tmpfs stick "$0/media" && mkdir "$0/media/usb" && chown 1000:1000 "$0/media" "$0/media/usb" && '
+                  f'python3 -I "{TOOL}" check-root --json "$0"')
+        done = subprocess.run(["unshare", "--map-auto", "--map-root-user", "--mount", "bash", "-c", script, str(root)],
+                              capture_output=True, text=True)
+        doc = json.loads(done.stdout or "{}")
+        self.assertEqual(done.returncode, 0, (doc, done.stderr))
+        self.assertEqual([o["path"] for o in doc["other_filesystems"]], ["/media"])
+
+
+class StreamContents(unittest.TestCase):
+    """A stream whose sudoers, passwd or group contents the reader cannot see is unreadable."""
+
+    def check(self, **kw):
+        d = Path(tempfile.mkdtemp(prefix="srel-stream-"))
+        self.addCleanup(shutil.rmtree, d, True)
+        (d / "root.btrfs").write_bytes(root_stream(**kw))
+        return sr.check_root(d / "root.btrfs")
+
+    def test_sudoers_without_contents_is_unreadable_not_an_empty_pass(self):
+        self.assertIn(("unreadable", "/etc/sudoers"), rules(self.check(no_data=("etc/sudoers",))))
+
+    def test_passwd_or_group_as_a_shared_copy_is_unreadable(self):
+        report = self.check(shared=("etc/passwd",))
+        self.assertIn(("unreadable", "/etc/passwd"), rules(report))
+        self.assertIn(("unreadable", "/etc/group"), rules(self.check(shared=("etc/group",))))
+
+    def test_a_sudoers_d_file_as_a_shared_copy_is_unreadable(self):
+        self.assertIn(("unreadable", "/etc/sudoers.d/rc"), rules(self.check(shared=("etc/sudoers.d/rc",))))
+
+    def test_a_stream_without_passwd_is_unreadable(self):
+        self.assertIn(("unreadable", "/etc/passwd"), rules(self.check(omit=("etc/passwd",))))
+
+    def test_an_empty_sudoers_d_file_is_fine(self):
+        self.assertTrue(self.check(no_data=("etc/sudoers.d/rc",)).ok)
+
+
+class CheckFailed(unittest.TestCase):
+    """check-root exits 3 when the check could not run: never the "unsafe" exit 1."""
+
+    def test_a_missing_path_or_a_truncated_stream_exits_3(self):
+        d = Path(tempfile.mkdtemp(prefix="srel-cf-"))
+        self.addCleanup(shutil.rmtree, d, True)
+        (d / "root.btrfs").write_bytes(root_stream()[:-10])
+        for target in (d / "nothing-here", d / "root.btrfs"):
+            done = subprocess.run(["python3", "-I", str(TOOL), "check-root", "--json", str(target)],
+                                  capture_output=True, text=True)
+            self.assertEqual(done.returncode, sr.CHECK_ROOT_ERROR, done.stderr)
+            self.assertIsNone(json.loads(done.stdout)["ok"])
+
+    def test_a_crash_in_the_check_exits_3(self):
+        w = World(self)
+
+        def boom(_path):
+            raise RuntimeError("a bug in the walk")
+
+        w.host.check_root = boom
+        code, out, err = w.run("check-root", "--json")
+        self.assertEqual(code, sr.CHECK_ROOT_ERROR)
+        self.assertIn("a bug in the walk", out + err)
+
+
+class TrialCheckCrash(unittest.TestCase):
+    """A crash of the check on the trial root is not an unsafe root: logged, shown, not refused."""
+
+    def armed(self, world):
+        code, _, err = world.run("update", str(world.release()), "--unsigned")
+        self.assertEqual(code, 0, err)
+        world.trial_boot()
+
+    def crash(self, world, exc):
+        def boom(_path):
+            raise exc
+        world.host.check_root = boom
+
+    def test_studio_a_crashing_check_neither_refuses_nor_strands_the_trial(self):
+        for exc in (RuntimeError("a bug"), PermissionError(13, "Permission denied"), sr.Fail("no zstd")):
+            w = World(self)
+            self.armed(w)
+            self.crash(w, exc)
+            code, _, err = w.run("health-run")
+            self.assertEqual(code, 0, err)
+            st = w.state()
+            self.assertIsNone(st["trial"])                                    # never left "booting"
+            self.assertEqual(st["configured"]["release"], "2026.11.21-1")     # promoted on health
+            self.assertEqual(w.host.reboots, 0)
+            self.assertIsNone(st["root_check"]["ok"])
+            self.assertIn("root-check-error", [e["event"] for e in st["events"]])
+            code, out, _ = w.run("status", "--json")
+            self.assertIsNone(json.loads(out)["release"]["root_check"]["ok"])
+            self.assertTrue(json.loads(out)["release"]["root_check"]["error"])
+            # the next update is not refused as "a trial boot is already pending"
+            del w.host.check_root
+            code, _, err = w.run("update", str(w.release("2026.11.22-1")), "--unsigned")
+            self.assertEqual(code, 0, err)
+
+    def test_mini_the_same(self):
+        w = MiniWorld(self)
+        code, _, err = w.run("update", str(w.release()), "--unsigned")
+        self.assertEqual(code, 0, err)
+        w.trial_boot()
+        release = w.state()["trial"]["release"]
+        self.crash(w, RuntimeError("a bug"))
+        code, _, err = w.run("health-run")
+        self.assertEqual(code, 0, err)
+        self.assertIsNone(w.state()["trial"])
+        self.assertEqual(w.state()["configured"]["release"], release)
+
+    def test_a_passing_check_is_recorded_too(self):
+        w = World(self)
+        self.armed(w)
+        code, _, _ = w.run("health-run")
+        self.assertEqual(code, 0)
+        self.assertTrue(w.state()["root_check"]["ok"])
+
+    def test_a_crash_while_staging_refuses_the_update_and_arms_nothing(self):
+        w = World(self)
+        self.crash(w, RuntimeError("a bug"))
+        code, _, err = w.run("update", str(w.release()), "--unsigned")
+        self.assertEqual(code, 1)
+        self.assertIn("root check could not run", err)
+        self.assertEqual(w.state()["last_result"]["reason"], "root-check-error")
+        self.assertFalse((w.prefix / "top/@r-2026.11.21-1").exists())
+        self.assertIsNone(w.state().get("trial"))
+
+
+class RefusalKeepsTheFallback(unittest.TestCase):
+    """A refused update leaves the previous release's boot files on the ESP."""
+
+    def two_releases(self):
+        w = World(self)
+        for name in ("2026.11.21-1", "2026.11.22-1"):
+            code, _, err = w.run("update", str(w.release(name, uki=f"uki-{name}".encode(),
+                                                          stage2=f"s2-{name}".encode())), "--unsigned")
+            self.assertEqual(code, 0, err)
+            w.trial_boot(name)
+            code, _, err = w.run("health-run")
+            self.assertEqual(code, 0, err)
+            w.back_on_configured(f"@r-{name}", boot_id=f"boot-after-{name}")
+        st = w.state()
+        self.assertEqual(st["previous"]["release"], "2026.11.21-1")
+        return w
+
+    def test_an_unsafe_root_refusal_puts_the_previous_boot_files_back(self):
+        w = self.two_releases()
+        prev_uki = w.esp / sr.LAYOUT_STUDIO.previous_uki
+        self.assertEqual(prev_uki.read_bytes(), b"uki-2026.11.21-1")
+        w.host.owners = {"etc": (1000, 1000)}
+        code, _, err = w.run("update", str(w.release("2026.11.23-1")), "--unsigned")
+        self.assertEqual(code, 1)
+        self.assertIn("refused", err)
+        self.assertEqual(prev_uki.read_bytes(), b"uki-2026.11.21-1")
+        self.assertEqual((w.esp / sr.LAYOUT_STUDIO.previous_boot).read_bytes(), b"s2-2026.11.21-1")
+        self.assertEqual(w.state()["previous"]["uki"], sr.LAYOUT_STUDIO.previous_uki)
+
+    def test_any_other_refusal_after_the_cleanup_does_too(self):
+        w = self.two_releases()
+        prev_uki = w.esp / sr.LAYOUT_STUDIO.previous_uki
+        with mock.patch.object(sr, "receive_root", side_effect=sr.Fail("receive failed")):
+            code, _, _ = w.run("update", str(w.release("2026.11.23-1")), "--unsigned")
+        self.assertEqual(code, 1)
+        self.assertEqual(prev_uki.read_bytes(), b"uki-2026.11.21-1")
+
+
+class KeptRoots(unittest.TestCase):
+    """check-kept: the invariant on the rollback targets, information in status --json."""
+
+
+    two_releases = RefusalKeepsTheFallback.two_releases
+
+    def test_kept_roots_are_checked_and_shown_in_status(self):
+        w = self.two_releases()
+        (w.prefix / "top/@r-2026.11.21-1/etc").mkdir(parents=True, exist_ok=True)
+        calls = []
+        real = w.host.check_root
+
+        def spy(path):
+            calls.append(Path(path).name)
+            if Path(path).name == "@r-2026.11.21-1":
+                w.host.owners = {"etc": (1000, 1000)}
+            else:
+                w.host.owners = {}
+            try:
+                return real(path)
+            finally:
+                w.host.owners = {}
+
+        w.host.check_root = spy
+        code, out, err = w.run("check-kept", "--json", "--max-age", "3600")
+        self.assertEqual(code, 0, err)
+        doc = json.loads(out)
+        self.assertNotIn("@r-2026.11.22-1", calls)              # the running root is integrity's
+        by = {r["release"]: r for r in doc["roots"]}
+        self.assertIs(by["2026.11.21-1"]["ok"], False)
+        self.assertIs(doc["ok"], False)
+        code, out, _ = w.run("status", "--json")
+        status = json.loads(out)
+        rows = {r["release"]: r for r in sr.release_rows(w.state())}
+        self.assertIn("2026.11.21-1", rows)
+        self.assertIn("keptRootsCheck", status)
+        # reused while fresh and the same roots: no second walk
+        n = len(calls)
+        code, out, _ = w.run("check-kept", "--json", "--max-age", "3600")
+        self.assertEqual(len(calls), n)
+        w.host.clock += 7200
+        code, out, _ = w.run("check-kept", "--json", "--max-age", "3600")
+        self.assertGreater(len(calls), n)
+
+    def test_status_never_walks(self):
+        w = self.two_releases()
+
+        def boom(_path):
+            raise AssertionError("status walked a root")
+
+        w.host.check_root = boom
+        code, out, err = w.run("status", "--json")
+        self.assertEqual(code, 0, err)
+
+
+class JournalBeforeReboot(unittest.TestCase):
+    def test_the_journal_is_flushed_before_a_rollback_reboot(self):
+        tmp = Path(tempfile.mkdtemp(prefix="srel-j-"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        log = tmp / "calls"
+        for name in ("journalctl", "systemctl"):
+            (tmp / name).write_text(f'#!/bin/sh\necho "{name} $*" >>"{log}"\n')
+            (tmp / name).chmod(0o755)
+        host = sr.Host(str(tmp / "room"))
+        with mock.patch.dict(os.environ, {"PATH": f"{tmp}:{os.environ['PATH']}"}):
+            host.reboot()
+        self.assertEqual(log.read_text().splitlines(),
+                         ["journalctl --flush", "journalctl --sync", "systemctl reboot --no-block"])
 
 
 if __name__ == "__main__":
