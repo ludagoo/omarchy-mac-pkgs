@@ -236,6 +236,9 @@ class RealOwners(unittest.TestCase):
 
     def run_ns(self, script):
         root = fake_root(self)
+        # Inside the namespace the tree belongs to sub-ids: remove it from there first.
+        self.addCleanup(subprocess.run, ["unshare", "--map-auto", "--map-root-user", "rm", "-rf", str(root)],
+                        capture_output=True)
         done = subprocess.run(["unshare", "--map-auto", "--map-root-user", "bash", "-c",
                                script + f'\npython3 -I "{TOOL}" check-root --json "$0"', str(root)],
                               capture_output=True, text=True)
