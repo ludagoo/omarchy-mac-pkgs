@@ -150,11 +150,7 @@ class FakeHost(sr.Host):
     def hard_reboot(self):
         self.hard += 1
 
-    @contextlib.contextmanager
-    def top(self):
-        top = self.p("/top")
-        top.mkdir(parents=True, exist_ok=True)
-        yield top
+    # top(): the real one (its prefix branch: PREFIX/top, the real lock under PREFIX/run)
 
     def efivar(self, name):
         return self.p("/sys/firmware/efi/efivars") / name

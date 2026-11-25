@@ -7,7 +7,9 @@ import os
 import shutil
 import struct
 import subprocess
+import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -819,7 +821,9 @@ class RoomPages(unittest.TestCase):
 
 class RollbackRefusal(unittest.TestCase):
     """Waiting on Lucas: refuse a rollback/restore to a root that fails the invariant.
-    Written and tested behind refuse_unsafe_rollback=no (default: today's behaviour)."""
+    Written and tested behind refuse_unsafe_rollback. Off (the default), a rollback is
+    never refused on it, before arming or in its trial (as before WS17); the check is
+    recorded for ops. Update trials refuse an unsafe root whatever the switch says."""
 
     two_releases = RefusalKeepsTheFallback.two_releases
 
@@ -839,13 +843,63 @@ class RollbackRefusal(unittest.TestCase):
         (w.prefix / "etc/smartroomos/release.conf").write_text(text)
         w.host._conf = None
 
-    def test_off_by_default_the_rollback_is_armed_and_the_trial_refuses_it(self):
+    def rolled_back_trial(self, w):
+        """rollback armed, then the room boots its trial; that root fails the check."""
+        code, _, err = w.run("rollback")
+        self.assertEqual(code, 0, err)
+        self.assertEqual((w.state()["trial"]["kind"], w.state()["trial"]["release"]), ("rollback", "2026.11.21-1"))
+        w.trial_boot("2026.11.21-1")
+        w.host.__dict__.pop("check_root", None)        # spoil_previous's wrapper resets owners
+        w.host.owners = {"etc": (1000, 1000)}
+
+    def test_off_by_default_the_rollback_is_armed_and_its_trial_is_not_refused(self):
         w = self.two_releases()
         self.spoil_previous(w)
         self.assertEqual(sr.DEFAULTS["refuse_unsafe_rollback"], "no")
-        code, _, err = w.run("rollback")
+        self.rolled_back_trial(w)
+        code, _, err = w.run("health-run")
         self.assertEqual(code, 0, err)
-        self.assertEqual(w.state()["trial"]["release"], "2026.11.21-1")
+        self.assertEqual((w.host.reboots, w.host.hard), (0, 0))              # not sent back
+        st = w.state()
+        self.assertIsNone(st["trial"])
+        self.assertEqual(st["configured"]["release"], "2026.11.21-1")       # promoted on health, as before WS17
+        self.assertNotEqual(st["last_result"].get("reason"), "unsafe-root")
+        self.assertIn("not refused (refuse_unsafe_rollback=no)", err)
+        # recorded for ops: status --json release.root_check, and one event for both checks
+        code, out, _ = w.run("status", "--json")
+        check = json.loads(out)["release"]["root_check"]
+        self.assertEqual((check["ok"], check["refused"], check["kind"]), (False, False, "rollback"))
+        self.assertEqual(check["findings"][0]["path"], "/etc")
+        self.assertIn("refuse_unsafe_rollback=no", check["note"])
+        kept = [e for e in st["events"] if e["event"] == "unsafe-rollback-kept"]
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(kept[0]["release"], "2026.11.21-1")
+
+    def test_on_a_rollback_trial_whose_root_fails_the_check_is_sent_back(self):
+        w = self.two_releases()
+        self.conf(w, "refuse_unsafe_rollback=yes\n")
+        self.rolled_back_trial(w)                       # good when armed, spoiled when it boots
+        code, _, _ = w.run("health-run")
+        self.assertEqual(code, 1)
+        self.assertEqual(w.host.reboots, 1)
+        st = w.state()
+        self.assertIsNone(st["trial"])
+        self.assertEqual(st["configured"]["release"], "2026.11.22-1")
+        self.assertEqual((st["last_result"]["result"], st["last_result"]["reason"]), ("rolled-back", "unsafe-root"))
+        self.assertEqual((st["root_check"]["refused"], st["root_check"]["kind"]), (True, "rollback"))
+
+    def test_off_an_update_trial_still_refuses_an_unsafe_root(self):
+        w = World(self)
+        self.assertEqual(sr.DEFAULTS["refuse_unsafe_rollback"], "no")
+        code, _, err = w.run("update", str(w.release()), "--unsigned")
+        self.assertEqual(code, 0, err)
+        w.trial_boot()
+        w.host.owners = {"etc": (1000, 1000)}
+        code, _, _ = w.run("health-run")
+        self.assertEqual((code, w.host.reboots), (1, 1))
+        st = w.state()
+        self.assertEqual((st["last_result"]["result"], st["last_result"]["reason"]), ("rolled-back", "unsafe-root"))
+        self.assertEqual((st["root_check"]["refused"], st["root_check"]["kind"]), (True, "update"))
 
     def test_on_a_rollback_to_an_unsafe_root_is_refused_before_arming(self):
         w = self.two_releases()
@@ -882,6 +936,143 @@ class RollbackRefusal(unittest.TestCase):
         w2.host.check_root = boom
         code, _, err = w2.run("rollback")
         self.assertEqual(code, 0, err)
+
+
+# A process that holds the btrfs top level (Host.top) the way stage or check-kept do,
+# on the real (not prefix) path: RUN_DIR moved to a scratch dir, mount, umount and
+# findmnt faked by a mount table file. Prints what it saw.
+TOP_DRIVER = r"""
+import importlib.machinery, importlib.util, os, subprocess, sys, time
+tool, run_dir, role, hold, wait = sys.argv[1:6]
+loader = importlib.machinery.SourceFileLoader("smartroom_release", tool)
+sr = importlib.util.module_from_spec(importlib.util.spec_from_loader("smartroom_release", loader))
+loader.exec_module(sr)
+sr.RUN_DIR = run_dir
+host = sr.Host("")
+host.btrfs_device = lambda: "/dev/fake-btrfs"
+log = open(os.environ["TOP_LOG"], "a", buffering=1)
+try:
+    with host.top(wait=None if wait == "none" else float(wait)) as top:
+        log.write(f"{role} in {time.monotonic():.3f}\n")
+        time.sleep(float(hold))
+        still = subprocess.run(["findmnt", "-M", str(top)]).returncode == 0
+        log.write(f"{role} out {time.monotonic():.3f} mounted={still}\n")
+except sr.Fail as exc:
+    log.write(f"{role} {exc.code}\n")
+"""
+
+FAKE_MOUNT = {
+    "mount": 'echo "${@: -1}" >>"$MOUNT_TABLE"',
+    "umount": 'grep -qxF "$1" "$MOUNT_TABLE" || { echo "umount: $1: not mounted" >&2; exit 32; }\n'
+              'tac "$MOUNT_TABLE" | awk -v m="$1" \'!d && $0 == m {d=1; next} {print}\' | tac >"$MOUNT_TABLE.n"\n'
+              'mv "$MOUNT_TABLE.n" "$MOUNT_TABLE"',
+    "findmnt": '[ "$1" = -M ] && grep -qxF "$2" "$MOUNT_TABLE"',
+}
+
+
+class TopLevelLock(unittest.TestCase):
+    """One lock around every user of the btrfs top level mount (/run/smartroom-release/top).
+    2026-11-24: integrity's timer runs check-kept there; with no lock an update could
+    lose its mount mid-stage, or the top level could stay mounted."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="srel-top-"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        bin_dir = self.tmp / "bin"
+        bin_dir.mkdir()
+        for name, body in FAKE_MOUNT.items():
+            (bin_dir / name).write_text("#!/bin/bash\n" + body + "\n")
+            (bin_dir / name).chmod(0o755)
+        self.table = self.tmp / "mounts"
+        self.table.write_text("")
+        self.log = self.tmp / "log"
+        self.run_dir = self.tmp / "run"
+        self.top = str(self.run_dir / "top")
+        self.env = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}",
+                    "MOUNT_TABLE": str(self.table), "TOP_LOG": str(self.log)}
+
+    def start(self, role, hold, wait="none"):
+        return subprocess.Popen([sys.executable, "-B", "-c", TOP_DRIVER, str(TOOL), str(self.run_dir),
+                                 role, str(hold), wait], env=self.env)
+
+    def wait_for(self, text, limit=20.0):
+        end = time.monotonic() + limit
+        while time.monotonic() < end:
+            if self.log.exists() and text in self.log.read_text():
+                return
+            time.sleep(0.02)
+        self.fail(f"never saw {text!r}: {self.log.read_text() if self.log.exists() else ''}")
+
+    def lines(self):
+        return {line.split(" ", 2)[0] + " " + line.split(" ", 2)[1]: line for line in self.log.read_text().splitlines()}
+
+    def test_a_stage_that_comes_second_keeps_its_mount_until_it_is_done(self):
+        kept = self.start("check-kept", 1.0, wait="0")
+        self.wait_for("check-kept in")
+        stage = self.start("stage", 1.0)                # the old race: stage reused kept's mount and lost it
+        self.assertEqual((kept.wait(30), stage.wait(30)), (0, 0))
+        log = self.lines()
+        self.assertIn("mounted=True", log["check-kept out"])
+        self.assertIn("mounted=True", log["stage out"])
+        self.assertGreaterEqual(float(log["stage in"].split()[2]), float(log["check-kept out"].split()[2]))
+        self.assertEqual(self.table.read_text(), "")    # nothing left mounted
+
+    def test_check_kept_does_not_wait_for_a_stage_or_touch_its_mount(self):
+        stage = self.start("stage", 1.5)
+        self.wait_for("stage in")
+        kept = self.start("check-kept", 0.1, wait="0")
+        self.assertEqual(kept.wait(30), 0)
+        self.assertIn("check-kept busy", self.log.read_text())
+        self.assertEqual(self.table.read_text().split(), [self.top])        # stage's mount, untouched
+        self.assertEqual(stage.wait(30), 0)
+        self.assertIn("mounted=True", self.lines()["stage out"])
+        self.assertEqual(self.table.read_text(), "")
+
+    def test_a_mount_left_by_a_killed_holder_is_taken_over_and_unmounted(self):
+        self.table.write_text(f"{self.top}\n{self.top}\n")       # killed, and stacked by an older tool
+        stage = self.start("stage", 0.1)
+        self.assertEqual(stage.wait(30), 0)
+        self.assertIn("mounted=True", self.lines()["stage out"])
+        self.assertEqual(self.table.read_text(), "")
+
+    def test_check_kept_and_stage_at_the_same_time(self):
+        """The commands themselves: check-kept (another process) while an update is
+        receiving its root. check-kept is busy and caches nothing; the update is
+        staged; the next check-kept checks the kept roots."""
+        w = RefusalKeepsTheFallback.two_releases(self)
+        real_receive = sr.receive_root
+        seen = {}
+
+        def receive_while_check_kept_runs(*args, **kwargs):
+            done = subprocess.run([sys.executable, "-B", str(TOOL), "--prefix", str(w.prefix),
+                                   "check-kept", "--json"], capture_output=True, text=True, timeout=60)
+            seen["code"], seen["doc"] = done.returncode, json.loads(done.stdout or "{}")
+            return real_receive(*args, **kwargs)
+
+        with mock.patch.object(sr, "receive_root", side_effect=receive_while_check_kept_runs):
+            code, _, err = w.run("update", str(w.release("2026.11.23-1")), "--unsigned")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(w.state()["trial"]["release"], "2026.11.23-1")
+        self.assertEqual(seen["code"], 0)
+        self.assertIs(seen["doc"]["busy"], True)
+        self.assertIsNone(seen["doc"]["ok"])
+        self.assertFalse(sr.kept_check_path(w.host).exists())               # nothing cached
+        code, out, err = w.run("check-kept", "--json")
+        self.assertEqual(code, 0, err)
+        doc = json.loads(out)
+        self.assertNotIn("busy", doc)
+        self.assertTrue(doc["roots"])
+        self.assertTrue(sr.kept_check_path(w.host).exists())
+
+    def test_one_process_nests_without_locking_itself_out(self):
+        tmp = Path(tempfile.mkdtemp(prefix="srel-nest-"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        host = sr.Host(str(tmp))
+        with host.top(wait=0) as outer:
+            with host.top(wait=0) as inner:
+                self.assertEqual(outer, inner)
+        with host.top(wait=0):
+            pass
 
 
 if __name__ == "__main__":

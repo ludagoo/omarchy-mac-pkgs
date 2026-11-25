@@ -55,6 +55,7 @@ import argparse
 import contextlib
 import dataclasses
 import errno
+import fcntl
 import hashlib
 import json
 import os
@@ -73,6 +74,10 @@ from typing import Any, Iterable, NamedTuple, Optional
 SCHEMA = 1
 MANIFEST = "manifest.json"
 STATE_DIR = "smartroom-release"
+# The btrfs top level is mounted at RUN_DIR/top, by one process at a time: the
+# holder of the flock on RUN_DIR/top.lock (Host.top).
+RUN_DIR = "/run/smartroom-release"
+TOP_LOCK_WAIT = 30 * 60
 STATE_FILE = "state.json"
 MARKER = "aura-try"
 TRIAL_BOOT = "m1n1/boot-trial.bin"
@@ -165,9 +170,9 @@ DEFAULTS = {
     # display is connected; `always`: also without one (a test Studio's screens are
     # Hyprland headless outputs, which DRM does not count).
     "require_room_pages": "no",
-    # Waiting on Lucas (2026-11-24): refuse a rollback or restore whose root fails the
-    # root invariant before anything is armed. Off: today such a trial boots once and
-    # health-run's own check sends the room back (unsafe-root). `yes` turns it on.
+    # Waiting on Lucas (2026-11-24): `yes` refuses a rollback or restore whose root fails the
+    # invariant, before arming and in its trial. Off (default, as before WS17): never refused;
+    # the trial records the check (release.root_check refused false). See unsafe_trial.
     "refuse_unsafe_rollback": "no",
     "keyring": "/usr/share/smartroomos/release-keyring.gpg",
     "watchdog_device": "/dev/watchdog",
@@ -651,7 +656,7 @@ class Host:
     def __init__(self, prefix: str = ""):
         self.prefix = prefix.rstrip("/")
         self._conf: Optional[dict] = None
-        self._top_mounted = False
+        self._top: Optional[Path] = None     # the top level while this process holds it
 
     def p(self, absolute: str) -> Path:
         return Path(self.prefix + absolute)
@@ -811,26 +816,64 @@ class Host:
         )
 
     @contextlib.contextmanager
-    def top(self):
-        """The btrfs top level (subvolid 5), where the root subvolumes live."""
+    def top(self, wait: Optional[float] = None):
+        """The btrfs top level (subvolid 5), where the root subvolumes live.
+        One mount point (RUN_DIR/top) and one lock for every user of it: stage,
+        rollback/restore, prune, discard, build-release, doctor, migrate-confirm and
+        check-kept (integrity's timer). The holder of the exclusive flock on
+        RUN_DIR/top.lock mounts the top level and unmounts it when it is done; no
+        other process mounts or unmounts it meanwhile. (2026-11-24: check-kept on
+        integrity's timer and an update could unmount the top level under each other
+        mid-stage, or leave it mounted.) A mount left by a holder that was killed is
+        taken over and unmounted by the next holder. A use nested in one process
+        shares its holder's mount. WAIT: seconds to wait for another holder (None:
+        TOP_LOCK_WAIT); then Fail with code busy."""
+        if self._top is not None:
+            yield self._top
+            return
+        run_dir = self.p(RUN_DIR)
+        run_dir.mkdir(parents=True, exist_ok=True)
+        fd = os.open(run_dir / "top.lock", os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
+        try:
+            take_lock(fd, TOP_LOCK_WAIT if wait is None else wait,
+                      "another smartroom-release is using the btrfs top level")
+            mount = self.mount_top(run_dir / "top")
+            self._top = mount
+            try:
+                yield mount
+            finally:
+                self._top = None
+                self.unmount_top(mount)
+        finally:
+            os.close(fd)                                # releases the lock
+
+    def mount_top(self, mount: Path) -> Path:
+        """Called with the top lock held."""
         if self.prefix:
             top = self.p("/top")
             top.mkdir(parents=True, exist_ok=True)
-            yield top
-            return
-        mount = Path("/run/smartroom-release/top")
-        device = self.btrfs_device()
-        mounted = subprocess.run(["findmnt", "-M", str(mount)], capture_output=True).returncode == 0
-        did = False
-        if not mounted:
+            return top
+        if not self.top_is_mounted(mount):
             mount.mkdir(parents=True, exist_ok=True)
-            self.run(["mount", "-o", "subvolid=5,noatime", device, str(mount)])
-            did = True
-        try:
-            yield mount
-        finally:
-            if did:
-                subprocess.run(["umount", str(mount)], capture_output=True, check=False)
+            self.run(["mount", "-o", "subvolid=5,noatime", self.btrfs_device(), str(mount)])
+        return mount
+
+    def unmount_top(self, mount: Path) -> None:
+        """Called with the top lock held: every mount there is ours (older tools could
+        stack two), so all of them go."""
+        if self.prefix:
+            return
+        for _ in range(4):
+            if not self.top_is_mounted(mount):
+                return
+            done = subprocess.run(["umount", str(mount)], capture_output=True, check=False)
+            if done.returncode != 0:
+                print(f"smartroom-release: could not unmount {mount}: "
+                      f"{done.stderr.decode(errors='replace').strip()}", file=sys.stderr)
+                return
+
+    def top_is_mounted(self, mount: Path) -> bool:
+        return subprocess.run(["findmnt", "-M", str(mount)], capture_output=True).returncode == 0
 
     # health signals ------------------------------------------------------------
     def agent_connected(self) -> bool:
@@ -1084,6 +1127,20 @@ def load_state(host: Host) -> dict:
 def save_state(host: Host, state: dict) -> None:
     state["events"] = state.get("events", [])[-EVENTS_KEEP:]
     write_atomic(state_path(host), (json.dumps(state, indent=2, sort_keys=True) + "\n").encode())
+
+
+def take_lock(fd: int, wait: float, busy: str) -> None:
+    """An exclusive flock on FD, waiting up to WAIT seconds (real time, not the
+    host's clock: the other holder is a real process). Fail busy after that."""
+    deadline = time.monotonic() + max(0.0, wait)
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                raise Fail(busy, "busy") from None
+            time.sleep(0.2)
 
 
 def event(host: Host, state: dict, name: str, **fields: Any) -> None:
@@ -2159,7 +2216,9 @@ def check_kept_roots(host: Host, state: dict) -> dict:
     targets = [r for r in release_rows(state) if r.get("root") and r.get("root") != running]
     if not targets:
         return {"at": host.stamp(), "checked_unix": host.now(), "ok": True, "running": running, "roots": []}
-    with host.top() as top:
+    # wait=0: an update (or anything else) holding the top level goes first; the
+    # next integrity timer run checks again.
+    with host.top(wait=0) as top:
         for row in targets:
             item = {"release": row["release"], "root": row["root"], "role": row["role"], "at": host.stamp()}
             path = top / row["root"]
@@ -2191,8 +2250,15 @@ def cmd_check_kept(host: Host, args) -> int:
              and sorted((r.get("release"), r.get("root")) for r in doc.get("roots", [])) == want)
     if not fresh:
         require_root(host)
-        doc = check_kept_roots(host, state)
-        write_atomic(kept_check_path(host), json.dumps(doc, indent=2, sort_keys=True).encode(), 0o644)
+        try:
+            doc = check_kept_roots(host, state)
+        except Fail as exc:
+            if exc.code != "busy":
+                raise
+            # not cached: status --json keeps the last result, the next run checks
+            doc = {"at": host.stamp(), "ok": None, "busy": True, "error": exc.message, "roots": []}
+        else:
+            write_atomic(kept_check_path(host), json.dumps(doc, indent=2, sort_keys=True).encode(), 0o644)
     if args.json:
         print(json.dumps(doc, sort_keys=True))
     else:
@@ -2410,7 +2476,7 @@ def _rollback_trial_after_offload(host: Host, state: dict, prev: dict, layout: B
     with host.top() as top:
         if prev["root"] and not subvol_exists(top, prev["root"]):
             raise Fail(f"the previous root {prev['root']} is gone", "not-found")
-        if prev["root"] and str(host.conf.get("refuse_unsafe_rollback", "no")).lower() in ("yes", "1", "true"):
+        if prev["root"] and refuse_unsafe_rollback(host):
             refuse_unsafe_target(host, state, prev, top / prev["root"])
     # Budget: trial files + promote previous reserve (same as an update).
     uki_sz = file_size(uki_src)
@@ -2447,6 +2513,11 @@ def _rollback_trial_after_offload(host: Host, state: dict, prev: dict, layout: B
     event(host, state, "started", release=prev["release"], previous=state["configured"].get("release"), kind="rollback")
     save_state(host, state)
     return state
+
+
+def refuse_unsafe_rollback(host: Host) -> bool:
+    """The switch (release.conf refuse_unsafe_rollback, default no; waiting on Lucas)."""
+    return str(host.conf.get("refuse_unsafe_rollback", "no")).strip().lower() in ("yes", "1", "true")
 
 
 def refuse_unsafe_target(host: Host, state: dict, entry: dict, root: Path) -> None:
@@ -3670,12 +3741,17 @@ def healthy_window(samples: list[tuple[float, tuple[int, int, int]]], start: flo
 
 
 def unsafe_trial(host: Host, state: dict) -> bool:
-    """The root invariant on the running trial root. A trial that fails it is never
-    kept: record why (ops shows last_result), reboot, the configured release boots.
+    """The root invariant on the running trial root. An update trial that fails it is
+    never kept: record why (ops shows last_result), reboot, the configured release boots.
+    A rollback or restore trial (kind rollback) is refused on it only when
+    refuse_unsafe_rollback is on. Off (the default), it goes on as before WS17: the
+    result is recorded (status --json release.root_check with refused false, event
+    unsafe-rollback-kept) and integrity shows the running root's own check on ops.
     A check that cannot run (a tool bug, an error) is not proof of an unsafe root:
     it is logged and shown on ops (status --json rootCheck), and the trial goes on
     as if the check had not run. A tool bug must never strand a room."""
     trial = state.get("trial") or {}
+    kind = trial.get("kind", "update")
     try:
         report = host.check_root(host.p("/"))
     except Exception as exc:   # noqa: BLE001
@@ -3687,10 +3763,23 @@ def unsafe_trial(host: Host, state: dict) -> bool:
         save_state(host, state)
         return False
     state["root_check"] = {"ok": report.ok, "count": report.count, "checked": report.checked,
-                           "at": host.stamp(), "release": trial.get("release")}
+                           "at": host.stamp(), "release": trial.get("release"), "kind": kind}
     if report.ok:
         save_state(host, state)
         return False
+    if kind == "rollback" and not refuse_unsafe_rollback(host):
+        state["root_check"].update(refused=False, message=report.summary(), findings=report.findings[:20],
+                                   note="a rollback or restore is not refused on the root check "
+                                        "(refuse_unsafe_rollback=no)")
+        if not any(e.get("event") == "unsafe-rollback-kept" and e.get("trial") == trial.get("armed_at")
+                   for e in state.get("events") or []):
+            event(host, state, "unsafe-rollback-kept", release=trial.get("release"), trial=trial.get("armed_at"),
+                  count=report.count, message=report.summary()[:300])
+        print(f"smartroom-release: the rollback root fails the root check ({report.summary()}); "
+              "not refused (refuse_unsafe_rollback=no)", file=sys.stderr)
+        save_state(host, state)
+        return False
+    state["root_check"]["refused"] = True
     finish_failed_trial(host, state, "unsafe-root", message=report.summary(),
                         count=report.count, findings=report.findings[:20])
     host.reboot()

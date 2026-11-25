@@ -74,11 +74,13 @@ Every place a root comes from runs it, and a root that fails is refused:
 
 - `build-release`: before it sends or signs (reason code `unsafe-root`);
 - `stage`/`update`: on the received root, before anything is armed (`last_result` `refused`, `unsafe-root`);
-- `health-run`: on the running trial, at the start and again before mark-good. A trial that fails is rolled back at once (no wait): reason `unsafe-root`, with the first paths in `last_result.findings`, for ops. The journal is flushed to disk before the rollback reboot, so the failed boot's log survives.
+- `health-run`: on the running trial, at the start and again before mark-good. An update trial that fails is rolled back at once (no wait): reason `unsafe-root`, with the first paths in `last_result.findings`, for ops. The journal is flushed to disk before the rollback reboot, so the failed boot's log survives. A rollback or restore trial is refused on it only with `refuse_unsafe_rollback=yes` (below).
 
 Any refusal of `stage`/`update` after it has moved the previous release's boot files off the ESP puts them back, so the room keeps its one fallback.
 
-`check-kept [--json] [--max-age S]` runs the invariant on every kept root this room could roll back or restore to (not the running root, which integrity checks). The result is cached in `/var/lib/smartroomos/release-kept-roots.json` and shown, as information, in `status --json` (`keptRootsCheck`, and `rootCheck` on each release row); `status` never walks a root. `smartroomos-integrity`'s live check runs it at most every six hours. Rollback and restore do not refuse on it yet.
+`check-kept [--json] [--max-age S]` runs the invariant on every kept root this room could roll back or restore to (not the running root, which integrity checks). The result is cached in `/var/lib/smartroomos/release-kept-roots.json` and shown, as information, in `status --json` (`keptRootsCheck`, and `rootCheck` on each release row); `status` never walks a root. `smartroomos-integrity`'s live check runs it at most every six hours. Rollback and restore do not refuse on it yet. When another `smartroom-release` holds the btrfs top level (an update receiving its root), `check-kept` does not wait: it prints `busy: true` with `ok: null`, caches nothing, and the next run checks.
+
+Every command that uses the btrfs top level (`stage`, `rollback`, `restore`, prune, `discard`, `build-release`, `doctor`, `migrate-confirm`, `check-kept`) takes one exclusive lock first, a flock on `/run/smartroom-release/top.lock`. The holder mounts the top level at `/run/smartroom-release/top` and unmounts it when done, so no process unmounts it under another. A mount left by a killed holder is taken over and unmounted by the next one.
 
 The firmware's `check-image`, the installer's `desk-check`, `smartroomos-integrity` and `smartroomos-release-sign` call this same command; the firmware's `overlay/usr/bin/smartroom-release` is a byte copy of this file.
 
@@ -90,7 +92,9 @@ The condition is written and tested, and off: `require_room_pages=no` (default) 
 
 ## Refusing a rollback to an unsafe root (written, off)
 
-Waiting on Lucas. Today `rollback` and `restore` arm a kept root without checking it; if it fails the invariant, its trial's `health-run` refuses it at boot (`unsafe-root`) and the room returns to the configured release after one reboot. With `refuse_unsafe_rollback=yes` in `/etc/smartroomos/release.conf`, they check the target first and refuse before anything is armed (`last_result` `refused`, `unsafe-root`, event `rollback-refused`); a check that cannot run does not refuse. Default `no`. `check-kept` shows today which kept roots would be refused.
+Waiting on Lucas. Default `refuse_unsafe_rollback=no`: as before WS17, `rollback` and `restore` are never refused on the invariant. They arm a kept root without checking it, and their trial (kind `rollback`) checks the root at boot but does not roll back on it: the result goes in `status --json` (`release.root_check` with `ok: false`, `refused: false`, `kind`, `findings`, `note`), event `unsafe-rollback-kept` (once per trial), and the trial goes on to its health result. Integrity shows that record as information (`release_root_check`); its own check of the running root still reports `unsafe-root`. Update trials refuse an unsafe root whatever the switch says.
+
+With `refuse_unsafe_rollback=yes` in `/etc/smartroomos/release.conf`, `rollback` and `restore` check the target first and refuse before anything is armed (`last_result` `refused`, `unsafe-root`, event `rollback-refused`), and a rollback trial whose root fails is sent back (`unsafe-root`), as an update trial is. A check that cannot run does not refuse. `check-kept` shows today which kept roots would be refused. The Mini's `smartroomos-boot-commit` does the same for a snapshot restore (`root_check_refused=no|yes` in its marker).
 
 A rollback or restore that fails after moving the previous release's boot files off the ESP puts them back, as `stage` does.
 
