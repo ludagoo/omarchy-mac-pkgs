@@ -10,8 +10,8 @@ arch=('any')
 url='https://github.com/ludagoo/omarchy-mac-pkgs'
 license=('MIT')
 makedepends=('git')
-depends=('python' 'btrfs-progs' 'zstd' 'gnupg' 'curl' 'systemd' 'iproute2' 'util-linux')
-checkdepends=('tar')
+depends=('python' 'btrfs-progs' 'zstd' 'gnupg' 'curl' 'systemd' 'iproute2' 'util-linux' 'sudo')
+checkdepends=('tar' 'sudo')
 _commit=${SMARTROOM_MAC_PKGS_COMMIT:?set by smartroom/build-packages}
 source=("omarchy-mac-pkgs::git+https://github.com/ludagoo/omarchy-mac-pkgs.git#commit=${_commit}")
 sha256sums=('SKIP')

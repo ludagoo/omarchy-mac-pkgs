@@ -13,11 +13,32 @@ built() { sed -n "s/^$1=//p" "$recipe/BUILT"; }
 want=$(built pkgbuild_sha256)
 [[ $want =~ ^[0-9a-f]{64}$ ]] || fail "BUILT has no pkgbuild_sha256"
 got=$(sha256sum "$recipe/PKGBUILD" | cut -d' ' -f1)
-[[ $got == "$want" ]] ||
+# A recipe change waiting for its build is named in BUILT (recipe_after_build); any
+# other PKGBUILD is not the recipe of what ships.
+pending=$(built recipe_after_build)
+if [[ $got == "$want" ]]; then
+  echo "ok - PKGBUILD is the recipe of $(built package)"
+elif [[ -n $pending && $got == "$pending" ]]; then
+  echo "ok - PKGBUILD is the recorded change after $(built package) (recipe_after_build; the next build ships it)"
+else
   fail "PKGBUILD is $got, the shipped package was built from $want: rebuild, then update BUILT and the installer's room/prebuilt.sha256"
+fi
 [[ $(built package_sha256) =~ ^[0-9a-f]{64}$ ]] || fail "BUILT has no package_sha256"
 [[ $(built package) == chromium-smartroom-*-aarch64.pkg.tar.* ]] || fail "BUILT names no chromium-smartroom package"
-echo "ok - PKGBUILD is the recipe of $(built package)"
+
+# The shared libraries it links are declared, from the package's own NEEDED entries
+# (soname-depends record NEEDED), not by hand; makepkg versions them, so a provider
+# with another soname (simdutf .so.37 for a build that linked .so.36) is refused.
+[[ -f $recipe/NEEDED && -x $recipe/soname-depends ]] || fail "the recipe needs NEEDED and soname-depends"
+record_sha=$(sed -n '1s/.*(\([0-9a-f]\{64\}\))$/\1/p' "$recipe/NEEDED")
+[[ $record_sha == "$(built package_sha256)" ]] || fail "NEEDED is not the record of the shipped package ($record_sha)"
+declared=$(cd "$recipe" && bash -c 'source ./PKGBUILD >/dev/null 2>&1; printf "%s\n" "${_soname_depends[@]}"' | sort)
+derived=$("$recipe/soname-depends" --names "$recipe/NEEDED")
+[[ -n $derived && $declared == "$derived" ]] || fail "PKGBUILD's _soname_depends is not NEEDED's list:"$'\n'"$(diff <(echo "$declared") <(echo "$derived"))"
+grep -qx libsimdutf.so <<<"$declared" || fail "libsimdutf.so must be declared"
+(cd "$recipe" && bash -c 'source ./PKGBUILD >/dev/null 2>&1; printf "%s\n" "${depends[@]}"') | grep -qx 'libsimdutf.so' ||
+  fail "_soname_depends must be in depends"
+echo "ok - the $(wc -l <<<"$declared") shared libraries it links are declared (from NEEDED)"
 
 # Local sources (no "::" rename and no URL) against their sums, in order.
 mapfile -t lines < <(cd "$recipe" && bash -c 'source ./PKGBUILD >/dev/null 2>&1

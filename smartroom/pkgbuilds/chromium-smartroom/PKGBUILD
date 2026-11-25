@@ -34,7 +34,7 @@ buildarch=8
 
 pkgname=chromium-smartroom
 pkgver=158.0.8127.36
-pkgrel=3
+pkgrel=4
 _launcher_ver=8
 _manual_clone=0
 _system_clang=1
@@ -242,6 +242,50 @@ _unwanted_bundled_libs=(
   $(printf "%s\n" ${!_system_libs[@]} | sed 's/^libjpeg$/&_turbo/')
 )
 depends+=(${_system_libs[@]})
+
+# The shared libraries this build links, derived from the built package's own ELF
+# NEEDED entries by ./soname-depends (the record is NEEDED beside this file; regenerate
+# both after a build). makepkg versions each from what it linked (libsimdutf.so=36-64),
+# so pacman, and the image build with it, refuse a package set whose provider ships
+# another soname (2026-11-24: simdutf 9.3.0 ships .so.37; the kiosk could not start).
+_soname_depends=(
+  'libasound.so'
+  'libatk-1.0.so'
+  'libatk-bridge-2.0.so'
+  'libatspi.so'
+  'libbrotlidec.so'
+  'libcairo.so'
+  'libdav1d.so'
+  'libdbus-1.so'
+  'libexpat.so'
+  'libffi.so'
+  'libFLAC.so'
+  'libfontconfig.so'
+  'libfreetype.so'
+  'libgbm.so'
+  'libgcc_s.so'
+  'libgio-2.0.so'
+  'libglib-2.0.so'
+  'libgobject-2.0.so'
+  'libharfbuzz.so'
+  'libharfbuzz-subset.so'
+  'libjpeg.so'
+  'libopenh264.so'
+  'libopus.so'
+  'libpango-1.0.so'
+  'libpulse.so'
+  'libsimdutf.so'
+  'libstdc++.so'
+  'libudev.so'
+  'libwebpdemux.so'
+  'libwebpmux.so'
+  'libwebp.so'
+  'libxkbcommon.so'
+  'libxml2.so'
+  'libz.so'
+  'libzstd.so'
+)
+depends+=("${_soname_depends[@]}")
 
 # Google API keys (see https://www.chromium.org/developers/how-tos/api-keys)
 # Note: These are for Arch Linux use ONLY. For your own distribution, please

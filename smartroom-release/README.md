@@ -45,9 +45,58 @@ Paths in a manifest must be relative and stay inside the release. The signature
 is required (key: `/usr/share/smartroomos/release-keyring.gpg`); `--unsigned`
 exists for development and is recorded in the state. A URL must be https.
 
-Make one from a room that runs the image you want to ship:
-`smartroom-release build-release --id ID --out DIR [--sign-key FPR]`. It snapshots
-the root, sends it, and copies the room's `m1n1/boot.bin` and UKI.
+A release is made only by `smartroom-release build-release`, and only from a root that passes the root invariant (below). It writes nothing and signs nothing when the root fails, and it removes an older `manifest.json` and `.sig` from `--out` first.
+
+- From an image (the Studio release build, installer `smartroom/release-pack`): `smartroom-release build-release --id ID --out DIR --source-path MOUNTED_IMAGE/@ --line studio --uki-from UKI --boot-from BOOT_BIN [--source-info firmware=COMMIT ...] [--sign-key FPR]`, as root on the build host.
+- From a room that runs the image you want to ship: `smartroom-release build-release --id ID --out DIR [--sign-key FPR]`. It snapshots the root, sends it, and copies the room's `m1n1/boot.bin` and UKI.
+
+Never assemble a release root by hand or by a job script (patching an older root, `rsync -a` from a checkout): on 2026-11-24 that shipped `2026.11.24-studio-edge` and `-edge-b` with about 200 system paths owned by the Room Controller user.
+
+## The root invariant (`check-root`)
+
+`smartroom-release check-root [ROOT] [--json]` checks a root directory, a `root.btrfs.zst` (read without privileges), or the running room (`/`). It fails on:
+
+- `login-owner`: a path whose uid or gid is a login id (1000 and up, except 65534);
+- `rc-owner`: a path owned by `smartroomcontroller`, looked up by name in the root's `/etc/passwd` and `/etc/group`;
+- `system-owner`: a path under `/etc`, `/usr` or `/opt` whose owner is not root (system groups are fine);
+- `system-dir`: `/`, `/etc`, `/usr`, any direct child of `/usr`, `/etc/sudoers`, `/etc/sudoers.d` or a file in it that is not `root:root`, or is writable by group or other;
+- `sudoers-mode`: `/etc/sudoers` or a file in `/etc/sudoers.d` with a mode bit beyond `0440` (what plain `visudo -c` enforces);
+- `sudoers-missing` and `visudo` (`visudo -c` on the root's sudoers and sudoers.d);
+- `unreadable`: a path it cannot list or stat, or, in a stream, a sudoers, passwd or group file whose contents the stream does not carry (no data, a shared copy or an encoded write). An empty sudoers would pass `visudo`, and an empty passwd would hide the Room Controller user.
+
+It stays on the root's own filesystem; on btrfs that is the root's own subvolume, exactly what a release contains. A directory on another filesystem or subvolume (`/boot`, the ESP, `@log`, `@home`, `/mnt`, `/media`, a USB stick) is neither judged nor walked; `other_filesystems` in the JSON lists it, and `smartroomos-integrity` shows it as information. A tech's uid-1000 USB stick never makes a room unsafe.
+
+Exit codes: `0` the root passes, `1` it fails (unsafe), `3` the check itself could not run (a missing path, a bad stream, a crash). `3` is never a verdict on the root. The build side (`build-release`, `desk-check`, `check-image`, `release-pack`) refuses on any non-zero exit. A room never refuses a trial on `3`: `health-run` and the Mini's `smartroomos-boot-commit` log it, show it on ops (`status --json` `release.root_check`, integrity reason `root-check-error`) and treat it as not proven unsafe, because a tool bug must never strand a room. `stage` refuses on it (reason `root-check-error`), since nothing is armed yet.
+
+The exceptions are in the code with their reasons (`ROOT_EXEMPT_TREES`): what is below `/home`, `/opt/smartroom` itself and below (the Room Controller's own directory), what is below `/tmp` and `/var/tmp`, and systemd DynamicUser ids under `/var/lib/private` and the like. `/proc`, `/sys`, `/dev`, `/run` and `.snapshots` are not walked. They were derived from the good root `2026.11.21-studio-ws14b` (86,739 paths, ok), the Mini image `2026.11.21-mini` (98,635 paths, ok) and the repaired Home Studio (87,632 paths, ok); `2026.11.24-studio-edge-b` fails with 207 problems.
+
+Every place a root comes from runs it, and a root that fails is refused:
+
+- `build-release`: before it sends or signs (reason code `unsafe-root`);
+- `stage`/`update`: on the received root, before anything is armed (`last_result` `refused`, `unsafe-root`);
+- `health-run`: on the running trial, at the start and again before mark-good. An update trial that fails is rolled back at once (no wait): reason `unsafe-root`, with the first paths in `last_result.findings`, for ops. The journal is flushed to disk before the rollback reboot, so the failed boot's log survives. A rollback or restore trial is refused on it only with `refuse_unsafe_rollback=yes` (below).
+
+Any refusal of `stage`/`update` after it has moved the previous release's boot files off the ESP puts them back, so the room keeps its one fallback.
+
+`check-kept [--json] [--max-age S]` runs the invariant on every kept root this room could roll back or restore to (not the running root, which integrity checks). The result is cached in `/var/lib/smartroomos/release-kept-roots.json` and shown, as information, in `status --json` (`keptRootsCheck`, and `rootCheck` on each release row); `status` never walks a root. `smartroomos-integrity`'s live check runs it at most every six hours. Rollback and restore do not refuse on it yet. When another `smartroom-release` holds the btrfs top level (an update receiving its root), `check-kept` does not wait: it prints `busy: true` with `ok: null`, caches nothing, and the next run checks.
+
+Every command that uses the btrfs top level (`stage`, `rollback`, `restore`, prune, `discard`, `build-release`, `doctor`, `migrate-confirm`, `check-kept`) takes one exclusive lock first, a flock on `/run/smartroom-release/top.lock`. The holder mounts the top level at `/run/smartroom-release/top` and unmounts it when done, so no process unmounts it under another. A mount left by a killed holder is taken over and unmounted by the next one.
+
+The firmware's `check-image`, the installer's `desk-check`, `smartroomos-integrity` and `smartroomos-release-sign` call this same command; the firmware's `overlay/usr/bin/smartroom-release` is a byte copy of this file.
+
+## Room pages as a trial condition (written, off)
+
+Waiting on Lucas: should a trial also need "the room pages are up when a display is connected"? On `2026.11.24-studio-edge-c` the kiosk Chromium could not start (a missing library), and the trial still passed: health samples the Room Controller's connection, the network and the display count, and the Room Controller reported `chrome=yes` (installed, not running).
+
+The condition is written and tested, and off: `require_room_pages=no` (default) in `/etc/smartroomos/release.conf`. A room page is a kiosk Chromium main process of the Room Controller user whose URL names a room role (`?role=presentationDisplay`). With `yes`, a sample whose room has a connected display (DRM) and no room page counts as not healthy, so a trial whose pages never start ends in `health-timeout` and rolls back (`last_result.room_pages_required`). `always` requires a page also without a DRM display: a test Studio's screens are Hyprland headless outputs, which DRM does not count, so `yes` would not have caught edge-c on the Home Studio, and `always` would have.
+
+## Refusing a rollback to an unsafe root (written, off)
+
+Waiting on Lucas. Default `refuse_unsafe_rollback=no`: as before WS17, `rollback` and `restore` are never refused on the invariant. They arm a kept root without checking it, and their trial (kind `rollback`) checks the root at boot but does not roll back on it: the result goes in `status --json` (`release.root_check` with `ok: false`, `refused: false`, `kind`, `findings`, `note`), event `unsafe-rollback-kept` (once per trial), and the trial goes on to its health result. Integrity shows that record as information (`release_root_check`); its own check of the running root still reports `unsafe-root`. Update trials refuse an unsafe root whatever the switch says.
+
+With `refuse_unsafe_rollback=yes` in `/etc/smartroomos/release.conf`, `rollback` and `restore` check the target first and refuse before anything is armed (`last_result` `refused`, `unsafe-root`, event `rollback-refused`), and a rollback trial whose root fails is sent back (`unsafe-root`), as an update trial is. A check that cannot run does not refuse. `check-kept` shows today which kept roots would be refused. The Mini's `smartroomos-boot-commit` does the same for a snapshot restore (`root_check_refused=no|yes` in its marker).
+
+A rollback or restore that fails after moving the previous release's boot files off the ESP puts them back, as `stage` does.
 
 ## Commands
 
@@ -61,6 +110,9 @@ smartroom-release rollback [--reboot]   trial of the previous release
 smartroom-release discard               drop a staged or armed (not yet booted) trial
 smartroom-release restore N --no-reboot --json   the Room Controller's call (see below)
 smartroom-release health-run            the boot service (not run by hand)
+smartroom-release check-root [ROOT] [--json]   the root invariant (exit 1 unsafe, 3 the check could not run)
+smartroom-release check-kept [--json] [--max-age S]   the invariant on the kept rollback roots (information)
+smartroom-release build-release ...     make a release (see above)
 ```
 
 ## What it writes
@@ -120,7 +172,8 @@ boots the previous release.
 Reasons recorded: `health-timeout`, `lost-before-userspace` (the room came back on the
 configured set before the service ever ran), `lost-after-userspace`, `trial-did-not-start`
 (Limine ran the trial entry but aura did not run the trial image), `trial-incomplete` (aura
-ran the trial image but Limine picked the configured entry).
+ran the trial image but Limine picked the configured entry), `unsafe-root` (the trial root
+fails the root invariant; checked before the health wait and again before mark-good).
 
 ## Room Controller contract
 
@@ -164,5 +217,7 @@ Controller reboots the room itself after `restore`.
 ## Tests
 
 `test/all` runs the whole path on a directory tree with a fake `btrfs`, a fake clock and
-a real gpg key. The hardware cycle on a Studio is described in the ws6 report in the
+a real gpg key. `test/test_root_invariant.py` holds the invariant's cases (fake roots with
+planted owners, synthetic btrfs send streams, real owners in a user namespace) and the
+refusals of build-release, stage and the trial on both lines. The hardware cycle on a Studio is described in the ws6 report in the
 firmware repo (`docs/update-rollback.md`).
