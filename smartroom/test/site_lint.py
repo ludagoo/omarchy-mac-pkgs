@@ -2,13 +2,14 @@
 """Report site-specific strings in tracked product files.
 
 Patterns and path allow-globs live in .site-lint.json (one file per repo).
-The scan is report-only unless SITE_LINT_STRICT=1, which exits 1 on any hit.
-Existing hits are being removed; this check is what fails once
-strict mode is turned on.
+Strict by default: exits 1 on any hit and names each file and line.
+SITE_LINT_STRICT=0 reports without failing.
 """
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import re
@@ -145,10 +146,14 @@ def file_text(path: Path) -> str | None:
 
 
 def scan(root: Path, config: dict) -> tuple:
-    """Return (lines_by_pattern, files_with_hits, line_hits)."""
+    """Return (lines_by_pattern, files_with_hits, line_hits, where).
+
+    where lists (path, line number, pattern ids) for every line with a hit.
+    """
     counts = {ident: 0 for ident, _rx in config["patterns"]}
     files = 0
     lines = 0
+    where = []
     for rel in list_files(root):
         if not in_roots(rel, config["roots"]) or allowed(rel, config["allow"]):
             continue
@@ -156,90 +161,118 @@ def scan(root: Path, config: dict) -> tuple:
         if text is None:
             continue
         file_hit = False
-        for line in text.splitlines():
-            hit = False
-            for ident, rx in config["patterns"]:
-                if rx.search(line):
-                    counts[ident] += 1
-                    hit = True
-            if hit:
+        for number, line in enumerate(text.splitlines(), 1):
+            ids = [ident for ident, rx in config["patterns"] if rx.search(line)]
+            for ident in ids:
+                counts[ident] += 1
+            if ids:
                 lines += 1
                 file_hit = True
+                where.append((rel, number, ids))
         if file_hit:
             files += 1
-    return counts, files, lines
+    return counts, files, lines, where
 
 
-def report(counts: dict, files: int, lines: int, strict: bool) -> int:
+def strict_from_env(env) -> bool:
+    """Strict unless SITE_LINT_STRICT is 0."""
+    return (env.get("SITE_LINT_STRICT") or "1").strip() != "0"
+
+
+def report(counts: dict, files: int, lines: int, strict: bool, where=()) -> int:
     flag = "1" if strict else "0"
     print(f"site-lint: files={files} lines={lines} strict={flag}")
     for ident in sorted(counts):
         print(f"  {ident}: {counts[ident]}")
+    # Locations only, never the matched text.
+    for rel, number, ids in where:
+        print(f"  hit {rel}:{number}: {','.join(ids)}")
     if strict and lines:
-        print("site-lint: strict mode, hits remain", file=sys.stderr)
+        print("site-lint: strict mode, hits remain (fix them, or allow a path in .site-lint.json with a reason)", file=sys.stderr)
         return 1
     return 0
 
 
+def quiet_report(*args) -> int:
+    """report() for the self-test: its fixture hits are not printed."""
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        return report(*args)
+
+
 def self_test() -> int:
     """Prove strict mode fails on a hit, passes an allow-glob, and stays quiet when clean."""
+    # Built from pieces so this file does not match its own patterns.
     samples = {
-        "room-id": "sw" + "209",
-        "cr9-board-room": "cr9" + "-board-room",
-        "fi108": "fi" + "108",
-        "campus-ip": "172" + ".31." + "0.1",
-        "goossen-dev": "goossen" + ".dev",
-        "moody-edu": "moody" + ".edu",
+        "room-id": ["sw" + "209", "chrome-room__" + "sw" + "333-Default"],
+        "room-name": ["cr9" + "-board-room", "fi" + "108"],
+        "campus-ip": ["172" + ".31." + "0.1"],
+        "goossen-dev": ["goossen" + ".dev"],
+        "moody-edu": ["moody" + ".edu"],
     }
     config = {
         "ignoreCase": True,
         "roots": ["."],
         "patterns": [
-            {"id": "room-id", "regex": r"\bsw[0-9]{3}\b"},
-            {"id": "cr9-board-room", "regex": r"\bcr9-board-room\b"},
-            {"id": "fi108", "regex": r"\bfi108\b"},
+            {"id": "room-id", "regex": r"(?<![a-z0-9])sw[0-9]{3}(?![0-9])"},
+            {"id": "room-name", "regex": r"\b(?:cr9[-]board[-]room|fi10[8])\b"},
             {"id": "campus-ip", "regex": r"172\.31\."},
             {"id": "goossen-dev", "regex": r"goossen\.dev"},
             {"id": "moody-edu", "regex": r"moody\.edu"},
         ],
         "allow": [],
     }
+    for env, want in (({}, True), ({"SITE_LINT_STRICT": "1"}, True), ({"SITE_LINT_STRICT": "0"}, False)):
+        if strict_from_env(env) is not want:
+            print(f"site-lint self-test: strict_from_env({env}) is not {want}", file=sys.stderr)
+            return 1
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         (root / "notes.txt").write_text(
-            "room " + samples["room-id"] + " at " + samples["campus-ip"] + "\n",
+            "ok\nroom " + samples["room-id"][0] + " at " + samples["campus-ip"][0] + "\n",
             encoding="utf-8",
         )
         (root / "keep").mkdir()
-        (root / "keep" / "stay.txt").write_text(samples["goossen-dev"] + "\n", encoding="utf-8")
+        (root / "keep" / "stay.txt").write_text(samples["goossen-dev"][0] + "\n", encoding="utf-8")
         loaded = load_config_obj(config)
-        counts, files, lines = scan(root, loaded)
+        counts, files, lines, where = scan(root, loaded)
         if counts["room-id"] != 1 or counts["campus-ip"] != 1 or files != 2 or lines != 2:
             print(f"site-lint self-test: unexpected counts {counts} files={files} lines={lines}", file=sys.stderr)
             return 1
-        if report(counts, files, lines, True) != 1:
+        if sorted(where) != [("keep/stay.txt", 1, ["goossen-dev"]), ("notes.txt", 2, ["room-id", "campus-ip"])]:
+            print(f"site-lint self-test: unexpected locations {where}", file=sys.stderr)
+            return 1
+        if quiet_report(counts, files, lines, True, where) != 1:
             print("site-lint self-test: strict mode did not fail", file=sys.stderr)
+            return 1
+        shown = io.StringIO()
+        with contextlib.redirect_stdout(shown):
+            if report(counts, files, lines, False, where) != 0:
+                print("site-lint self-test: SITE_LINT_STRICT=0 failed", file=sys.stderr)
+                return 1
+        text = shown.getvalue()
+        if "hit notes.txt:2: room-id,campus-ip" not in text or samples["campus-ip"][0] in text:
+            print("site-lint self-test: hits must show file and line, not the text", file=sys.stderr)
             return 1
         config["allow"] = [
             {"glob": "notes.txt", "reason": "fixture"},
             {"glob": "keep/**", "reason": "fixture tree"},
         ]
-        counts, files, lines = scan(root, load_config_obj(config))
-        if files or lines or report(counts, files, lines, True) != 0:
+        counts, files, lines, where = scan(root, load_config_obj(config))
+        if files or lines or where or quiet_report(counts, files, lines, True, where) != 0:
             print("site-lint self-test: allow-globs did not hide the hits", file=sys.stderr)
             return 1
         (root / "notes.txt").write_text("room-101 example.org\n", encoding="utf-8")
         (root / "keep" / "stay.txt").write_text("ok\n", encoding="utf-8")
         config["allow"] = []
-        counts, files, lines = scan(root, load_config_obj(config))
-        if files or lines or report(counts, files, lines, True) != 0:
+        counts, files, lines, where = scan(root, load_config_obj(config))
+        if files or lines or quiet_report(counts, files, lines, True, where) != 0:
             print("site-lint self-test: a clean tree failed strict mode", file=sys.stderr)
             return 1
         # Every configured literal is recognized, so a new pattern cannot be a no-op.
-        blob = "\n".join(samples[ident] for ident, _rx in load_config_obj(config)["patterns"])
+        blob = "\n".join(s for ident, _rx in load_config_obj(config)["patterns"] for s in samples[ident])
         (root / "all.txt").write_text(blob + "\n", encoding="utf-8")
-        counts, _files, _lines = scan(root, load_config_obj(config))
-        missing = [ident for ident, n in counts.items() if n != 1]
+        counts, _files, _lines, _where = scan(root, load_config_obj(config))
+        missing = [ident for ident, n in counts.items() if n != len(samples[ident])]
         if missing:
             print(f"site-lint self-test: patterns missed a sample: {missing}", file=sys.stderr)
             return 1
@@ -266,9 +299,8 @@ def main(argv: list) -> int:
     except SystemExit:
         root = repo_root(Path(__file__).resolve().parent)
     config = load_config(root / ".site-lint.json")
-    counts, files, lines = scan(root, config)
-    strict = os.environ.get("SITE_LINT_STRICT") == "1"
-    return report(counts, files, lines, strict)
+    counts, files, lines, where = scan(root, config)
+    return report(counts, files, lines, strict_from_env(os.environ), where)
 
 
 if __name__ == "__main__":
