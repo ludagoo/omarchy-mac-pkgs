@@ -52,4 +52,16 @@ out=$(cd "$w/tree" && env -u SITE_LINT_STRICT -u SITE_LINT_PATTERNS python3 "$li
 code=0
 (cd "$w/tree" && SITE_LINT_PATTERNS="$w/missing.json" python3 "$lint" >/dev/null 2>&1) || code=$?
 [[ $code != 0 ]] || fail "a missing pattern file must fail"
+
+# --files: what a test uses on one file or its own output. Always strict; one skip line without patterns.
+printf '%s\n' 'room-101' >"$w/out.txt"
+code=0
+out=$(SITE_LINT_STRICT=0 SITE_LINT_PATTERNS="$w/patterns.json" python3 "$lint" --files "$w/out.txt" "$w/tree/planted.txt" 2>/dev/null) || code=$?
+[[ $code == 1 ]] || fail "--files must fail a hit even with SITE_LINT_STRICT=0, got $code"
+grep -qF "hit $w/tree/planted.txt:2: planted-domain" <<<"$out" || fail "--files must name the hit by file and line: $out"
+out=$(env -u SITE_LINT_PATTERNS python3 "$lint" --files "$w/tree/planted.txt") || fail "--files without SITE_LINT_PATTERNS must pass"
+grep -q 'skipped$' <<<"$out" || fail "--files without SITE_LINT_PATTERNS must say it skipped: $out"
+code=0
+(env -u SITE_LINT_PATTERNS python3 "$lint" --files "$w/none.txt" >/dev/null 2>&1) || code=$?
+[[ $code != 0 ]] || fail "--files must fail on a missing path"
 echo "ok - site lint"
