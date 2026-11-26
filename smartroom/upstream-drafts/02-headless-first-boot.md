@@ -1,4 +1,4 @@
-# Draft PR to omacom/omarchy-mac-pkgs (Lucas sends it; not opened)
+# Draft PR to omacom/omarchy-mac-pkgs (the operator sends it; not opened)
 
 Branch: cut from omacom `main`, cherry-pick "omarchy-mac-boot: first boot for headless images".
 

@@ -116,7 +116,7 @@ REASONS = (
 
 KEEP_GOOD = 5  # last N good releases kept on disk (Lucas decision 3)
 # Cap on /var/lib/smartroomos/drift-archive when carried into a new root.
-# Archives hold hand-change records Lucas requires; drop content only with a
+# Archives hold hand-change records the operator requires; drop content only with a
 # content_pruned mark (never silently). 256 MiB keeps Mini updates off ENOSPC.
 DRIFT_ARCHIVE_CARRY_MAX = 256 * 1024 * 1024
 MINI_MARKER = "trial.marker"  # ESP smartroom-release/trial.marker (Mini; no aura-try)
@@ -165,12 +165,12 @@ DEFAULTS = {
     "sample_seconds": 5,
     "min_displays": "",
     "reboot_hook": "",
-    # Waiting on Lucas (2026-11-24): "the room pages are up when a display is
+    # Waiting on the operator (2026-11-24): "the room pages are up when a display is
     # connected" as a trial health condition. Off until he decides. `yes`: when a
     # display is connected; `always`: also without one (a test Studio's screens are
     # Hyprland headless outputs, which DRM does not count).
     "require_room_pages": "no",
-    # Waiting on Lucas (2026-11-24): `yes` refuses a rollback or restore whose root fails the
+    # Waiting on the operator (2026-11-24): `yes` refuses a rollback or restore whose root fails the
     # invariant, before arming and in its trial. Off (default, as before WS17): never refused;
     # the trial records the check (release.root_check refused false). See unsafe_trial.
     "refuse_unsafe_rollback": "no",
@@ -1565,7 +1565,7 @@ def carry_into(host: Host, new_root: Path) -> list[str]:
             elif target.is_dir():
                 shutil.rmtree(target)
             host.run(["cp", "-a", "--no-target-directory", str(source), str(target)])
-            # Carry drift-archive (banner + content Lucas requires). Cap total
+            # Carry drift-archive (banner + content the operator requires). Cap total
             # size so nested multi-GB build leftovers cannot ENOSPC the Mini.
             if str(rel) == "var/lib/smartroomos" or str(rel).endswith("var/lib/smartroomos"):
                 pruned = prune_carried_drift_archive(
