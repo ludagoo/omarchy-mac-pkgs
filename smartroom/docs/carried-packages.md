@@ -62,5 +62,5 @@ All aarch64 package builds run on a native aarch64 build host (never on an Intel
    smartroom/build-image --inputs INPUTS --recovery-app REC --cache CACHE \
      --packages OUT_PKGS --firmware <pinned-fw-commit> --keys AUTHORIZED_KEYS OUT_IMG
    ```
-   `build-image` records `installer_fork`, `firmware_git`, `omarchy_mac_pkgs_commit`, and the active bootloader into `/usr/share/smartroomos/build-info` inside the image.
+   `build-image` records `installer_fork`, `firmware_git`, `omarchy_mac_pkgs_commit`, and the active bootloader into `/usr/share/smartroom/build-info` inside the image.
 4. Run `sudo smartroom/desk-check OUT_IMG/*.zip WORKDIR` and `bash smartroom/test/all` in `omarchy-mac-installer`; every check (kernel release, `smartroom-kernel-commit`, `build-qualification.json`, GPU/Mesa driver match, `dcpext2`/`dcpext3` DT wiring, AVE encoders/DMA blocks, SMC sensors, Limine zero-touch boot, Recovery branding) must pass before promoting the release.

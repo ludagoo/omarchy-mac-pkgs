@@ -96,12 +96,12 @@ EFI_VARS_SAVE = "/usr/lib/omarchy/mac-boot/efi-vars-save"
 TRIAL_ONLY_PARAMS = ("watchdog.handle_boot_enabled=0",)
 RELEASE_PARAM = "smartroom.release"
 INSTALLED = "installed"
-CARRY_LIST = "/usr/share/smartroomos/release-carry.list"
+CARRY_LIST = "/usr/share/smartroom/release-carry.list"
 EVENTS_KEEP = 100
 ESP_MARGIN = 32 * 1024 * 1024
 # Durable boot files for kept releases live on the system disk (btrfs), not the ESP.
 # The ESP only holds what the next boot and its one fallback need (WS14).
-BOOT_STORE = "/var/lib/smartroomos/boot-store"
+BOOT_STORE = "/var/lib/smartroom/boot-store"
 ESP_HOLD_DEFAULT = "/var/lib/srbuild/esp-hold"
 
 # Reasons a trial ends without becoming the configured release.
@@ -118,7 +118,7 @@ REASONS = (
 
 
 KEEP_GOOD = 5  # last N good releases kept on disk (Lucas decision 3)
-# Cap on /var/lib/smartroomos/drift-archive when carried into a new root.
+# Cap on /var/lib/smartroom/drift-archive when carried into a new root.
 # Archives hold hand-change records the operator requires; drop content only with a
 # content_pruned mark (never silently). 256 MiB keeps Mini updates off ENOSPC.
 DRIFT_ARCHIVE_CARRY_MAX = 256 * 1024 * 1024
@@ -168,7 +168,7 @@ DEFAULTS = {
     "sample_seconds": 5,
     "min_displays": "",
     "reboot_hook": "",
-    "keyring": "/usr/share/smartroomos/release-keyring.gpg",
+    "keyring": "/usr/share/smartroom/release-keyring.gpg",
     "watchdog_device": "/dev/watchdog",
 }
 
@@ -660,7 +660,7 @@ class Host:
     def conf(self) -> dict:
         if self._conf is None:
             values = dict(DEFAULTS)
-            path = self.p("/etc/smartroomos/release.conf")
+            path = self.p("/etc/smartroom/release.conf")
             if path.is_file():
                 for line in path.read_text().splitlines():
                     line = line.strip()
@@ -722,7 +722,7 @@ class Host:
 
     def line(self) -> str:
         """studio (Apple Silicon / aura) or mini (Intel T2 / Limine-only)."""
-        if self.p("/etc/smartroomos/omarchy-base").is_file():
+        if self.p("/etc/smartroom/omarchy-base").is_file():
             return "studio"
         esp = self.esp()
         if (esp / CONFIGURED_BOOT).is_file() or (esp / CONFIGURED_UKI).is_file():
@@ -876,8 +876,8 @@ class Host:
         # When SMARTROOM_RELEASE_VM=1, a root-owned marker means "pretend connected"
         # so promote/fallback paths can be exercised without a server.
         if os.environ.get("SMARTROOM_RELEASE_VM") == "1":
-            for rel in ("/run/smartroomos/release-vm-healthy",
-                        "/etc/smartroomos/release-vm-healthy"):
+            for rel in ("/run/smartroom/release-vm-healthy",
+                        "/etc/smartroom/release-vm-healthy"):
                 if self.p(rel).is_file():
                     return True
         conf = self.p("/opt/smartroom/config/agent.json")
@@ -963,9 +963,9 @@ class Host:
         return text.split()[0] if text else ""
 
     def is_test_room(self) -> bool:
-        """True when /etc/smartroomos/test-room has room= equal to this hostname."""
+        """True when /etc/smartroom/test-room has room= equal to this hostname."""
         try:
-            text = self.p("/etc/smartroomos/test-room").read_text()
+            text = self.p("/etc/smartroom/test-room").read_text()
         except OSError:
             return False
         room = ""
@@ -1076,7 +1076,7 @@ class Host:
         if self.line() == "mini":
             return
         saver = self.p(EFI_VARS_SAVE)
-        alt = self.p("/usr/local/sbin/smartroomos-efi-vars-save")
+        alt = self.p("/usr/local/sbin/smartroom-efi-vars-save")
         if not self.prefix and not saver.exists() and not alt.exists():
             raise Fail("omarchy-mac-boot's efi-vars-save is not installed")
         for candidate in (saver, alt):
@@ -1140,10 +1140,10 @@ class Host:
         return check_root(path, self.root_ids)
 
     def record_integrity(self) -> None:
-        tool = self.p("/usr/local/sbin/smartroomos-integrity")
+        tool = self.p("/usr/local/sbin/smartroom-integrity")
         if not os.access(tool, os.X_OK):
             return
-        env = dict(os.environ, SMARTROOMOS_ROOT=str(self.p("/"))) if self.prefix else None
+        env = dict(os.environ, SMARTROOM_SYSROOT=str(self.p("/"))) if self.prefix else None
         subprocess.run([str(tool), "record", "--by", "smartroom-release"], check=False, env=env,
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         subprocess.run([str(tool), "check", "--manual"], check=False, env=env,
@@ -1493,13 +1493,13 @@ def carry_entries(host: Host) -> list[str]:
     path = host.p(CARRY_LIST)
     if not path.is_file():
         # pkgs tree: bin/smartroom-release → share/release-carry.list
-        # bootstrap scp: /usr/bin/smartroom-release + /usr/share/smartroomos/...
+        # bootstrap scp: /usr/bin/smartroom-release + /usr/share/smartroom/...
         # agent scp of just the binary: look beside the file too
         here = Path(__file__).resolve()
         for candidate in (
             here.parent.parent / "share" / "release-carry.list",
             here.parent / "release-carry.list",
-            Path("/usr/share/smartroomos/release-carry.list"),
+            Path("/usr/share/smartroom/release-carry.list"),
         ):
             if candidate.is_file():
                 path = candidate
@@ -1551,7 +1551,7 @@ def _clear_archive_content_keep_manifest(archive: Path) -> None:
 
 
 def prune_carried_drift_archive(
-    target_smartroomos: Path,
+    target_smartroom: Path,
     max_bytes: int = DRIFT_ARCHIVE_CARRY_MAX,
 ) -> list[dict]:
     """Enforce a total size budget on a carried drift-archive.
@@ -1560,7 +1560,7 @@ def prune_carried_drift_archive(
     is dropped: keep manifest.json and return a content_pruned record. Callers
     mark hand-changes-pending.json / status.json so nothing is silent.
     """
-    arch = target_smartroomos / "drift-archive"
+    arch = target_smartroom / "drift-archive"
     if not arch.is_dir():
         return []
     entries: list[tuple[float, Path, int]] = []
@@ -1585,12 +1585,12 @@ def prune_carried_drift_archive(
     return pruned
 
 
-def mark_content_pruned(target_smartroomos: Path, pruned: list[dict]) -> None:
+def mark_content_pruned(target_smartroom: Path, pruned: list[dict]) -> None:
     """Record content_pruned on hand-changes-pending.json and status.json."""
     if not pruned:
         return
     by_id = {p["id"]: p for p in pruned if p.get("id")}
-    pending_path = target_smartroomos / "integrity" / "hand-changes-pending.json"
+    pending_path = target_smartroom / "integrity" / "hand-changes-pending.json"
     if pending_path.is_file():
         try:
             doc = json.loads(pending_path.read_text(encoding="utf-8"))
@@ -1611,7 +1611,7 @@ def mark_content_pruned(target_smartroomos: Path, pruned: list[dict]) -> None:
                     (json.dumps(doc, indent=2, sort_keys=True) + "\n").encode(),
                     mode=pending_path.stat().st_mode & 0o7777,
                 )
-    status_path = target_smartroomos / "integrity" / "status.json"
+    status_path = target_smartroom / "integrity" / "status.json"
     if status_path.is_file():
         try:
             st = json.loads(status_path.read_text(encoding="utf-8"))
@@ -1640,6 +1640,40 @@ def mark_content_pruned(target_smartroomos: Path, pruned: list[dict]) -> None:
                 )
 
 
+def is_carried_state_dir(rel: str) -> bool:
+    """True for the room state directory, including the pre-rename path."""
+    text = str(rel).replace("\\", "/").strip("/")
+    return (
+        text == "var/lib/smartroom"
+        or text == "var/lib/smartroomos"
+        or text.endswith("/var/lib/smartroom")
+        or text.endswith("/var/lib/smartroomos")
+    )
+
+
+def migrate_legacy_names(host: "Host", mode: str, root: Optional[Path] = None) -> None:
+    """Point new path names at installed-room state (boot) or flip them (promote).
+
+    The tool ships in the new image. A root without it (an older image, or a
+    unit test that never planted it) is left alone.
+    """
+    if root is None:
+        root = host.p("/")
+    script = root / "usr/local/sbin/smartroom-legacy-paths"
+    if not script.is_file():
+        script = host.p("/usr/local/sbin/smartroom-legacy-paths")
+    if not script.is_file():
+        return
+    argv = [str(script)]
+    if str(root) not in ("/", ""):
+        argv.extend(["--root", str(root)])
+    argv.append(mode)
+    done = host.run(argv, check=False)
+    if done.returncode != 0:
+        tail = (done.stderr or done.stdout).decode(errors="replace").strip().splitlines()[-5:]
+        raise Fail(f"legacy name migration ({mode}) failed: {' | '.join(tail)}")
+
+
 def carry_into(host: Host, new_root: Path) -> list[str]:
     """Copy the room's own files from the running root into NEW_ROOT."""
     copied = []
@@ -1660,7 +1694,7 @@ def carry_into(host: Host, new_root: Path) -> list[str]:
             host.run(["cp", "-a", "--no-target-directory", str(source), str(target)])
             # Carry drift-archive (banner + content the operator requires). Cap total
             # size so nested multi-GB build leftovers cannot ENOSPC the Mini.
-            if str(rel) == "var/lib/smartroomos" or str(rel).endswith("var/lib/smartroomos"):
+            if is_carried_state_dir(str(rel)):
                 pruned = prune_carried_drift_archive(
                     target, max_bytes=DRIFT_ARCHIVE_CARRY_MAX,
                 )
@@ -1718,7 +1752,7 @@ def fix_root_files(host: Host, new_root: Path, subvol: str, release: str) -> Non
             os.replace(target, booted)
         else:
             remove(target)
-    info = new_root / "usr/share/smartroomos"
+    info = new_root / "usr/share/smartroom"
     info.mkdir(parents=True, exist_ok=True)
     write_atomic(info / "release-id", (release + "\n").encode(), mode=0o644)
     # Nested .snapshots so snapper works the first time this root is booted
@@ -1746,13 +1780,13 @@ def ensure_nested_snapshots(host: Host, root: Path) -> None:
 
 
 def import_release_pacman_key(host: Host, root: Path) -> None:
-    """pacman-key --add + --lsign-key for /usr/share/smartroomos/release-keyring.gpg.
+    """pacman-key --add + --lsign-key for /usr/share/smartroom/release-keyring.gpg.
 
     Runs after carry_into (gnupg is carried from the old room) during stage, and
     again at promote on the live root so a room staged by an older
     smartroom-release still stops asking to import the key.
     """
-    keyring = root / "usr/share/smartroomos/release-keyring.gpg"
+    keyring = root / "usr/share/smartroom/release-keyring.gpg"
     gnupg = root / "etc/pacman.d/gnupg"
     if not keyring.is_file():
         return
@@ -1760,7 +1794,7 @@ def import_release_pacman_key(host: Host, root: Path) -> None:
     fpr = "26436A50BDD17118770DE9185FDA1532DC448891"
     if host.prefix:
         # Tests: record that we would import; do not need a real keyring.
-        stamp = root / "var/lib/smartroomos/release-key-imported"
+        stamp = root / "var/lib/smartroom/release-key-imported"
         stamp.parent.mkdir(parents=True, exist_ok=True)
         stamp.write_text(fpr + "\n")
         return
@@ -1783,7 +1817,7 @@ def precompile_smartroom_python(root: Path) -> None:
     """Write __pycache__ for our shipped Python so runtime imports create no new .pyc."""
     import compileall
     targets = [
-        root / "usr/local/lib/smartroomos",
+        root / "usr/local/lib/smartroom",
         root / "usr/local/sbin",
         root / "usr/local/bin",
         root / "usr/bin",
@@ -1841,6 +1875,9 @@ def finalize_promoted_root(host: Host, release: str, subvol: str) -> None:
         if new != text:
             write_atomic(sync_conf, new.encode(), mode=sync_conf.stat().st_mode & 0o7777)
     precompile_smartroom_python(host.p("/"))
+    # Flip old state directories now, before the as-installed snapshot, so
+    # the baseline records the new paths. A missing tool is a no-op.
+    migrate_legacy_names(host, "promote")
 
 
 def exclude_as_installed_from_limine_sync(host: Host, *snap_nums: int) -> None:
@@ -1878,7 +1915,7 @@ def take_as_installed_snapshot(host: Host, release: str) -> Optional[int]:
     """
     if host.prefix:
         # Scratch tests: create a marker file the integrity tool can find.
-        marker = host.p("/var/lib/smartroomos/integrity/as-installed.json")
+        marker = host.p("/var/lib/smartroom/integrity/as-installed.json")
         marker.parent.mkdir(parents=True, exist_ok=True)
         marker.write_text(json.dumps({
             "snapshot": 1, "uuid": None, "kind": "as-installed",
@@ -1887,7 +1924,7 @@ def take_as_installed_snapshot(host: Host, release: str) -> Optional[int]:
             "note": None,
         }) + "\n")
         return 1
-    repair = host.p("/usr/local/sbin/smartroomos-snapper-repair")
+    repair = host.p("/usr/local/sbin/smartroom-snapper-repair")
     if repair.is_file():
         host.run([str(repair)], check=False)
     desc = f"release {release} as installed"
@@ -1928,7 +1965,7 @@ def take_as_installed_snapshot(host: Host, release: str) -> Optional[int]:
     if num is None:
         return None
     exclude_as_installed_from_limine_sync(host, *([pre_num] if pre_num else []), num)
-    marker = host.p("/var/lib/smartroomos/integrity/as-installed.json")
+    marker = host.p("/var/lib/smartroom/integrity/as-installed.json")
     marker.parent.mkdir(parents=True, exist_ok=True)
     path = f"/.snapshots/{num}/snapshot"
     write_atomic(marker, (json.dumps({
@@ -1946,7 +1983,7 @@ def take_as_installed_home_snapshot(host: Host, release: str) -> Optional[int]:
     the release root is replaced. Same userdata as the root as-installed.
     """
     if host.prefix:
-        marker = host.p("/var/lib/smartroomos/integrity/as-installed-home.json")
+        marker = host.p("/var/lib/smartroom/integrity/as-installed-home.json")
         marker.parent.mkdir(parents=True, exist_ok=True)
         home = host.p("/home")
         home.mkdir(parents=True, exist_ok=True)
@@ -1959,7 +1996,7 @@ def take_as_installed_home_snapshot(host: Host, release: str) -> Optional[int]:
         return 1
     if not host.p("/home").is_dir():
         return None
-    repair = host.p("/usr/local/sbin/smartroomos-snapper-repair")
+    repair = host.p("/usr/local/sbin/smartroom-snapper-repair")
     if repair.is_file():
         host.run([str(repair)], check=False)
     desc = f"release {release} as installed"
@@ -1975,7 +2012,7 @@ def take_as_installed_home_snapshot(host: Host, release: str) -> Optional[int]:
     num = _snapper_print_number(done)
     if num is None:
         return None
-    marker = host.p("/var/lib/smartroomos/integrity/as-installed-home.json")
+    marker = host.p("/var/lib/smartroom/integrity/as-installed-home.json")
     marker.parent.mkdir(parents=True, exist_ok=True)
     path = f"/home/.snapshots/{num}/snapshot"
     write_atomic(marker, (json.dumps({
@@ -1992,12 +2029,12 @@ def archive_outgoing_drift(host: Host, state: dict, new_release: str) -> None:
     """
     if host.prefix:
         # Scratch: call the integrity tool against the fake root when present.
-        tool = host.p("/usr/local/sbin/smartroomos-integrity")
+        tool = host.p("/usr/local/sbin/smartroom-integrity")
         if not tool.is_file():
             return
         old = (state.get("configured") or {}).get("release") or "unknown"
         env = os.environ.copy()
-        env["SMARTROOMOS_ROOT"] = str(host.p("/"))
+        env["SMARTROOM_SYSROOT"] = str(host.p("/"))
         # Honour the shebang (python or a test stub shell script).
         subprocess.run(
             [str(tool), "archive-outgoing",
@@ -2005,7 +2042,7 @@ def archive_outgoing_drift(host: Host, state: dict, new_release: str) -> None:
             check=False, env=env,
         )
         return
-    tool = Path("/usr/local/sbin/smartroomos-integrity")
+    tool = Path("/usr/local/sbin/smartroom-integrity")
     if not tool.is_file():
         return
     old = (state.get("configured") or {}).get("release") or "unknown"
@@ -2133,7 +2170,7 @@ _SCREEN_ROLES = frozenset({
     "presentationDisplay", "extraDisplay1", "extraDisplay2", "extraDisplay3", "extraDisplay4",
 })
 _AV_DISPLAYS = ("presentationDisplay", "back-display-left", "back-display-right")
-DISPLAY_BASELINE = "/var/lib/smartroomos/display-baseline.json"
+DISPLAY_BASELINE = "/var/lib/smartroom/display-baseline.json"
 
 
 def _slot_address(av: Any, target: str) -> str:
@@ -2403,7 +2440,7 @@ def status_doc(host: Host, state: dict) -> dict:
     return doc
 
 
-KEPT_CHECK_FILE = "/var/lib/smartroomos/release-kept-roots.json"   # a cache on the root, not on the ESP
+KEPT_CHECK_FILE = "/var/lib/smartroom/release-kept-roots.json"   # a cache on the root, not on the ESP
 KEPT_FINDINGS = 10
 
 
@@ -2617,6 +2654,10 @@ def _stage_after_offload(host: Host, state: dict, directory: Path, manifest: dic
             save_state(host, state)
             print(report.text(), file=sys.stderr)
             raise Fail(f"release {release} refused: {report.summary()}", "unsafe-root")
+        # After the root check: symlinks so a trial boot sees old state under
+        # the new names. The first hop is performed by the previous release's
+        # tool, which does not know this; the boot unit is that guarantee.
+        migrate_legacy_names(host, "boot", new_root)
     # boot files, beside the configured ones (ESP); durable copy on btrfs boot-store.
     trial_uki = layout.trial_uki
     trial_boot = layout.trial_boot
@@ -2900,18 +2941,18 @@ def _aside_ephemeral_for_build(host: Host, out: Path) -> list[tuple[Path, Path]]
     """Park drift archives and leftover local release dirs off the root briefly.
 
     build-release snapshots the live root; nested prior /root/*release* payloads
-    and /var/lib/smartroomos/drift-archive (which can hold multi-GB
+    and /var/lib/smartroom/drift-archive (which can hold multi-GB
     root.btrfs.zst copies) would otherwise inflate every later stream and
     ENOSPC Mini keep-5. Moved aside for the snapshot only, then restored.
     """
     moved: list[tuple[Path, Path]] = []
-    aside_root = host.p("/var/lib/smartroomos/build-aside")
+    aside_root = host.p("/var/lib/smartroom/build-aside")
     if aside_root.exists():
         shutil.rmtree(aside_root, ignore_errors=True)
     aside_root.mkdir(parents=True, exist_ok=True)
     out_resolved = out.resolve() if out.exists() else out
     candidates: list[Path] = []
-    arch = host.p("/var/lib/smartroomos/drift-archive")
+    arch = host.p("/var/lib/smartroom/drift-archive")
     if arch.is_dir():
         candidates.append(arch)
     for parent_name in ("/root", "/home"):
@@ -3015,7 +3056,7 @@ def cmd_build_release(host: Host, args) -> int:
                     dst.rename(src)
                 except OSError:
                     pass
-            aside_root = host.p("/var/lib/smartroomos/build-aside")
+            aside_root = host.p("/var/lib/smartroom/build-aside")
             shutil.rmtree(aside_root, ignore_errors=True)
     boot = []
     if layout.uses_aura:
@@ -3067,9 +3108,9 @@ def cmd_build_release(host: Host, args) -> int:
 #   smartroom-release stage/update    the received root, before a trial is armed
 #   smartroom-release health-run      an update trial's running root, before mark-good
 #                                     (a rollback or restore is not checked on the room)
-#   smartroomos-integrity             the running room (reason unsafe-root)
+#   smartroom-integrity             the running room (reason unsafe-root)
 #   fw builder/image/check-image(-x86_64), installer smartroom/desk-check,
-#   fw bin/smartroomos-release-sign   `smartroom-release check-root ...`
+#   fw bin/smartroom-release-sign   `smartroom-release check-root ...`
 # fw overlay/usr/bin/smartroom-release is a byte copy of this file
 # (fw test/unit/mini-release-tool.sh), so the Studio and the Mini run the same rule.
 #
@@ -4154,7 +4195,7 @@ def migrate_preflight(host: Host, force: bool = False) -> dict:
     check("limine.conf", cfg.is_file(), str(cfg))
     text = cfg.read_text() if cfg.is_file() else ""
     found = kernel_entry(text) if text else None
-    check("limine-uki-entry", found is not None, "no smartroomos_/omarchy_ UKI entry")
+    check("limine-uki-entry", found is not None, "no smartroom_/omarchy_ UKI entry")
 
     # unexpected / unknown entries: refuse when a password prompt or menu timeout is enabled
     if "timeout:" in text:

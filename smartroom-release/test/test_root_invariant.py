@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """The root invariant (smartroom-release check-root) and every place that refuses on it:
 build-release, stage, and the trial's health-run. One set of cases for every caller
-(fw check-image, installer desk-check and smartroomos-integrity run this same file)."""
+(fw check-image, installer desk-check and smartroom-integrity run this same file)."""
 import json
 import os
 import shutil
@@ -783,8 +783,8 @@ class RollbackRefusal(unittest.TestCase):
         w.host.check_root = spoiled
 
     def conf(self, w, text):
-        (w.prefix / "etc/smartroomos").mkdir(parents=True, exist_ok=True)
-        (w.prefix / "etc/smartroomos/release.conf").write_text(text)
+        (w.prefix / "etc/smartroom").mkdir(parents=True, exist_ok=True)
+        (w.prefix / "etc/smartroom/release.conf").write_text(text)
         w.host._conf = None
 
     def rolled_back_trial(self, w):

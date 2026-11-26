@@ -1,0 +1,245 @@
+#!/usr/bin/env bash
+# Point the new SmartRoom path names at state left by an older release,
+# then (promote) make the new name the real directory.
+#
+#   smartroom-legacy-paths [--root DIR] boot|promote
+#
+# boot    Trial and every boot. If the old state directory is the real one,
+#         symlink the new name at it. Add the old snapshot command and a
+#         sudoers drop-in only when that old state is present. Add new env
+#         keys beside old ones. A fresh install is a no-op.
+# promote After the trial is healthy (smartroom-release mark-good). Turn
+#         those symlinks into a real rename and leave the old name as a
+#         symlink, so a Room Controller that still calls the old path works.
+#         A second run is a no-op. The previous release's own subvolume is
+#         not this root, so a rollback still finds the old paths there.
+#
+# Does not rename the ESP directory, UKI filenames, the boot loader, the
+# APFS volume, or the boot picker. Env keys inside firstboot.env are updated
+# in place; the file stays where it is.
+set -euo pipefail
+
+usage() {
+  echo "usage: smartroom-legacy-paths [--root DIR] boot|promote" >&2
+}
+
+root=""
+mode=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --root)
+      [[ $# -ge 2 ]] || { usage; exit 2; }
+      root="${2%/}"
+      shift 2
+      ;;
+    boot|promote)
+      mode="$1"
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      usage
+      exit 2
+      ;;
+  esac
+done
+[[ -n $mode ]] || { usage; exit 2; }
+
+log() { echo "smartroom-legacy-paths: $*" >&2; }
+
+is_real_dir() { [[ -d $1 && ! -L $1 ]]; }
+
+# Old room state is still on this root (a real directory, or a symlink
+# left by a previous promote). A fresh install has neither.
+has_old_state() {
+  [[ -d $root/var/lib/smartroomos || -d $root/etc/smartroomos ]]
+}
+
+link_missing_children() {
+  local new="$1" old="$2" child base dest oldbase
+  oldbase="$(basename "$old")"
+  shopt -s nullglob
+  for child in "$old"/*; do
+    base="$(basename "$child")"
+    dest="$new/$base"
+    [[ -e $dest || -L $dest ]] && continue
+    ln -s "../${oldbase}/${base}" "$dest"
+  done
+}
+
+# Whole directory: /var/lib. The new image does not ship room state here.
+boot_dir() {
+  local new="$1" old="$2"
+  is_real_dir "$old" || return 0
+  if [[ -L $new ]]; then
+    return 0
+  fi
+  if is_real_dir "$new"; then
+    if [[ -n $(find "$new" -mindepth 1 -print -quit 2>/dev/null) ]]; then
+      link_missing_children "$new" "$old"
+      return 0
+    fi
+    rmdir "$new"
+  elif [[ -e $new ]]; then
+    return 0
+  fi
+  mkdir -p "$(dirname "$new")"
+  ln -s "$(basename "$old")" "$new"
+}
+
+flip_dir() {
+  local new="$1" old="$2" child base dest newbase
+  newbase="$(basename "$new")"
+  if is_real_dir "$new" && [[ -L $old ]]; then
+    return 0
+  fi
+  if [[ -L $new ]] && is_real_dir "$old"; then
+    rm -f "$new"
+    mv "$old" "$new"
+    ln -s "$newbase" "$old"
+    return 0
+  fi
+  if [[ ! -e $new && ! -L $new ]] && is_real_dir "$old"; then
+    mkdir -p "$(dirname "$new")"
+    mv "$old" "$new"
+    ln -s "$newbase" "$old"
+    return 0
+  fi
+  if is_real_dir "$new" && is_real_dir "$old"; then
+    shopt -s nullglob
+    for child in "$old"/*; do
+      [[ -L $child ]] && continue
+      base="$(basename "$child")"
+      dest="$new/$base"
+      if [[ -L $dest || ! -e $dest ]]; then
+        rm -f "$dest"
+        mv "$child" "$dest"
+        ln -s "../${newbase}/${base}" "$child"
+      fi
+    done
+  fi
+}
+
+# /etc/smartroom already holds the image's conf files. Never replace the
+# directory. Room files (unique-id, release.conf, test-room, tunnel) come
+# across one name at a time, and an image file of the same name stays.
+boot_etc() {
+  local new="$1" old="$2"
+  is_real_dir "$old" || return 0
+  mkdir -p "$new"
+  link_missing_children "$new" "$old"
+}
+
+promote_etc() {
+  flip_dir "$1" "$2"
+}
+
+add_env_keys() {
+  local file="$1"
+  [[ -f $file && ! -L $file ]] || return 0
+  python3 - "$file" <<'PY'
+import re, sys
+path = sys.argv[1]
+with open(path, "r", encoding="utf-8", errors="surrogateescape") as fh:
+    text = fh.read()
+lines = text.splitlines()
+have = set()
+key_re = re.compile(r"^(?:export\s+|Environment=)?([A-Za-z_][A-Za-z0-9_]*)=")
+for line in lines:
+    match = key_re.match(line.strip())
+    if match:
+        have.add(match.group(1))
+legacy = re.compile(r"^(export\s+|Environment=|)(SMARTROOMOS_[A-Za-z0-9_]+)=(.*)$")
+extra = []
+for line in lines:
+    match = legacy.match(line.strip())
+    if not match:
+        continue
+    prefix, key, val = match.group(1), match.group(2), match.group(3)
+    if key == "SMARTROOMOS_ROOT":
+        new = "SMARTROOM_SYSROOT"
+    else:
+        new = "SMARTROOM_" + key[len("SMARTROOMOS_"):]
+    if new in have:
+        continue
+    have.add(new)
+    extra.append(f"{prefix}{new}={val}")
+if not extra:
+    sys.exit(0)
+if text and not text.endswith("\n"):
+    text += "\n"
+text += "\n".join(extra) + "\n"
+with open(path, "w", encoding="utf-8", errors="surrogateescape") as fh:
+    fh.write(text)
+PY
+}
+
+rewrite_env_files() {
+  local file
+  if [[ -d $root/etc/systemd ]]; then
+    while IFS= read -r file; do
+      add_env_keys "$file"
+    done < <(find "$root/etc/systemd" -type f \( -name '*.conf' -o -name '*.env' \) 2>/dev/null || true)
+  fi
+  for file in \
+    "$root/boot/efi/smartroomos/firstboot.env" \
+    "$root/boot/smartroomos/firstboot.env" \
+    "$root/esp/smartroomos/firstboot.env"
+  do
+    add_env_keys "$file"
+  done
+}
+
+install_legacy_commands() {
+  has_old_state || return 0
+  local dir new="smartroom-snapshot" old="smartroomos-snapshot"
+  for dir in "$root/usr/local/bin" "$root/usr/local/sbin"; do
+    [[ -e $dir/$new ]] || continue
+    [[ -e $dir/$old || -L $dir/$old ]] && continue
+    ln -s "$new" "$dir/$old"
+  done
+  local dest="$root/etc/sudoers.d/smartroomcontroller-legacy" tmp
+  mkdir -p "$(dirname "$dest")"
+  tmp="$(mktemp)"
+  cat >"$tmp" <<'EOF'
+# Previous snapshot command, for a Room Controller that has not
+# self-updated yet. Created only when this root still has state from
+# before the rename. A fresh install does not get this file.
+Cmnd_Alias SR_SNAPSHOT_LEGACY = \
+    /usr/local/bin/smartroomos-snapshot ^(status|list) --json$, \
+    /usr/local/sbin/smartroomos-snapshot ^(status|list) --json$, \
+    /usr/local/bin/smartroomos-snapshot ^take --kind ops --desc .+( --protect)? --json$, \
+    /usr/local/sbin/smartroomos-snapshot ^take --kind ops --desc .+( --protect)? --json$, \
+    /usr/local/bin/smartroomos-snapshot ^(restore|boot-once) [0-9]+ --no-reboot --json$, \
+    /usr/local/sbin/smartroomos-snapshot ^(restore|boot-once) [0-9]+ --no-reboot --json$, \
+    /usr/local/bin/smartroomos-snapshot ^(protect|unprotect|delete) [0-9]+ --json$, \
+    /usr/local/sbin/smartroomos-snapshot ^(protect|unprotect|delete) [0-9]+ --json$
+
+smartroomcontroller ALL=(root) NOPASSWD: SR_SNAPSHOT_LEGACY
+EOF
+  if [[ -f $dest ]] && cmp -s "$tmp" "$dest"; then
+    rm -f "$tmp"
+    return 0
+  fi
+  chmod 0440 "$tmp"
+  mv -f "$tmp" "$dest"
+}
+
+new_state="$root/var/lib/smartroom"
+old_state="$root/var/lib/smartroomos"
+new_etc="$root/etc/smartroom"
+old_etc="$root/etc/smartroomos"
+
+if [[ $mode == boot ]]; then
+  boot_dir "$new_state" "$old_state"
+  boot_etc "$new_etc" "$old_etc"
+else
+  flip_dir "$new_state" "$old_state"
+  promote_etc "$new_etc" "$old_etc"
+fi
+rewrite_env_files
+install_legacy_commands
+log "$mode done"
