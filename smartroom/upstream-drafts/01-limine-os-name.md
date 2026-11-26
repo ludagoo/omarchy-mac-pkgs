@@ -1,4 +1,4 @@
-# Draft PR to omacom/omarchy-mac-pkgs (the operator sends it; not opened)
+# Draft PR to omacom/omarchy-mac-pkgs (The maintainer sends it; not opened)
 
 Branch: cut from omacom `main`, cherry-pick "omarchy-mac-boot: keep an image's own Limine OS name".
 
@@ -10,4 +10,3 @@ This keeps a `TARGET_OS_NAME` that `/etc/default/limine` already holds (restrict
 
 Tests: `test/apple-limine-boot-test.sh` adds "an image's own Limine OS name is kept and its entry keyed"; the full `omarchy-mac-boot/test/all` passes.
 
-Assisted-by: Claude:claude-opus-5-5

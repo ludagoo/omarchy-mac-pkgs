@@ -1,4 +1,4 @@
-# Draft PR to omacom/omarchy-mac-pkgs (the operator sends it; not opened)
+# Draft PR to omacom/omarchy-mac-pkgs (The maintainer sends it; not opened)
 
 Branch: cut from omacom `main`, cherry-pick "omarchy-mac-boot: first boot for headless images".
 
@@ -10,4 +10,3 @@ An image that ships `/etc/omarchy-mac-boot/headless` now consumes `install.conf`
 
 Tests: `test/mac-first-boot-test.sh` adds the headless hand-off and the headless failure; the full `omarchy-mac-boot/test/all` passes.
 
-Assisted-by: Claude:claude-opus-5-5

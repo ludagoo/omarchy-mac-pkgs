@@ -1,13 +1,13 @@
 # omarchy-chromium 148 with V4L2 (not shipped)
 
-The earlier room browser attempt, kept so the studio-build tree it came from
+The earlier room browser attempt, kept so the build tree it came from
 can be rebuilt. No image ever shipped it: the stable image installs Omarchy's
 `omarchy-chromium-bin`, and the edge image installs `chromium-smartroom` 158
 (`../pkgbuilds/chromium-smartroom`), which replaces it.
 
 It is ludagoo/omarchy-chromium `smartroom/v4l2` at `fec767d97b68` ("Keep
 VA-API Fourcc conversion when V4L2 is also enabled", pushed) plus what was
-left uncommitted in studio-build's `~/fw-build/omarchy-chromium` on
+left uncommitted on the aarch64 build host under `~/fw-build/omarchy-chromium` on
 2026-11-19:
 
 - `PKGBUILD.arm64.diff`: `package()` enters `$srcdir/chromium-$pkgver`.
