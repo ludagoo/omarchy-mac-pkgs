@@ -134,6 +134,11 @@ class FakeHost(sr.Host):
     def displays(self):
         return self.screens
 
+    def display_self_test(self):
+        """Never the real loopback port: a test must not power a display."""
+        self.self_tests = getattr(self, "self_tests", 0) + 1
+        return {"ok": True, "skipped": "unavailable", "displays": []}
+
     def set_oneshot(self, entry_id):
         self.oneshot = entry_id
 

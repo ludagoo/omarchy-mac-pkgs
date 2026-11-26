@@ -10,5 +10,5 @@ for need in tar zstd gpg gpgv visudo; do
   command -v "$need" >/dev/null || { echo "not ok - $need is needed" >&2; exit 1; }
 done
 cd "$here"
-python3 -B -m unittest -v test_release test_root_invariant 2>&1 | tail -n +1
+python3 -B -m unittest -v test_release test_root_invariant test_display_health 2>&1 | tail -n +1
 echo "ok - smartroom-release"
