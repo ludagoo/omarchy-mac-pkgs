@@ -68,7 +68,7 @@ It stays on the root's own filesystem; on btrfs that is the root's own subvolume
 
 Exit codes: `0` the root passes, `1` it fails (unsafe), `3` the check itself could not run (a missing path, a bad stream, a crash). `3` is never a verdict on the root. The build side (`build-release`, `desk-check`, `check-image`, `release-pack`) refuses on any non-zero exit. A room never refuses a trial on `3`: `health-run` and the Mini's `smartroomos-boot-commit` log it, show it on ops (`status --json` `release.root_check`, integrity reason `root-check-error`) and treat it as not proven unsafe, because a tool bug must never strand a room. `stage` refuses on it (reason `root-check-error`), since nothing is armed yet.
 
-The exceptions are in the code with their reasons (`ROOT_EXEMPT_TREES`): what is below `/home`, `/opt/smartroom` itself and below (the Room Controller's own directory), what is below `/tmp` and `/var/tmp`, and systemd DynamicUser ids under `/var/lib/private` and the like. `/proc`, `/sys`, `/dev`, `/run` and `.snapshots` are not walked. They were derived from the good root `2026.11.21-studio-ws14b` (86,739 paths, ok), the Mini image `2026.11.21-mini` (98,635 paths, ok) and the repaired Home Studio (87,632 paths, ok); `2026.11.24-studio-edge-b` fails with 207 problems.
+The exceptions are in the code with their reasons (`ROOT_EXEMPT_TREES`): what is below `/home`, `/opt/smartroom` itself and below (the Room Controller's own directory), what is below `/tmp` and `/var/tmp`, and systemd DynamicUser ids under `/var/lib/private` and the like. `/proc`, `/sys`, `/dev`, `/run` and `.snapshots` are not walked. They were derived from the good root `2026.11.21-studio-ws14b` (86,739 paths, ok), the Mini image `2026.11.21-mini` (98,635 paths, ok) and a repaired test Mac Studio (87,632 paths, ok); `2026.11.24-studio-edge-b` fails with 207 problems.
 
 Every place a root comes from runs it, and a root that fails is refused:
 
@@ -86,13 +86,13 @@ The firmware's `check-image`, the installer's `desk-check`, `smartroomos-integri
 
 ## Room pages as a trial condition (written, off)
 
-Waiting on the operator: should a trial also need "the room pages are up when a display is connected"? On `2026.11.24-studio-edge-c` the kiosk Chromium could not start (a missing library), and the trial still passed: health samples the Room Controller's connection, the network and the display count, and the Room Controller reported `chrome=yes` (installed, not running).
+Open: should a trial also need "the room pages are up when a display is connected"? On `2026.11.24-studio-edge-c` the kiosk Chromium could not start (a missing library), and the trial still passed: health samples the Room Controller's connection, the network and the display count, and the Room Controller reported `chrome=yes` (installed, not running).
 
-The condition is written and tested, and off: `require_room_pages=no` (default) in `/etc/smartroomos/release.conf`. A room page is a kiosk Chromium main process of the Room Controller user whose URL names a room role (`?role=presentationDisplay`). With `yes`, a sample whose room has a connected display (DRM) and no room page counts as not healthy, so a trial whose pages never start ends in `health-timeout` and rolls back (`last_result.room_pages_required`). `always` requires a page also without a DRM display: a test Studio's screens are Hyprland headless outputs, which DRM does not count, so `yes` would not have caught edge-c on the Home Studio, and `always` would have.
+The condition is written and tested, and off: `require_room_pages=no` (default) in `/etc/smartroomos/release.conf`. A room page is a kiosk Chromium main process of the Room Controller user whose URL names a room role (`?role=presentationDisplay`). With `yes`, a sample whose room has a connected display (DRM) and no room page counts as not healthy, so a trial whose pages never start ends in `health-timeout` and rolls back (`last_result.room_pages_required`). `always` requires a page also without a DRM display: a test Studio's screens are Hyprland headless outputs, which DRM does not count, so `yes` would not have caught edge-c on a test Mac Studio, and `always` would have.
 
 ## Refusing a rollback to an unsafe root (written, off)
 
-Waiting on the operator. Default `refuse_unsafe_rollback=no`: as before WS17, `rollback` and `restore` are never refused on the invariant. They arm a kept root without checking it, and their trial (kind `rollback`) checks the root at boot but does not roll back on it: the result goes in `status --json` (`release.root_check` with `ok: false`, `refused: false`, `kind`, `findings`, `note`), event `unsafe-rollback-kept` (once per trial), and the trial goes on to its health result. Integrity shows that record as information (`release_root_check`); its own check of the running root still reports `unsafe-root`. Update trials refuse an unsafe root whatever the switch says.
+Open. Default `refuse_unsafe_rollback=no`: as before WS17, `rollback` and `restore` are never refused on the invariant. They arm a kept root without checking it, and their trial (kind `rollback`) checks the root at boot but does not roll back on it: the result goes in `status --json` (`release.root_check` with `ok: false`, `refused: false`, `kind`, `findings`, `note`), event `unsafe-rollback-kept` (once per trial), and the trial goes on to its health result. Integrity shows that record as information (`release_root_check`); its own check of the running root still reports `unsafe-root`. Update trials refuse an unsafe root whatever the switch says.
 
 With `refuse_unsafe_rollback=yes` in `/etc/smartroomos/release.conf`, `rollback` and `restore` check the target first and refuse before anything is armed (`last_result` `refused`, `unsafe-root`, event `rollback-refused`), and a rollback trial whose root fails is sent back (`unsafe-root`), as an update trial is. A check that cannot run does not refuse. `check-kept` shows today which kept roots would be refused. The Mini's `smartroomos-boot-commit` does the same for a snapshot restore (`root_check_refused=no|yes` in its marker).
 
@@ -198,13 +198,13 @@ Controller reboots the room itself after `restore`.
 - A bad boot image plus a bad kernel image in the same trial is untested: the
   unconsumed Limine one-shot could send the fallback boot into the trial entry without
   the trial watchdog. Release builds check both files, so this needs two faults at once.
-- On a Studio whose startup volume is macOS (the home test Studio), a trial that dies
+- On a Studio whose startup volume is macOS (a test Mac Studio), a trial that dies
   before Linux starts resets into macOS, not into Linux. The room's own release is
   untouched; blessing SmartRoom Firmware once more returns it, and the tool then records
   the failure. A room whose startup volume is SmartRoom Firmware has not been tried on
   hardware, because the safety rules for the test Studio keep macOS as the default.
 
-## Hardware results (home Studio, test settings: 60 s quiet, 240 s limit)
+## Hardware results (a test Mac Studio, test settings: 60 s quiet, 240 s limit)
 
 - Healthy update: trial boots with `aurora,trial` set, the one-shot is consumed and the
   deletion persists, the release becomes configured, the previous set is kept.

@@ -15,11 +15,11 @@ passes Studio qualification.
 | `aura` | `ludagoo/aura` (`ave/t6021-fw`) | `aura` main plus preloaded T6021 encoder firmware hand-off to Linux; also executes `dt_reserve_dcpext_firmware()` on T6021 to reserve `dcpext0..3` ASC firmware, set `apple,firmware-compat`, and flip `m2_dcpext2`/`m2_dcpext3` to `okay`. Uses `smartroom/pkgbuilds/aura/build-qualification.json` and `validate-qualification.py`. | Upstream bootloader pin: [omacom/omarchy-pkgs#3025](https://github.com/omacom/omarchy-pkgs/pull/3025); `aurora-silicon/aura` encoder hand-off when upstreamed. |
 | `mesa-aurora` (`vulkan-aurora`) | `omacom/mesa` (`carry/edgeB-7.3`) | Unchanged copy of the `omacom/omarchy-pkgs#3025` (`edgeB2`) recipe at `23791c134af`. The 7.3 kernel names the GPU DRM driver `"aurora"`, whereas the older published edge Mesa opened only `"asahi"` and broke EGL/Hyprland. | Channel pin: [omacom/omarchy-pkgs#3025](https://github.com/omacom/omarchy-pkgs/pull/3025); M3 carries noted in `smartroom/pkgbuilds/mesa-aurora/PKGBUILD` (`aurora-silicon/mesa` PRs `#415`, `#416`). Drop when Omarchy's edge channel ships this Mesa or newer. |
 | `omarchy-mac-boot`, `smartroom-omarchy-helpers`, `smartroom-boot-os` | `ludagoo/omarchy-mac-pkgs` (`smartroom/edge`) | Headless boot flow (`TARGET_OS_NAME` preserved across first boot, no owner provisioning/TTY1 hang), extracted unchanged runtime helpers without desktop `omarchy`, and `aurora-bless` wrapper. | See `CARRY.md` table (`smartroom/upstream-drafts/`). |
-| `chromium-smartroom` | Built from `/var/lib/srbuild/room-158` on Studio | Arch Linux ARM Chromium 158 with direct V4L2 hardware decode and encode (`omarchy-chromium-bin` replacement). Pinned by SHA-256 in `omarchy-mac-installer` (`smartroom/room/prebuilt.sha256`). | Maintained separately until upstream Chromium/Omarchy builds include V4L2 encode/decode parity. |
+| `chromium-smartroom` | Built on the aarch64 build host | Arch Linux ARM Chromium 158 with direct V4L2 hardware decode and encode (`omarchy-chromium-bin` replacement). Pinned by SHA-256 in `omarchy-mac-installer` (`smartroom/room/prebuilt.sha256`). | Maintained separately until upstream Chromium/Omarchy builds include V4L2 encode/decode parity. |
 
 ## 2. Reproducible builds
 
-All aarch64 package builds run on `studio-build` (never on the Intel Mini), with
+All aarch64 package builds run on a native aarch64 build host (never on an Intel Mini), with
 15 GiB RAM (`OMARCHY_BUILD_JOBS=3` for `linux-aurora` and `aura`).
 
 1. **Kernel (`linux-aurora`, `linux-aurora-headers`)**:
