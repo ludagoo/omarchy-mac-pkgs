@@ -1,0 +1,8 @@
+# kind, pattern, reason. A hit is allowed when the path or the line matches.
+path	(^|/)ai_attribution_lint\.py$	the scanner names the patterns it looks for
+path	(^|/)ai-attribution-allow\.txt$	this list
+path	^smartroom/pkgbuilds/chromium-smartroom/sr-00[0-9][0-9]-[^/]*\.patch$	pinned recipe: the shipped package's PKGBUILD hashes these patches, so their Assisted-by lines go at the next Chromium rebuild (Lucas decides)
+root	smartroom	our package and room tree; upstream Omarchy stays out of this lint
+root	smartroom-boot-os	our boot tool
+root	smartroom-release	our release tool
+root	CARRY.md	our carry notes
