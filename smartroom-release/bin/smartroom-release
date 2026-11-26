@@ -1700,7 +1700,29 @@ def carry_into(host: Host, new_root: Path) -> list[str]:
                 )
                 mark_content_pruned(target, pruned)
             copied.append("/" + str(rel))
+    copied.extend(_declared_extras_copied(host, new_root))
     return copied
+
+
+def _declared_extras_copied(host: Host, new_root: Path) -> list[str]:
+    """Copy a test unit's declared extras into the new root.
+
+    A room, or a test unit with no enabled profile, copies nothing here.
+    The role and the enabled names come from the running root. A failure
+    fails the update: dropping an extra on the floor would look like drift
+    after the reboot.
+    """
+    try:
+        lib = Path(__file__).resolve().parent.parent / "local" / "lib" / "smartroom"
+        if lib.is_dir() and str(lib) not in sys.path:
+            sys.path.insert(0, str(lib))
+        import integrity_drift
+    except ImportError:
+        return []
+    try:
+        return integrity_drift.carry_declared_extras(str(host.p("/")), str(new_root))
+    except OSError as exc:
+        raise Fail(f"declared extras were not carried: {exc}") from exc
 
 
 def fix_root_files(host: Host, new_root: Path, subvol: str, release: str) -> None:
