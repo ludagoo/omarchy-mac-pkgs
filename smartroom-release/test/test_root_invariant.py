@@ -729,62 +729,8 @@ class JournalBeforeReboot(unittest.TestCase):
 
 
 class RoomPages(unittest.TestCase):
-    """Waiting on the operator: "room pages up when a display is connected" as a trial health
-    condition. Written and tested, off by default (require_room_pages=no)."""
-
-    def trial(self, world, conf=None):
-        if conf:
-            (world.prefix / "etc/smartroomos").mkdir(parents=True, exist_ok=True)
-            (world.prefix / "etc/smartroomos/release.conf").write_text(conf)
-            world.host._conf = None
-        code, _, err = world.run("update", str(world.release()), "--unsigned")
-        self.assertEqual(code, 0, err)
-        world.trial_boot()
-
-    def test_off_by_default_a_trial_without_room_pages_is_still_kept(self):
-        w = World(self)
-        w.host.room_pages_up = lambda: 0
-        self.trial(w)
-        self.assertEqual(sr.DEFAULTS["require_room_pages"], "no")
-        code, _, _ = w.run("health-run")
-        self.assertEqual(code, 0)
-        self.assertEqual(w.state()["configured"]["release"], "2026.11.21-1")
-
-    def test_on_a_trial_whose_room_pages_never_start_rolls_back(self):
-        w = World(self)
-        w.host.room_pages_up = lambda: 0
-        self.trial(w, "require_room_pages=yes\n")
-        code, _, _ = w.run("health-run")
-        self.assertEqual(code, 1)
-        st = w.state()
-        self.assertEqual(st["configured"]["release"], sr.INSTALLED)
-        self.assertEqual(st["last_result"]["reason"], "health-timeout")
-        self.assertFalse(st["last_result"]["displays_ok"])
-        self.assertEqual(st["last_result"]["room_pages_required"], "display")
-
-    def test_always_requires_pages_also_without_a_drm_display(self):
-        w = World(self)
-        w.host.screens = 0                  # a test Studio: Hyprland headless outputs only
-        w.host.room_pages_up = lambda: 0
-        self.trial(w, "require_room_pages=always\n")
-        code, _, _ = w.run("health-run")
-        self.assertEqual(code, 1)
-        self.assertEqual(w.state()["last_result"]["room_pages_required"], "always")
-
-    def test_on_with_room_pages_up_the_trial_is_kept(self):
-        w = World(self)
-        w.host.room_pages_up = lambda: 1
-        self.trial(w, "require_room_pages=yes\n")
-        code, _, _ = w.run("health-run")
-        self.assertEqual(code, 0)
-
-    def test_on_without_a_display_no_page_is_required(self):
-        w = World(self)
-        w.host.screens = 0
-        w.host.room_pages_up = lambda: 0
-        self.trial(w, "require_room_pages=yes\n")
-        code, _, _ = w.run("health-run")
-        self.assertEqual(code, 0)
+    """A room page is a kiosk Chromium main of the Room Controller user whose URL names a role.
+    Whether a trial requires one is display health (test_display_health.py), not a switch."""
 
     def test_room_pages_are_kiosk_browser_mains_with_a_room_url(self):
         tmp = Path(tempfile.mkdtemp(prefix="srel-pages-"))
@@ -820,10 +766,8 @@ class RoomPages(unittest.TestCase):
 
 
 class RollbackRefusal(unittest.TestCase):
-    """Waiting on the operator: refuse a rollback/restore to a root that fails the invariant.
-    Written and tested behind refuse_unsafe_rollback. Off (the default), a rollback is
-    never refused on it, before arming or in its trial (as before WS17); the check is
-    recorded for ops. Update trials refuse an unsafe root whatever the switch says."""
+    """A rollback or restore is not checked for ownership on the room. Update trials
+    still refuse an unsafe root. Build and signing keep their own check."""
 
     two_releases = RefusalKeepsTheFallback.two_releases
 
@@ -852,45 +796,35 @@ class RollbackRefusal(unittest.TestCase):
         w.host.__dict__.pop("check_root", None)        # spoil_previous's wrapper resets owners
         w.host.owners = {"etc": (1000, 1000)}
 
-    def test_off_by_default_the_rollback_is_armed_and_its_trial_is_not_refused(self):
+    def test_a_rollback_of_an_unsafe_root_is_armed_and_not_refused(self):
         w = self.two_releases()
+        self.conf(w, 'refuse_unsafe_rollback = "yes"\n')
         self.spoil_previous(w)
-        self.assertEqual(sr.DEFAULTS["refuse_unsafe_rollback"], "no")
-        self.rolled_back_trial(w)
+        calls = []
+        real = w.host.check_root
+
+        def wrapped(path):
+            calls.append(Path(path).name)
+            return real(path)
+
+        w.host.check_root = wrapped
+        code, _, err = w.run("rollback")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(calls, [])
+        w.trial_boot("2026.11.21-1")
+        w.host.owners = {"etc": (1000, 1000)}
         code, _, err = w.run("health-run")
         self.assertEqual(code, 0, err)
-        self.assertEqual((w.host.reboots, w.host.hard), (0, 0))              # not sent back
+        self.assertEqual((w.host.reboots, w.host.hard), (0, 0))
         st = w.state()
         self.assertIsNone(st["trial"])
-        self.assertEqual(st["configured"]["release"], "2026.11.21-1")       # promoted on health, as before WS17
+        self.assertEqual(st["configured"]["release"], "2026.11.21-1")
         self.assertNotEqual(st["last_result"].get("reason"), "unsafe-root")
-        self.assertIn("not refused (refuse_unsafe_rollback=no)", err)
-        # recorded for ops: status --json release.root_check, and one event for both checks
-        code, out, _ = w.run("status", "--json")
-        check = json.loads(out)["release"]["root_check"]
-        self.assertEqual((check["ok"], check["refused"], check["kind"]), (False, False, "rollback"))
-        self.assertEqual(check["findings"][0]["path"], "/etc")
-        self.assertIn("refuse_unsafe_rollback=no", check["note"])
-        kept = [e for e in st["events"] if e["event"] == "unsafe-rollback-kept"]
-        self.assertEqual(len(kept), 1)
-        self.assertEqual(kept[0]["release"], "2026.11.21-1")
+        self.assertNotIn("not refused", err)
+        self.assertFalse(any(e.get("event") == "unsafe-rollback-kept" for e in st["events"]))
 
-    def test_on_a_rollback_trial_whose_root_fails_the_check_is_sent_back(self):
-        w = self.two_releases()
-        self.conf(w, "refuse_unsafe_rollback=yes\n")
-        self.rolled_back_trial(w)                       # good when armed, spoiled when it boots
-        code, _, _ = w.run("health-run")
-        self.assertEqual(code, 1)
-        self.assertEqual(w.host.reboots, 1)
-        st = w.state()
-        self.assertIsNone(st["trial"])
-        self.assertEqual(st["configured"]["release"], "2026.11.22-1")
-        self.assertEqual((st["last_result"]["result"], st["last_result"]["reason"]), ("rolled-back", "unsafe-root"))
-        self.assertEqual((st["root_check"]["refused"], st["root_check"]["kind"]), (True, "rollback"))
-
-    def test_off_an_update_trial_still_refuses_an_unsafe_root(self):
+    def test_an_update_trial_still_refuses_an_unsafe_root(self):
         w = World(self)
-        self.assertEqual(sr.DEFAULTS["refuse_unsafe_rollback"], "no")
         code, _, err = w.run("update", str(w.release()), "--unsigned")
         self.assertEqual(code, 0, err)
         w.trial_boot()
@@ -901,19 +835,6 @@ class RollbackRefusal(unittest.TestCase):
         self.assertEqual((st["last_result"]["result"], st["last_result"]["reason"]), ("rolled-back", "unsafe-root"))
         self.assertEqual((st["root_check"]["refused"], st["root_check"]["kind"]), (True, "update"))
 
-    def test_on_a_rollback_to_an_unsafe_root_is_refused_before_arming(self):
-        w = self.two_releases()
-        self.conf(w, "refuse_unsafe_rollback=yes\n")
-        self.spoil_previous(w)
-        code, _, err = w.run("rollback")
-        self.assertEqual(code, 1)
-        self.assertIn("not armed", err)
-        st = w.state()
-        self.assertIsNone(st.get("trial"))
-        self.assertEqual((st["last_result"]["result"], st["last_result"]["reason"]), ("refused", "unsafe-root"))
-        self.assertFalse((w.esp / sr.LAYOUT_STUDIO.trial_uki).exists())
-        self.assertEqual((w.esp / sr.LAYOUT_STUDIO.previous_uki).read_bytes(), b"uki-2026.11.21-1")
-
     def test_a_failed_rollback_keeps_the_previous_boot_files_on_the_esp(self):
         w = self.two_releases()
         prev_uki = w.esp / sr.LAYOUT_STUDIO.previous_uki
@@ -923,18 +844,14 @@ class RollbackRefusal(unittest.TestCase):
         self.assertIn("ESP", err)
         self.assertEqual(prev_uki.read_bytes(), b"uki-2026.11.21-1")
 
-    def test_on_a_good_root_and_a_check_error_still_roll_back(self):
+    def test_a_check_error_is_not_consulted_on_rollback(self):
         w = self.two_releases()
-        self.conf(w, "refuse_unsafe_rollback=yes\n")
-        code, _, err = w.run("rollback")
-        self.assertEqual(code, 0, err)
-        w2 = self.two_releases()
-        self.conf(w2, "refuse_unsafe_rollback=yes\n")
 
         def boom(_path):
             raise RuntimeError("a bug")
-        w2.host.check_root = boom
-        code, _, err = w2.run("rollback")
+
+        w.host.check_root = boom
+        code, _, err = w.run("rollback")
         self.assertEqual(code, 0, err)
 
 

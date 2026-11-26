@@ -68,6 +68,8 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Any, Iterable, NamedTuple, Optional
 
@@ -111,6 +113,7 @@ REASONS = (
     "trial-incomplete",      # the trial boot image ran but Limine booted the configured entry
     "promote-failed",        # mark-good could not finish; room left on a bootable release
     "unsafe-root",           # the trial root fails the root invariant (check-root): never kept
+    "display-self-test",    # a configured display is newly broken (was fine in the baseline)
 )
 
 
@@ -165,15 +168,6 @@ DEFAULTS = {
     "sample_seconds": 5,
     "min_displays": "",
     "reboot_hook": "",
-    # Waiting on the operator (2026-11-24): "the room pages are up when a display is
-    # connected" as a trial health condition. Off until he decides. `yes`: when a
-    # display is connected; `always`: also without one (a test Studio's screens are
-    # Hyprland headless outputs, which DRM does not count).
-    "require_room_pages": "no",
-    # Waiting on the operator (2026-11-24): `yes` refuses a rollback or restore whose root fails the
-    # invariant, before arming and in its trial. Off (default, as before WS17): never refused;
-    # the trial records the check (release.root_check refused false). See unsafe_trial.
-    "refuse_unsafe_rollback": "no",
     "keyring": "/usr/share/smartroomos/release-keyring.gpg",
     "watchdog_device": "/dev/watchdog",
 }
@@ -959,6 +953,105 @@ class Host:
             except OSError:
                 pass
         return count
+
+    def hostname(self) -> str:
+        try:
+            text = self.p("/etc/hostname").read_text()
+        except OSError:
+            return ""
+        text = text.strip()
+        return text.split()[0] if text else ""
+
+    def is_test_room(self) -> bool:
+        """True when /etc/smartroomos/test-room has room= equal to this hostname."""
+        try:
+            text = self.p("/etc/smartroomos/test-room").read_text()
+        except OSError:
+            return False
+        room = ""
+        for line in text.splitlines():
+            line = line.strip()
+            if line.startswith("room="):
+                room = line.split("=", 1)[1].strip().strip('"')
+                break
+        host = self.hostname()
+        return bool(room) and bool(host) and room == host
+
+    def room_id(self) -> str:
+        try:
+            doc = json.loads(self.p("/opt/smartroom/config/agent.json").read_text())
+        except (OSError, ValueError):
+            return ""
+        if not isinstance(doc, dict):
+            return ""
+        return str(doc.get("roomId") or doc.get("room_id") or "").strip()
+
+    def local_control_port(self) -> int:
+        try:
+            doc = json.loads(self.p("/opt/smartroom/config/agent.json").read_text())
+        except (OSError, ValueError):
+            return 8790
+        if not isinstance(doc, dict):
+            return 8790
+        try:
+            port = int(doc.get("localControlPort") or 8790)
+        except (TypeError, ValueError):
+            return 8790
+        if not 1 <= port <= 65535:
+            return 8790
+        return port
+
+    def cache_screen_case(self) -> Optional[str]:
+        """configured or no-display-settings from the room cache, or None if it is not on this root."""
+        path = self.p("/opt/smartroom/data/room-cache.json")
+        if not path.is_file():
+            return None
+        try:
+            doc = json.loads(path.read_text())
+        except (OSError, ValueError):
+            return None
+        if not isinstance(doc, dict):
+            return "no-display-settings"
+        state = doc.get("state") if isinstance(doc.get("state"), dict) else {}
+        av = state.get("avControls") if isinstance(state, dict) else None
+        if _has_display_settings(doc.get("displays"), av):
+            return "configured"
+        return "no-display-settings"
+
+    def screen_case(self, prior: Optional[dict] = None) -> str:
+        """not-adopted, no-display-settings, or configured.
+
+        A trial root may not carry the room cache. The baseline taken on the
+        previous root says whether this room had display settings.
+        """
+        if not self.room_id():
+            return "not-adopted"
+        cached = self.cache_screen_case()
+        if cached:
+            return cached
+        prev = ""
+        if isinstance(prior, dict):
+            prev = str(prior.get("screenCase") or "")
+        if prev in ("configured", "no-display-settings", "not-adopted"):
+            return prev
+        return "no-display-settings"
+
+    def display_self_test(self) -> dict:
+        """POST the Room Controller on this box. An old controller (no route) is unavailable, not a failure."""
+        port = self.local_control_port()
+        url = f"http://127.0.0.1:{port}/local/display-self-test"
+        try:
+            req = urllib.request.Request(
+                url, data=b"{}", method="POST",
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                doc = json.loads(resp.read().decode())
+        except (OSError, urllib.error.URLError, ValueError, TimeoutError):
+            return {"ok": True, "skipped": "unavailable", "displays": []}
+        if not isinstance(doc, dict) or "ok" not in doc:
+            return {"ok": True, "skipped": "unavailable", "displays": []}
+        return doc
 
     # EFI variables ----------------------------------------------------------------
     def efivar(self, name: str) -> Path:
@@ -2036,29 +2129,147 @@ def space_check(host: Host, manifest: dict, esp: Path, state: Optional[dict] = N
     return budget
 
 
-def room_pages_required(host: Host) -> str:
-    """"" (off), "display" (when a display is connected) or "always"."""
-    value = str(host.conf.get("require_room_pages", "no")).lower()
-    return {"yes": "display", "1": "display", "true": "display", "always": "always"}.get(value, "")
+_SCREEN_ROLES = frozenset({
+    "presentationDisplay", "extraDisplay1", "extraDisplay2", "extraDisplay3", "extraDisplay4",
+})
+_AV_DISPLAYS = ("presentationDisplay", "back-display-left", "back-display-right")
+DISPLAY_BASELINE = "/var/lib/smartroomos/display-baseline.json"
 
 
-def health_now(host: Host) -> dict:
+def _slot_address(av: Any, target: str) -> str:
+    if not isinstance(av, dict):
+        return ""
+    slot = av.get(target)
+    if isinstance(slot, str) and slot.strip():
+        return slot.strip()
+    if not isinstance(slot, dict):
+        return ""
+    for key in ("address", "url", "ip"):
+        value = slot.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _has_display_settings(displays: Any, av: Any) -> bool:
+    if isinstance(displays, list):
+        for row in displays:
+            if isinstance(row, dict) and (row.get("endpointRole") or row.get("endpoint_role")) in _SCREEN_ROLES:
+                return True
+    for target in _AV_DISPLAYS:
+        if _slot_address(av, target):
+            return True
+    return False
+
+
+def pages_required_now(host: Host, baseline: Optional[dict] = None) -> str:
+    """'' when pages are not required, else 'display' or 'always'.
+
+    Standard behaviour, no switch. A real room requires a room page when a
+    display is connected. A test unit requires one even with no DRM connector
+    (its screens are headless outputs). A box that is not adopted, or adopted
+    with no saved display settings, does not require pages.
+    """
+    if host.screen_case(baseline) != "configured":
+        return ""
+    if host.is_test_room():
+        return "always"
+    if host.displays() > 0:
+        return "display"
+    return ""
+
+
+def health_now(host: Host, baseline: Optional[dict] = None) -> dict:
     now = {"connected": host.agent_connected(), "network": host.network_up(), "displays": host.displays()}
-    need = room_pages_required(host)
-    if need == "always" or (need == "display" and now["displays"] > 0):
+    need = pages_required_now(host, baseline)
+    if need:
         now["pages"] = host.room_pages_up()
     return now
 
 
 def healthy_sample(host: Host, baseline: dict) -> tuple[int, int, int]:
     """(Room Controller connected, network up, screens ok). Screens ok: no fewer
-    displays than before the update and, only when require_room_pages=yes and a
-    display is connected, at least one room page running."""
-    now = health_now(host)
+    displays than before the update and, when this room's pages are required,
+    at least one room page running."""
+    now = health_now(host, baseline)
     want = host.conf["min_displays"]
-    need = int(want) if str(want) != "" else int(baseline.get("displays", 0))
+    need = int(want) if str(want) != "" else int((baseline or {}).get("displays", 0))
     screens = now["displays"] >= need and now.get("pages", 1) > 0
     return (1 if now["connected"] else 0, 1 if now["network"] else 0, 1 if screens else 0)
+
+
+def take_display_baseline(host: Host) -> dict:
+    """The picture of the displays just before an update or rollback.
+
+    Written on the running root so carry puts it on the trial root, and stored
+    on the trial record (a rollback may boot a root that does not have the file).
+    Not configured: no request to the Room Controller, so nothing is powered on.
+    """
+    case = host.screen_case()
+    doc: dict = {"screenCase": case, "at": host.stamp()}
+    if case != "configured":
+        doc["selfTest"] = {"ok": True, "skipped": case, "displays": []}
+    else:
+        doc["selfTest"] = host.display_self_test()
+    path = host.p(DISPLAY_BASELINE)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(json.dumps(doc, sort_keys=True) + "\n")
+        os.replace(tmp, path)
+    except OSError as exc:
+        print(f"smartroom-release: display baseline not written ({exc})", file=sys.stderr)
+    return doc
+
+
+def load_display_baseline(host: Host, trial: Optional[dict]) -> dict:
+    """The trial record wins. The file is the copy carried onto the new root."""
+    base = {}
+    if isinstance(trial, dict) and isinstance(trial.get("baseline"), dict):
+        base = dict(trial["baseline"])
+    if base.get("screenCase") or isinstance(base.get("displaySelfTest"), dict):
+        return base
+    path = host.p(DISPLAY_BASELINE)
+    try:
+        doc = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return base
+    if not isinstance(doc, dict):
+        return base
+    base.setdefault("screenCase", doc.get("screenCase"))
+    if isinstance(doc.get("selfTest"), dict):
+        base.setdefault("displaySelfTest", doc["selfTest"])
+    return base
+
+
+def newly_broken(baseline: Optional[dict], now: Any) -> list:
+    """Displays that fail now and did not already fail in the baseline.
+
+    A skipped result (not adopted, no settings, old Room Controller) is not a
+    failure. A skipped baseline does not excuse a real failure: there is no
+    proof the display was already broken.
+    """
+    if not isinstance(now, dict):
+        return [{"id": "*"}]
+    if now.get("skipped"):
+        return []
+    prev_bad = set()
+    prev = (baseline or {}).get("displaySelfTest") if isinstance(baseline, dict) else None
+    if isinstance(prev, dict) and not prev.get("skipped"):
+        for row in prev.get("displays") or []:
+            if isinstance(row, dict) and row.get("ok") is False and row.get("id"):
+                prev_bad.add(row["id"])
+    broken = []
+    rows = now.get("displays") or []
+    if now.get("ok") is False and not rows:
+        return [{"id": "*"}]
+    for row in rows:
+        if not isinstance(row, dict) or row.get("ok") is not False:
+            continue
+        if row.get("id") in prev_bad:
+            continue
+        broken.append(row)
+    return broken
 
 
 # --------------------------------------------------------------------------
@@ -2339,6 +2550,9 @@ def stage_release(host: Host, state: dict, directory: Path, unsigned: bool, kind
             raise Fail("this room is not healthy now (Room Controller or network down); "
                        "an update would look like a failed one. Fix that first.", "unhealthy")
     baseline = {"displays": host.displays()}
+    taken = take_display_baseline(host)
+    baseline["screenCase"] = taken.get("screenCase")
+    baseline["displaySelfTest"] = taken.get("selfTest")
     check_files(directory, manifest)
     roles = {item["role"]: item for item in manifest["boot"]}
     # WS14: move legacy ESP UKI store + previous fallback off the ESP before budgeting.
@@ -2476,8 +2690,6 @@ def _rollback_trial_after_offload(host: Host, state: dict, prev: dict, layout: B
     with host.top() as top:
         if prev["root"] and not subvol_exists(top, prev["root"]):
             raise Fail(f"the previous root {prev['root']} is gone", "not-found")
-        if prev["root"] and refuse_unsafe_rollback(host):
-            refuse_unsafe_target(host, state, prev, top / prev["root"])
     # Budget: trial files + promote previous reserve (same as an update).
     uki_sz = file_size(uki_src)
     boot_sz = file_size(boot_src) if boot_src else 0
@@ -2501,10 +2713,16 @@ def _rollback_trial_after_offload(host: Host, state: dict, prev: dict, layout: B
     require_zero_touch(cmdline)
     state["counter"] = state.get("counter", 0) + 1
     state["esp_budget"] = budget
+    taken = take_display_baseline(host)
     state["trial"] = {
         "kind": "rollback", "release": prev["release"], "number": prev.get("number", 0), "root": prev["root"],
         "boot": layout.trial_boot, "uki": layout.trial_uki, "cmdline": cmdline,
-        "phase": "staged", "staged_at": host.stamp(), "baseline": {"displays": host.displays()},
+        "phase": "staged", "staged_at": host.stamp(),
+        "baseline": {
+            "displays": host.displays(),
+            **{k: taken[k] for k in ("screenCase",) if k in taken},
+            "displaySelfTest": taken.get("selfTest"),
+        },
         "signed": None, "carried": 0, "reached": False, "line": layout.line,
     }
     write_atomic(esp / "limine.conf",
@@ -2513,30 +2731,6 @@ def _rollback_trial_after_offload(host: Host, state: dict, prev: dict, layout: B
     event(host, state, "started", release=prev["release"], previous=state["configured"].get("release"), kind="rollback")
     save_state(host, state)
     return state
-
-
-def refuse_unsafe_rollback(host: Host) -> bool:
-    """The switch (release.conf refuse_unsafe_rollback, default no; waiting on Lucas)."""
-    return str(host.conf.get("refuse_unsafe_rollback", "no")).strip().lower() in ("yes", "1", "true")
-
-
-def refuse_unsafe_target(host: Host, state: dict, entry: dict, root: Path) -> None:
-    """refuse_unsafe_rollback=yes: a kept root that fails the invariant is never armed.
-    A check that cannot run does not refuse (as on a trial)."""
-    try:
-        report = host.check_root(root)
-    except Exception as exc:   # noqa: BLE001
-        message = exc.message if isinstance(exc, Fail) else f"{type(exc).__name__}: {exc}"
-        event(host, state, "root-check-error", release=entry.get("release"), message=message[:300])
-        save_state(host, state)
-        return
-    if report.ok:
-        return
-    record_result(host, state, "refused", reason="unsafe-root", release=entry.get("release"),
-                  message=report.summary(), findings=report.findings[:20])
-    event(host, state, "rollback-refused", reason="unsafe-root", release=entry.get("release"), count=report.count)
-    save_state(host, state)
-    raise Fail(f"release {entry.get('release')} not armed: {report.summary()}", "unsafe-root")
 
 
 def arm_trial(host: Host, state: dict) -> dict:
@@ -2871,7 +3065,8 @@ def cmd_build_release(host: Host, args) -> int:
 # This is the only implementation. Every caller runs this code:
 #   smartroom-release build-release   the root it is about to send and sign
 #   smartroom-release stage/update    the received root, before a trial is armed
-#   smartroom-release health-run      the running trial root, before mark-good
+#   smartroom-release health-run      an update trial's running root, before mark-good
+#                                     (a rollback or restore is not checked on the room)
 #   smartroomos-integrity             the running room (reason unsafe-root)
 #   fw builder/image/check-image(-x86_64), installer smartroom/desk-check,
 #   fw bin/smartroomos-release-sign   `smartroom-release check-root ...`
@@ -3741,17 +3936,15 @@ def healthy_window(samples: list[tuple[float, tuple[int, int, int]]], start: flo
 
 
 def unsafe_trial(host: Host, state: dict) -> bool:
-    """The root invariant on the running trial root. An update trial that fails it is
-    never kept: record why (ops shows last_result), reboot, the configured release boots.
-    A rollback or restore trial (kind rollback) is refused on it only when
-    refuse_unsafe_rollback is on. Off (the default), it goes on as before WS17: the
-    result is recorded (status --json release.root_check with refused false, event
-    unsafe-rollback-kept) and integrity shows the running root's own check on ops.
-    A check that cannot run (a tool bug, an error) is not proof of an unsafe root:
-    it is logged and shown on ops (status --json rootCheck), and the trial goes on
-    as if the check had not run. A tool bug must never strand a room."""
+    """The root invariant on a running update trial. A failure is never kept.
+    A rollback or restore (kind rollback) is not checked on the room: a root
+    that fails the invariant is refused at build and at signing. A check that
+    cannot run is not proof of an unsafe root: it is logged and the trial goes
+    on. A tool bug must never strand a room."""
     trial = state.get("trial") or {}
     kind = trial.get("kind", "update")
+    if kind == "rollback":
+        return False
     try:
         report = host.check_root(host.p("/"))
     except Exception as exc:   # noqa: BLE001
@@ -3765,18 +3958,6 @@ def unsafe_trial(host: Host, state: dict) -> bool:
     state["root_check"] = {"ok": report.ok, "count": report.count, "checked": report.checked,
                            "at": host.stamp(), "release": trial.get("release"), "kind": kind}
     if report.ok:
-        save_state(host, state)
-        return False
-    if kind == "rollback" and not refuse_unsafe_rollback(host):
-        state["root_check"].update(refused=False, message=report.summary(), findings=report.findings[:20],
-                                   note="a rollback or restore is not refused on the root check "
-                                        "(refuse_unsafe_rollback=no)")
-        if not any(e.get("event") == "unsafe-rollback-kept" and e.get("trial") == trial.get("armed_at")
-                   for e in state.get("events") or []):
-            event(host, state, "unsafe-rollback-kept", release=trial.get("release"), trial=trial.get("armed_at"),
-                  count=report.count, message=report.summary()[:300])
-        print(f"smartroom-release: the rollback root fails the root check ({report.summary()}); "
-              "not refused (refuse_unsafe_rollback=no)", file=sys.stderr)
         save_state(host, state)
         return False
     state["root_check"]["refused"] = True
@@ -3824,6 +4005,21 @@ def run_health(host: Host, state: dict) -> int:
         if healthy_window(samples, 0, elapsed, quiet, limit):
             if unsafe_trial(host, state):           # again: the room ran five minutes on it
                 return 1
+            base = load_display_baseline(host, trial)
+            if host.screen_case(base) == "configured":
+                # Once, not every sample: powering the projector on each sample
+                # would cycle the room for the whole window.
+                now_pic = host.display_self_test()
+                broken = newly_broken(base, now_pic)
+                if broken:
+                    finish_failed_trial(
+                        host, state, "display-self-test",
+                        newlyBroken=[str(row.get("id")) for row in broken],
+                    )
+                    host.reboot()
+                    host.sleep(120)
+                    host.hard_reboot()
+                    return 1
             event(host, state, "health-passed", release=trial["release"], seconds=int(elapsed))
             save_state(host, state)
             try:
@@ -3841,9 +4037,11 @@ def run_health(host: Host, state: dict) -> int:
     # The deadline passed. Stop feeding, record why, and reboot. aura's trial marker is
     # already spent, so the next boot is the configured release.
     last = samples[-1][1] if samples else (0, 0, 0)
+    base = load_display_baseline(host, trial)
+    pages = pages_required_now(host, base)
     finish_failed_trial(host, state, "health-timeout",
                         connected=bool(last[0]), network=bool(last[1]), displays_ok=bool(last[2]),
-                        **({"room_pages_required": room_pages_required(host)} if room_pages_required(host) else {}))
+                        **({"room_pages_required": pages} if pages else {}))
     host.reboot()
     host.sleep(120)
     host.hard_reboot()

@@ -74,7 +74,7 @@ Every place a root comes from runs it, and a root that fails is refused:
 
 - `build-release`: before it sends or signs (reason code `unsafe-root`);
 - `stage`/`update`: on the received root, before anything is armed (`last_result` `refused`, `unsafe-root`);
-- `health-run`: on the running trial, at the start and again before mark-good. An update trial that fails is rolled back at once (no wait): reason `unsafe-root`, with the first paths in `last_result.findings`, for ops. The journal is flushed to disk before the rollback reboot, so the failed boot's log survives. A rollback or restore trial is refused on it only with `refuse_unsafe_rollback=yes` (below).
+- `health-run`: on a running update trial, at the start and again before mark-good. An update trial that fails is rolled back at once (no wait): reason `unsafe-root`, with the first paths in `last_result.findings`, for ops. The journal is flushed to disk before the rollback reboot, so the failed boot's log survives. A rollback or restore trial is not checked on the room. Build and signing still refuse an unsafe root.
 
 Any refusal of `stage`/`update` after it has moved the previous release's boot files off the ESP puts them back, so the room keeps its one fallback.
 
@@ -84,19 +84,15 @@ Every command that uses the btrfs top level (`stage`, `rollback`, `restore`, pru
 
 The firmware's `check-image`, the installer's `desk-check`, `smartroomos-integrity` and `smartroomos-release-sign` call this same command; the firmware's `overlay/usr/bin/smartroom-release` is a byte copy of this file.
 
-## Room pages as a trial condition (written, off)
+## Room screens
 
-Open: should a trial also need "the room pages are up when a display is connected"? On `2026.11.24-studio-edge-c` the kiosk Chromium could not start (a missing library), and the trial still passed: health samples the Room Controller's connection, the network and the display count, and the Room Controller reported `chrome=yes` (installed, not running).
+A trial requires the room pages when the box is adopted and has saved display settings. A room page is a kiosk Chromium main process of the Room Controller user whose URL names a room role (`?role=presentationDisplay`). A real room requires a page when a DRM display is connected. A test unit (`/etc/smartroomos/test-room` names this machine) requires a page even with no DRM connector, because its screens are Hyprland headless outputs. A box that is not adopted, or adopted with no saved display settings, does not require pages. There is no switch. An old `require_room_pages` line in `release.conf` is ignored.
 
-The condition is written and tested, and off: `require_room_pages=no` (default) in `/etc/smartroomos/release.conf`. A room page is a kiosk Chromium main process of the Room Controller user whose URL names a room role (`?role=presentationDisplay`). With `yes`, a sample whose room has a connected display (DRM) and no room page counts as not healthy, so a trial whose pages never start ends in `health-timeout` and rolls back (`last_result.room_pages_required`). `always` requires a page also without a DRM display: a test Studio's screens are Hyprland headless outputs, which DRM does not count, so `yes` would not have caught edge-c on a test Mac Studio, and `always` would have.
+After the quiet window, and only then, health asks the Room Controller (`POST http://127.0.0.1:8790/local/display-self-test`, port from `agent.json` `localControlPort`) to power the configured projector and TVs, check each is connected, showing a non-black picture and reporting itself on, then restore the power and blank it found. The same request runs once just before `update` and `rollback`, and that result is the baseline (`/var/lib/smartroomos/display-baseline.json`, also on the trial record). A display that already failed in the baseline does not fail this release. A display that fails and was fine, or absent, in the baseline fails the trial (`display-self-test`). A Room Controller with no such route is `skipped: unavailable` and does not fail the trial. A skipped baseline does not excuse a later failure.
 
-## Refusing a rollback to an unsafe root (written, off)
+## Rollback ownership
 
-Open. Default `refuse_unsafe_rollback=no`: as before WS17, `rollback` and `restore` are never refused on the invariant. They arm a kept root without checking it, and their trial (kind `rollback`) checks the root at boot but does not roll back on it: the result goes in `status --json` (`release.root_check` with `ok: false`, `refused: false`, `kind`, `findings`, `note`), event `unsafe-rollback-kept` (once per trial), and the trial goes on to its health result. Integrity shows that record as information (`release_root_check`); its own check of the running root still reports `unsafe-root`. Update trials refuse an unsafe root whatever the switch says.
-
-With `refuse_unsafe_rollback=yes` in `/etc/smartroomos/release.conf`, `rollback` and `restore` check the target first and refuse before anything is armed (`last_result` `refused`, `unsafe-root`, event `rollback-refused`), and a rollback trial whose root fails is sent back (`unsafe-root`), as an update trial is. A check that cannot run does not refuse. `check-kept` shows today which kept roots would be refused. The Mini's `smartroomos-boot-commit` does the same for a snapshot restore (`root_check_refused=no|yes` in its marker).
-
-A rollback or restore that fails after moving the previous release's boot files off the ESP puts them back, as `stage` does.
+A rollback or restore is not checked for ownership on the room. `build-release` still refuses to send or sign an unsafe root, and `stage` still refuses one before anything is armed. Update trials still roll back on `unsafe-root`. An old `refuse_unsafe_rollback` line in `release.conf` is ignored. `check-kept` still reports kept roots as information. A rollback or restore that fails after moving the previous release's boot files off the ESP puts them back, as `stage` does. Older state files may still carry a `root_check` with `refused: false`; integrity shows that historical record and does not treat it as a reason.
 
 ## Commands
 
@@ -151,9 +147,10 @@ does not feed a running watchdog and the health service must.
 `smartroom-release-health.service` runs on every boot and exits at once unless this boot
 is a trial. On a trial boot it opens `/dev/watchdog` and feeds it, then samples every
 5 s. A sample is healthy when the Room Controller has an established connection to its
-server, the default route is up, and at least as many displays are connected as before
-the update. The trial passes after 5 quiet minutes of healthy samples that end within
-15 minutes of the start (`/etc/smartroomos/release.conf`: `quiet_seconds`,
+server, the default route is up, at least as many displays are connected as before
+the update, and (when this room's pages are required) a room page is running. The trial
+passes after 5 quiet minutes of healthy samples that end within 15 minutes of the start,
+and then the display self-test above. (`/etc/smartroomos/release.conf`: `quiet_seconds`,
 `limit_seconds`, `sample_seconds`, `min_displays`, `watchdog_device`, `keyring`,
 `reboot_hook`).
 
