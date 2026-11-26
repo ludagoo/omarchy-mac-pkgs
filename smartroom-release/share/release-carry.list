@@ -8,6 +8,7 @@
 /etc/hosts
 /etc/localtime
 /etc/ssh/ssh_host_*
+/etc/smartroom/unique-id
 /etc/smartroomos/unique-id
 # The Room Controller (/opt/smartroom/agent + venv + systemd unit) is installed
 # by firstboot and self-updates independently of OS images; carry the program
@@ -24,6 +25,10 @@
 /var/lib/iwd
 /var/lib/bluetooth
 # The Studio first boot's latch: without it a new root would register again.
+/var/lib/smartroom
+# Previous release's state directory. The first update is performed by the
+# release already on the room, which still copies this path. Later updates
+# copy it too, until promote has turned it into a symlink of the new one.
 /var/lib/smartroomos
 # First-boot state the room already completed: keeping its package keyring
 # and vendor firmware stamp stops an image-built release from reinitializing them.
@@ -40,11 +45,14 @@
 /opt/smartroom/state
 /opt/smartroom/chrome-profiles
 # Room-specific health settings, if the room has any.
+/etc/smartroom/release.conf
 /etc/smartroomos/release.conf
 # A test room's mark (TEST-ONLY machines; absent on every production room): only
 # with it do the test tools put fake cameras with real camera names on this room.
+/etc/smartroom/test-room
 /etc/smartroomos/test-room
 # Per-room Cloudflare tunnel token (presence only on the room; never in images).
 # Carry the directory so a rollback to a release without the tunnel unit still
 # keeps the token file for the next update that restores the unit.
+/etc/smartroom/tunnel
 /etc/smartroomos/tunnel

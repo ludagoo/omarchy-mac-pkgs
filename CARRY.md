@@ -78,7 +78,7 @@ SmartRoom repo. A release build (`smartroom/build-image` without `--dev`)
 records it, with its version and sha256, in that release's `PACKAGES` and
 serves it from the release's signed `[smartroom-release]` repository. A room
 takes a new build only when it switches to the release that contains it
-(`smartroomos-release switch`); nothing pulls it from a live repository.
+(`smartroom-release-repo switch`); nothing pulls it from a live repository.
 
 `smartroom/aura-try/` is the first rollback prototype from the design in
 `~/smartroom-rollback/DESIGN.md`. It arms a marker, checks health on a fake
@@ -117,12 +117,12 @@ It also holds the root invariant, `smartroom-release check-root` (2026-11-24): t
   the image build records this package's file name and sha256 in the image's package list like
   any other SmartRoom package; `desk-check` asserts the binary, the health unit, the release
   keyring and the Room Controller pin. Releases themselves are signed with the SmartRoom
-  package key (the public key is `/usr/share/smartroomos/release-keyring.gpg`).
+  package key (the public key is `/usr/share/smartroom/release-keyring.gpg`).
 - **WS13 (drift).** On stage: create a nested `.snapshots` under the new root and
   `pacman-key --add` + `--lsign-key` the release keyring into that root's gnupg so
   pacman stops asking to import it; precompile shipped SmartRoom Python
   (`compileall`) so runtime writes no `__pycache__`. On promote: finalize
-  limine defaults, re-import the key, run `smartroomos-integrity record`, then
+  limine defaults, re-import the key, run `smartroom-integrity record`, then
   take a read-only snapper snapshot `release <id> as installed` as type=post
   paired with a throwaway pre (snapper rejects orphan posts; no cleanup
   algorithm; `EXCLUDE_SNAPSHOT_TYPES=post` skips the post UKI;
@@ -131,15 +131,15 @@ It also holds the root invariant, `smartroom-release check-root` (2026-11-24): t
   limine-snapper-sync keeps working after the first promote. Firmware side:
   `smartroomcontrollerfirmware` `docs/disk-drift.md`.
 - **WS13c (home + export + never-forget).** On stage: if the outgoing root has
-  drift, `smartroomos-integrity archive-outgoing` writes
-  `/var/lib/smartroomos/drift-archive/<old>-<time>/` (last 5; never blocks;
+  drift, `smartroom-integrity archive-outgoing` writes
+  `/var/lib/smartroom/drift-archive/<old>-<time>/` (last 5; never blocks;
   never re-applies). On promote: also take a home as-installed snapper
   snapshot (`-c home`, nested `/home/.snapshots` on `@home` so it survives
   root replace). Home runtime IGNORE list and layout extras: see
   `docs/disk-drift.md`.
 - **WS14 (ESP budget).** The ESP holds only the configured boot set and one
   fallback (previous, or trial while a trial is staged). Kept-release UKI and
-  stage2 copies live on btrfs at `/var/lib/smartroomos/boot-store/<id>/` with
+  stage2 copies live on btrfs at `/var/lib/smartroom/boot-store/<id>/` with
   sha256 in `meta.json`; `rollback` / `restore` / `smartroom-rollback to`
   copy them back to the ESP trial slots. Stage computes the worst-case bytes
   promote will need, offloads the legacy ESP `smartroom-release/uki` store

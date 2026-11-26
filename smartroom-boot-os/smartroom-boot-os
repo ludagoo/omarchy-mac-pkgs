@@ -4,7 +4,7 @@
 # - On Apple Silicon: aurora-bless sets boot-volume / alt-boot-volume.
 # - On Intel T2 (Macmini8,1): efibootmgr sets BootOrder / BootNext, recreates
 #   missing SmartRoom or macOS Boot#### entries (using saved macos-boot-device
-#   metadata from /boot/smartroomos when bless overwrote Boot0080), and syncs
+#   metadata from /boot/smartroomos/ when bless overwrote Boot0080), and syncs
 #   Apple efi-boot-device / efi-boot-next variables in efivarfs when present.
 #
 #   smartroom-boot-os macos [--once] [--reboot]      start macOS (Zoom Rooms)
@@ -24,7 +24,7 @@ bless=${SMARTROOM_BOOT_OS_BLESS:-aurora-bless}
 limine_defaults=${SMARTROOM_BOOT_OS_LIMINE_DEFAULTS:-/etc/default/limine}
 efibootmgr_bin=${SMARTROOM_BOOT_OS_EFIBOOTMGR:-efibootmgr}
 esp_dir=${SMARTROOM_BOOT_OS_ESP_DIR:-/boot}
-meta_dir=${SMARTROOM_BOOT_OS_META_DIR:-$esp_dir/smartroomos}
+meta_dir=${SMARTROOM_BOOT_OS_META_DIR:-$esp_dir/smartroom}
 efivars_dir=${SMARTROOM_BOOT_OS_EFIVARS:-/sys/firmware/efi/efivars}
 die() { echo "smartroom-boot-os: $*" >&2; exit 1; }
 usage() { sed -n '/^#   smartroom-boot-os/s/^#   //p' "$0" >&2; exit 64; }

@@ -42,7 +42,7 @@ EFI/Linux/smartroomos_linux-t2.efi
 ```
 
 Paths in a manifest must be relative and stay inside the release. The signature
-is required (key: `/usr/share/smartroomos/release-keyring.gpg`); `--unsigned`
+is required (key: `/usr/share/smartroom/release-keyring.gpg`); `--unsigned`
 exists for development and is recorded in the state. A URL must be https.
 
 A release is made only by `smartroom-release build-release`, and only from a root that passes the root invariant (below). It writes nothing and signs nothing when the root fails, and it removes an older `manifest.json` and `.sig` from `--out` first.
@@ -64,9 +64,9 @@ Never assemble a release root by hand or by a job script (patching an older root
 - `sudoers-missing` and `visudo` (`visudo -c` on the root's sudoers and sudoers.d);
 - `unreadable`: a path it cannot list or stat, or, in a stream, a sudoers, passwd or group file whose contents the stream does not carry (no data, a shared copy or an encoded write). An empty sudoers would pass `visudo`, and an empty passwd would hide the Room Controller user.
 
-It stays on the root's own filesystem; on btrfs that is the root's own subvolume, exactly what a release contains. A directory on another filesystem or subvolume (`/boot`, the ESP, `@log`, `@home`, `/mnt`, `/media`, a USB stick) is neither judged nor walked; `other_filesystems` in the JSON lists it, and `smartroomos-integrity` shows it as information. A tech's uid-1000 USB stick never makes a room unsafe.
+It stays on the root's own filesystem; on btrfs that is the root's own subvolume, exactly what a release contains. A directory on another filesystem or subvolume (`/boot`, the ESP, `@log`, `@home`, `/mnt`, `/media`, a USB stick) is neither judged nor walked; `other_filesystems` in the JSON lists it, and `smartroom-integrity` shows it as information. A tech's uid-1000 USB stick never makes a room unsafe.
 
-Exit codes: `0` the root passes, `1` it fails (unsafe), `3` the check itself could not run (a missing path, a bad stream, a crash). `3` is never a verdict on the root. The build side (`build-release`, `desk-check`, `check-image`, `release-pack`) refuses on any non-zero exit. A room never refuses a trial on `3`: `health-run` and the Mini's `smartroomos-boot-commit` log it, show it on ops (`status --json` `release.root_check`, integrity reason `root-check-error`) and treat it as not proven unsafe, because a tool bug must never strand a room. `stage` refuses on it (reason `root-check-error`), since nothing is armed yet.
+Exit codes: `0` the root passes, `1` it fails (unsafe), `3` the check itself could not run (a missing path, a bad stream, a crash). `3` is never a verdict on the root. The build side (`build-release`, `desk-check`, `check-image`, `release-pack`) refuses on any non-zero exit. A room never refuses a trial on `3`: `health-run` and the Mini's `smartroom-boot-commit` log it, show it on ops (`status --json` `release.root_check`, integrity reason `root-check-error`) and treat it as not proven unsafe, because a tool bug must never strand a room. `stage` refuses on it (reason `root-check-error`), since nothing is armed yet.
 
 The exceptions are in the code with their reasons (`ROOT_EXEMPT_TREES`): what is below `/home`, `/opt/smartroom` itself and below (the Room Controller's own directory), what is below `/tmp` and `/var/tmp`, and systemd DynamicUser ids under `/var/lib/private` and the like. `/proc`, `/sys`, `/dev`, `/run` and `.snapshots` are not walked. They were derived from the good root `2026.11.21-studio-ws14b` (86,739 paths, ok), the Mini image `2026.11.21-mini` (98,635 paths, ok) and a repaired test Mac Studio (87,632 paths, ok); `2026.11.24-studio-edge-b` fails with 207 problems.
 
@@ -78,17 +78,17 @@ Every place a root comes from runs it, and a root that fails is refused:
 
 Any refusal of `stage`/`update` after it has moved the previous release's boot files off the ESP puts them back, so the room keeps its one fallback.
 
-`check-kept [--json] [--max-age S]` runs the invariant on every kept root this room could roll back or restore to (not the running root, which integrity checks). The result is cached in `/var/lib/smartroomos/release-kept-roots.json` and shown, as information, in `status --json` (`keptRootsCheck`, and `rootCheck` on each release row); `status` never walks a root. `smartroomos-integrity`'s live check runs it at most every six hours. Rollback and restore do not refuse on it yet. When another `smartroom-release` holds the btrfs top level (an update receiving its root), `check-kept` does not wait: it prints `busy: true` with `ok: null`, caches nothing, and the next run checks.
+`check-kept [--json] [--max-age S]` runs the invariant on every kept root this room could roll back or restore to (not the running root, which integrity checks). The result is cached in `/var/lib/smartroom/release-kept-roots.json` and shown, as information, in `status --json` (`keptRootsCheck`, and `rootCheck` on each release row); `status` never walks a root. `smartroom-integrity`'s live check runs it at most every six hours. Rollback and restore do not refuse on it yet. When another `smartroom-release` holds the btrfs top level (an update receiving its root), `check-kept` does not wait: it prints `busy: true` with `ok: null`, caches nothing, and the next run checks.
 
 Every command that uses the btrfs top level (`stage`, `rollback`, `restore`, prune, `discard`, `build-release`, `doctor`, `migrate-confirm`, `check-kept`) takes one exclusive lock first, a flock on `/run/smartroom-release/top.lock`. The holder mounts the top level at `/run/smartroom-release/top` and unmounts it when done, so no process unmounts it under another. A mount left by a killed holder is taken over and unmounted by the next one.
 
-The firmware's `check-image`, the installer's `desk-check`, `smartroomos-integrity` and `smartroomos-release-sign` call this same command; the firmware's `overlay/usr/bin/smartroom-release` is a byte copy of this file.
+The firmware's `check-image`, the installer's `desk-check`, `smartroom-integrity` and `smartroom-release-sign` call this same command; the firmware's `overlay/usr/bin/smartroom-release` is a byte copy of this file.
 
 ## Room screens
 
-A trial requires the room pages when the box is adopted and has saved display settings. A room page is a kiosk Chromium main process of the Room Controller user whose URL names a room role (`?role=presentationDisplay`). A real room requires a page when a DRM display is connected. A test unit (`/etc/smartroomos/test-room` names this machine) requires a page even with no DRM connector, because its screens are Hyprland headless outputs. A box that is not adopted, or adopted with no saved display settings, does not require pages. There is no switch. An old `require_room_pages` line in `release.conf` is ignored.
+A trial requires the room pages when the box is adopted and has saved display settings. A room page is a kiosk Chromium main process of the Room Controller user whose URL names a room role (`?role=presentationDisplay`). A real room requires a page when a DRM display is connected. A test unit (`/etc/smartroom/test-room` names this machine) requires a page even with no DRM connector, because its screens are Hyprland headless outputs. A box that is not adopted, or adopted with no saved display settings, does not require pages. There is no switch. An old `require_room_pages` line in `release.conf` is ignored.
 
-After the quiet window, and only then, health asks the Room Controller (`POST http://127.0.0.1:8790/local/display-self-test`, port from `agent.json` `localControlPort`) to power the configured projector and TVs, check each is connected, showing a non-black picture and reporting itself on, then restore the power and blank it found. The same request runs once just before `update` and `rollback`, and that result is the baseline (`/var/lib/smartroomos/display-baseline.json`, also on the trial record). A display that already failed in the baseline does not fail this release. A display that fails and was fine, or absent, in the baseline fails the trial (`display-self-test`). A Room Controller with no such route is `skipped: unavailable` and does not fail the trial. A skipped baseline does not excuse a later failure.
+After the quiet window, and only then, health asks the Room Controller (`POST http://127.0.0.1:8790/local/display-self-test`, port from `agent.json` `localControlPort`) to power the configured projector and TVs, check each is connected, showing a non-black picture and reporting itself on, then restore the power and blank it found. The same request runs once just before `update` and `rollback`, and that result is the baseline (`/var/lib/smartroom/display-baseline.json`, also on the trial record). A display that already failed in the baseline does not fail this release. A display that fails and was fine, or absent, in the baseline fails the trial (`display-self-test`). A Room Controller with no such route is `skipped: unavailable` and does not fail the trial. A skipped baseline does not excuse a later failure.
 
 ## Rollback ownership
 
@@ -150,7 +150,7 @@ is a trial. On a trial boot it opens `/dev/watchdog` and feeds it, then samples 
 server, the default route is up, at least as many displays are connected as before
 the update, and (when this room's pages are required) a room page is running. The trial
 passes after 5 quiet minutes of healthy samples that end within 15 minutes of the start,
-and then the display self-test above. (`/etc/smartroomos/release.conf`: `quiet_seconds`,
+and then the display self-test above. (`/etc/smartroom/release.conf`: `quiet_seconds`,
 `limit_seconds`, `sample_seconds`, `min_displays`, `watchdog_device`, `keyring`,
 `reboot_hook`).
 

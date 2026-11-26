@@ -33,7 +33,7 @@ def adopt(world, room="room-101", displays=None, av=None):
 
 
 def mark_test_room(world, name="room-A"):
-    dest = world.prefix / "etc/smartroomos/test-room"
+    dest = world.prefix / "etc/smartroom/test-room"
     dest.parent.mkdir(parents=True, exist_ok=True)
     dest.write_text(f"room={name}\n")
     (world.prefix / "etc/hostname").write_text("room-A\n")
@@ -77,7 +77,7 @@ class DisplayHealth(unittest.TestCase):
         self.assertEqual(code, 0, err)
         self.assertEqual(calls, [])
         self.assertEqual(w.state()["configured"]["release"], "2026.11.21-1")
-        doc = json.loads((w.prefix / "var/lib/smartroomos/display-baseline.json").read_text())
+        doc = json.loads((w.prefix / "var/lib/smartroom/display-baseline.json").read_text())
         self.assertEqual(doc["screenCase"], "not-adopted")
         self.assertEqual(doc["selfTest"]["skipped"], "not-adopted")
 
@@ -187,8 +187,8 @@ class DisplayHealth(unittest.TestCase):
     def test_an_old_require_room_pages_no_does_not_disable_the_check(self):
         w = World(self)
         adopt(w, displays=[ROLE], av=AV)
-        (w.prefix / "etc/smartroomos").mkdir(parents=True, exist_ok=True)
-        (w.prefix / "etc/smartroomos/release.conf").write_text("require_room_pages=no\n")
+        (w.prefix / "etc/smartroom").mkdir(parents=True, exist_ok=True)
+        (w.prefix / "etc/smartroom/release.conf").write_text("require_room_pages=no\n")
         w.host._conf = None
         w.host.display_self_test = lambda: good_display(True)
         w.host.screens = 2

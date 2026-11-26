@@ -27,12 +27,17 @@ check() {
 package() {
   local s="$srcdir/omarchy-mac-pkgs/smartroom-release"
   install -Dm0755 "$s/bin/smartroom-release" "$pkgdir/usr/bin/smartroom-release"
-  install -Dm0644 "$s/share/release-carry.list" "$pkgdir/usr/share/smartroomos/release-carry.list"
+  install -Dm0755 "$s/bin/smartroom-legacy-paths" "$pkgdir/usr/local/sbin/smartroom-legacy-paths"
+  install -Dm0644 "$s/share/release-carry.list" "$pkgdir/usr/share/smartroom/release-carry.list"
   install -Dm0644 "$s/systemd/smartroom-release-health.service" \
     "$pkgdir/usr/lib/systemd/system/smartroom-release-health.service"
+  install -Dm0644 "$s/systemd/smartroom-legacy-paths.service" \
+    "$pkgdir/usr/lib/systemd/system/smartroom-legacy-paths.service"
   install -Dm0644 "$s/README.md" "$pkgdir/usr/share/doc/$pkgname/README.md"
   install -Dm0644 "$srcdir/omarchy-mac-pkgs/LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
   install -d "$pkgdir/usr/lib/systemd/system/sysinit.target.wants"
   ln -s ../smartroom-release-health.service \
     "$pkgdir/usr/lib/systemd/system/sysinit.target.wants/smartroom-release-health.service"
+  ln -s ../smartroom-legacy-paths.service \
+    "$pkgdir/usr/lib/systemd/system/sysinit.target.wants/smartroom-legacy-paths.service"
 }

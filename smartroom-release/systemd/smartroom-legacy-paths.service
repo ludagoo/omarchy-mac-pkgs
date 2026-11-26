@@ -1,0 +1,18 @@
+# Every boot. On a fresh install there is nothing to do. On a room that
+# still has the previous state directory, make the new paths see that
+# state. smartroom-release promote (mark-good) flips the directories.
+# Does not rename the ESP, the UKI, or the APFS volume.
+[Unit]
+Description=SmartRoom Firmware legacy path names
+DefaultDependencies=no
+After=local-fs.target
+Before=sysinit.target smartroom-release-health.service smartroom-integrity.service smartroom-boot-commit.service smartroom-firstboot.service smartroom-snapshot-recover.service
+ConditionPathExists=/usr/local/sbin/smartroom-legacy-paths
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/smartroom-legacy-paths boot
+RemainAfterExit=yes
+
+[Install]
+WantedBy=sysinit.target

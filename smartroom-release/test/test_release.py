@@ -206,7 +206,7 @@ class World:
         for rel, data in {
             "etc/machine-id": "machine-A\n", "etc/hostname": "room-A\n",
             "etc/ssh/ssh_host_ed25519_key": "HOSTKEY-A", "etc/ssh/ssh_host_ed25519_key.pub": "HOSTPUB-A",
-            "etc/smartroomos/unique-id": "uid-A\n", "var/lib/smartroomos/studio-firstboot.done": "done\n",
+            "etc/smartroom/unique-id": "uid-A\n", "var/lib/smartroom/studio-firstboot.done": "done\n",
             "opt/smartroom/config/agent.json": '{"serverUrl": "https://s.example"}',
             "opt/smartroom/state/requirements.sha256": "abc\n",
         }.items():
@@ -360,14 +360,14 @@ class Stage(unittest.TestCase):
         # onto a root that did not ship the tunnel unit. The value must never
         # appear in the release tree that was staged (only via carry).
         secret = "dummy-ws15-tunnel-token-not-real"
-        token = self.w.prefix / "etc/smartroomos/tunnel/token"
+        token = self.w.prefix / "etc/smartroom/tunnel/token"
         token.parent.mkdir(parents=True, exist_ok=True)
         token.write_text(secret)
         token.chmod(0o600)
         d_a, (code, _, err) = self.stage(name="2026.11.23-tunnel-a")
         self.assertEqual(code, 0, err)
         new = self.w.prefix / "top/@r-2026.11.23-tunnel-a"
-        carried = new / "etc/smartroomos/tunnel/token"
+        carried = new / "etc/smartroom/tunnel/token"
         self.assertTrue(carried.is_file(), "token must be carried into the new root")
         self.assertEqual(carried.read_text(), secret)
         self.assertEqual(carried.stat().st_mode & 0o777, 0o600)
@@ -375,7 +375,7 @@ class Stage(unittest.TestCase):
         d_b, (code, _, err) = self.stage(name="2026.11.23-tunnel-b")
         self.assertEqual(code, 0, err)
         older = self.w.prefix / "top/@r-2026.11.23-tunnel-b"
-        self.assertEqual((older / "etc/smartroomos/tunnel/token").read_text(), secret)
+        self.assertEqual((older / "etc/smartroom/tunnel/token").read_text(), secret)
         self.assertNotIn(secret.encode(), (d_a / "root.btrfs.zst").read_bytes())
         self.assertNotIn(secret.encode(), (d_b / "root.btrfs.zst").read_bytes())
 
@@ -389,13 +389,13 @@ class Stage(unittest.TestCase):
         self.assertEqual((new / "etc/machine-id").read_text(), "machine-A\n")
         self.assertEqual((new / "etc/hostname").read_text(), "room-A\n")
         self.assertEqual((new / "etc/ssh/ssh_host_ed25519_key").read_text(), "HOSTKEY-A")
-        self.assertEqual((new / "var/lib/smartroomos/studio-firstboot.done").read_text(), "done\n")
+        self.assertEqual((new / "var/lib/smartroom/studio-firstboot.done").read_text(), "done\n")
         self.assertEqual((new / "opt/smartroom/config/agent.json").read_text(), '{"serverUrl": "https://s.example"}')
         # the new root names itself
         self.assertIn("subvol=@r-2026.11.21-1", (new / "etc/fstab").read_text())
         self.assertNotIn("subvol=@ ", (new / "etc/fstab").read_text().splitlines()[0])
         self.assertIn("rootflags=subvol=@r-2026.11.21-1", (new / "etc/default/limine").read_text())
-        self.assertEqual((new / "usr/share/smartroomos/release-id").read_text(), "2026.11.21-1\n")
+        self.assertEqual((new / "usr/share/smartroom/release-id").read_text(), "2026.11.21-1\n")
         # the running root is untouched
         self.assertIn("subvol=@ ", (top / "@/etc/fstab").read_text())
         # the boot files sit beside the configured ones, which are byte-identical
@@ -480,7 +480,7 @@ class Stage(unittest.TestCase):
         fpr = subprocess.run(["gpg", "--list-keys", "--with-colons"], env=env, capture_output=True, text=True,
                              check=True).stdout
         fpr = [l.split(":")[9] for l in fpr.splitlines() if l.startswith("fpr")][0]
-        keyring = self.w.prefix / "usr/share/smartroomos/release-keyring.gpg"
+        keyring = self.w.prefix / "usr/share/smartroom/release-keyring.gpg"
         keyring.parent.mkdir(parents=True)
         keyring.write_bytes(subprocess.run(["gpg", "--export", fpr], env=env, check=True, capture_output=True).stdout)
         self.assertEqual(self.w.run("stage", str(d))[0], 1)         # keyring but no signature
@@ -677,7 +677,7 @@ class Trial(unittest.TestCase):
         self.assertGreater(len(feeds), 50)
 
     def test_promotion_records_and_checks_integrity(self):
-        integ = self.w.prefix / "usr/local/sbin/smartroomos-integrity"
+        integ = self.w.prefix / "usr/local/sbin/smartroom-integrity"
         integ.parent.mkdir(parents=True, exist_ok=True)
         log = self.w.tmp / "integrity.calls"
         integ.write_text(f"#!/bin/sh\necho \"$*\" >> {log}\n")
@@ -1037,12 +1037,12 @@ class Cli(unittest.TestCase):
         self.assertGreater(len(entries), 8)
         for entry in entries:
             self.assertTrue(entry.startswith("/") and ".." not in entry, entry)
-        self.assertIn("/var/lib/smartroomos", entries)         # the first-boot latch
+        self.assertIn("/var/lib/smartroom", entries)         # the first-boot latch
         self.assertIn("/etc/machine-id", entries)
         self.assertIn("/etc/ssh/ssh_host_*", entries)
         self.assertIn("/etc/systemd/system/smartroom-agent.service", entries)
         self.assertIn("/opt/smartroom/agent", entries)
-        self.assertIn("/etc/smartroomos/tunnel", entries)      # WS15: per-room Cloudflare token
+        self.assertIn("/etc/smartroom/tunnel", entries)      # WS15: per-room Cloudflare token
         self.assertNotIn("/etc/systemd/system/smartroom-agent.service.d", entries)
 
 
@@ -1090,7 +1090,7 @@ class MiniWorld(World):
         for rel, data in {
             "etc/machine-id": "machine-M\n", "etc/hostname": "mini-A\n",
             "etc/ssh/ssh_host_ed25519_key": "HOSTKEY-M", "etc/ssh/ssh_host_ed25519_key.pub": "HOSTPUB-M",
-            "etc/smartroomos/unique-id": "uid-M\n",
+            "etc/smartroom/unique-id": "uid-M\n",
             "opt/smartroom/config/agent.json": '{"serverUrl": "https://s.example"}',
             "opt/smartroom/state/requirements.sha256": "abc\n",
             "etc/NetworkManager/system-connections/wifi.nmconnection": "[connection]\nid=wifi\n",
@@ -1144,13 +1144,13 @@ class Ws13SnapperAndKey(unittest.TestCase):
         new_root = w.prefix / "top" / "@r-2026.11.21-ws13"
         new_root.mkdir(parents=True)
         (new_root / "etc").mkdir()
-        (new_root / "usr/share/smartroomos").mkdir(parents=True)
-        (new_root / "usr/share/smartroomos/release-keyring.gpg").write_bytes(b"\x99fake")
+        (new_root / "usr/share/smartroom").mkdir(parents=True)
+        (new_root / "usr/share/smartroom/release-keyring.gpg").write_bytes(b"\x99fake")
         (new_root / "etc/fstab").write_text("UUID=x / btrfs subvol=/@ 0 0\n")
         sr.fix_root_files(w.host, new_root, "@r-2026.11.21-ws13", "2026.11.21-ws13")
         self.assertTrue((new_root / ".snapshots").is_dir())
-        self.assertTrue((new_root / "var/lib/smartroomos/release-key-imported").is_file())
-        self.assertIn("26436A50", (new_root / "var/lib/smartroomos/release-key-imported").read_text())
+        self.assertTrue((new_root / "var/lib/smartroom/release-key-imported").is_file())
+        self.assertIn("26436A50", (new_root / "var/lib/smartroom/release-key-imported").read_text())
 
     def test_promote_imports_key_after_carry(self):
         """Promote re-imports even when only the old carried gnupg is present."""
@@ -1158,9 +1158,9 @@ class Ws13SnapperAndKey(unittest.TestCase):
         # Simulate a carried gnupg with no release key stamp yet.
         (w.prefix / "etc/pacman.d/gnupg").mkdir(parents=True)
         (w.prefix / "etc/pacman.d/gnupg/pubring.gpg").write_text("ROOM-GPG")
-        (w.prefix / "usr/share/smartroomos").mkdir(parents=True)
-        (w.prefix / "usr/share/smartroomos/release-keyring.gpg").write_bytes(b"\x99fake")
-        stamp = w.prefix / "var/lib/smartroomos/release-key-imported"
+        (w.prefix / "usr/share/smartroom").mkdir(parents=True)
+        (w.prefix / "usr/share/smartroom/release-keyring.gpg").write_bytes(b"\x99fake")
+        stamp = w.prefix / "var/lib/smartroom/release-key-imported"
         if stamp.exists():
             stamp.unlink()
         w.run("update", str(w.release()), "--unsigned")
@@ -1173,7 +1173,7 @@ class Ws13SnapperAndKey(unittest.TestCase):
         w.run("update", str(w.release()), "--unsigned")
         w.trial_boot()
         self.assertEqual(w.run("health-run")[0], 0)
-        marker = w.prefix / "var/lib/smartroomos/integrity/as-installed.json"
+        marker = w.prefix / "var/lib/smartroom/integrity/as-installed.json"
         self.assertTrue(marker.is_file(), "as-installed marker missing after promote")
         data = json.loads(marker.read_text())
         self.assertEqual(data.get("kind"), "as-installed")
@@ -1186,7 +1186,7 @@ class Ws13SnapperAndKey(unittest.TestCase):
         w.run("update", str(w.release()), "--unsigned")
         w.trial_boot()
         self.assertEqual(w.run("health-run")[0], 0)
-        marker = w.prefix / "var/lib/smartroomos/integrity/as-installed-home.json"
+        marker = w.prefix / "var/lib/smartroom/integrity/as-installed-home.json"
         self.assertTrue(marker.is_file(), "home as-installed marker missing after promote")
         data = json.loads(marker.read_text())
         self.assertEqual(data.get("kind"), "as-installed")
@@ -1195,19 +1195,19 @@ class Ws13SnapperAndKey(unittest.TestCase):
     def test_stage_archives_outgoing_drift_when_present(self):
         """WS13c: stage archives outgoing drift via integrity archive-outgoing."""
         w = World(self)
-        tool = w.prefix / "usr/local/sbin/smartroomos-integrity"
+        tool = w.prefix / "usr/local/sbin/smartroom-integrity"
         tool.parent.mkdir(parents=True, exist_ok=True)
         tool.write_text(
             "#!/bin/bash\n"
             "set -e\n"
-            "root=\"${SMARTROOMOS_ROOT:-/}\"\n"
+            "root=\"${SMARTROOM_SYSROOT:-/}\"\n"
             "if [[ \"$1\" == archive-outgoing ]]; then\n"
             "  id=\"old-20261121T000000Z\"\n"
-            "  d=\"$root/var/lib/smartroomos/drift-archive/$id\"\n"
-            "  mkdir -p \"$d\" \"$root/var/lib/smartroomos/integrity\"\n"
+            "  d=\"$root/var/lib/smartroom/drift-archive/$id\"\n"
+            "  mkdir -p \"$d\" \"$root/var/lib/smartroom/integrity\"\n"
             "  echo archived >\"$d/README.md\"\n"
             "  printf '%s\\n' '{\"archives\":[{\"id\":\"old-20261121T000000Z\",\"acked\":false,\"count\":1,\"paths\":[\"/etc/x\"],\"old_release\":\"old\",\"new_release\":\"2026.11.21-2\"}]}' "
-            ">\"$root/var/lib/smartroomos/integrity/hand-changes-pending.json\"\n"
+            ">\"$root/var/lib/smartroom/integrity/hand-changes-pending.json\"\n"
             "  exit 0\n"
             "fi\n"
             "exit 0\n"
@@ -1219,10 +1219,10 @@ class Ws13SnapperAndKey(unittest.TestCase):
         rel = w.release(name="2026.11.21-2")
         rc, out, err = w.run("stage", str(rel), "--unsigned")
         self.assertEqual(rc, 0, err or out)
-        pending = w.prefix / "var/lib/smartroomos/integrity/hand-changes-pending.json"
+        pending = w.prefix / "var/lib/smartroom/integrity/hand-changes-pending.json"
         self.assertTrue(pending.is_file(), "hand-changes-pending missing after stage")
         self.assertTrue(
-            (w.prefix / "var/lib/smartroomos/drift-archive/old-20261121T000000Z/README.md").is_file()
+            (w.prefix / "var/lib/smartroom/drift-archive/old-20261121T000000Z/README.md").is_file()
         )
 
     def test_promote_snapshot_after_edits_leaves_zero_limine_drift(self):
@@ -1237,13 +1237,13 @@ class Ws13SnapperAndKey(unittest.TestCase):
         )
         # Fake integrity tool records a stamp under MANIFEST_DIR so we can see
         # it lands before the as-installed marker path is written.
-        tool = w.prefix / "usr/local/sbin/smartroomos-integrity"
+        tool = w.prefix / "usr/local/sbin/smartroom-integrity"
         tool.parent.mkdir(parents=True, exist_ok=True)
         tool.write_text(
             "#!/bin/bash\n"
             "set -e\n"
-            "root=\"${SMARTROOMOS_ROOT:-/}\"\n"
-            "d=\"$root/usr/local/lib/smartroomos/integrity\"\n"
+            "root=\"${SMARTROOM_SYSROOT:-/}\"\n"
+            "d=\"$root/usr/local/lib/smartroom/integrity\"\n"
             "mkdir -p \"$d/store\"\n"
             "echo recorded >\"$d/manifest.json\"\n"
             "echo blob >\"$d/store/deadbeef\"\n"
@@ -1251,7 +1251,7 @@ class Ws13SnapperAndKey(unittest.TestCase):
         )
         tool.chmod(0o755)
         # Also ship a tiny .py so precompile creates __pycache__ in the root.
-        lib = w.prefix / "usr/local/lib/smartroomos"
+        lib = w.prefix / "usr/local/lib/smartroom"
         lib.mkdir(parents=True, exist_ok=True)
         (lib / "hello_ws13b.py").write_text("x = 1\n")
         w.run("update", str(w.release()), "--unsigned")
@@ -1259,8 +1259,8 @@ class Ws13SnapperAndKey(unittest.TestCase):
         new = w.prefix / "top" / "@r-2026.11.21-1"
         (new / "etc/default").mkdir(parents=True, exist_ok=True)
         (new / "etc/default/limine").write_text(limine.read_text())
-        (new / "usr/local/lib/smartroomos").mkdir(parents=True, exist_ok=True)
-        (new / "usr/local/lib/smartroomos/hello_ws13b.py").write_text("x = 1\n")
+        (new / "usr/local/lib/smartroom").mkdir(parents=True, exist_ok=True)
+        (new / "usr/local/lib/smartroom/hello_ws13b.py").write_text("x = 1\n")
         (new / "usr/local/sbin").mkdir(parents=True, exist_ok=True)
         # Live root after trial boot is the new subvol content via prefix=/
         # World uses prefix as /; trial_boot only rewrites cmdline. Promote
@@ -1272,10 +1272,10 @@ class Ws13SnapperAndKey(unittest.TestCase):
         self.assertNotIn("watchdog.handle_boot_enabled", text)
         self.assertIn("smartroom.release=2026.11.21-1", text)
         # Manifest/store recorded (record_integrity ran before snapshot marker).
-        self.assertTrue((w.prefix / "usr/local/lib/smartroomos/integrity/manifest.json").is_file())
-        self.assertTrue((w.prefix / "usr/local/lib/smartroomos/integrity/store/deadbeef").is_file())
+        self.assertTrue((w.prefix / "usr/local/lib/smartroom/integrity/manifest.json").is_file())
+        self.assertTrue((w.prefix / "usr/local/lib/smartroom/integrity/store/deadbeef").is_file())
         # Precompile left bytecode for our module.
-        pyc = list((w.prefix / "usr/local/lib/smartroomos").rglob("hello_ws13b*.pyc"))
+        pyc = list((w.prefix / "usr/local/lib/smartroom").rglob("hello_ws13b*.pyc"))
         self.assertTrue(pyc, "stage/promote must precompile smartroom Python")
         # Status must not say trial boot after committed promote (dt still set).
         doc = json.loads(w.run("status", "--json")[1])
@@ -1305,7 +1305,7 @@ class Ws13SnapperAndKey(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            (root / "var/lib/smartroomos/integrity").mkdir(parents=True)
+            (root / "var/lib/smartroom/integrity").mkdir(parents=True)
 
             class FakeHost:
                 prefix = None
@@ -1342,7 +1342,7 @@ class Ws13SnapperAndKey(unittest.TestCase):
             remove_nums = [c[1] for c in calls if c and c[0] == "limine-snapper-remove"]
             self.assertEqual(remove_nums, ["10", "11"])
             marker = json.loads(
-                (root / "var/lib/smartroomos/integrity/as-installed.json").read_text()
+                (root / "var/lib/smartroom/integrity/as-installed.json").read_text()
             )
             self.assertEqual(marker["snapshot"], 11)
             self.assertEqual(marker["pre_snapshot"], 10)
@@ -1372,6 +1372,37 @@ class Ws13SnapperAndKey(unittest.TestCase):
             self.assertIn('ROOT_SUBVOLUME_PATH="/@r-2026.11.21-1"', text)
             self.assertIn('ROOT_SNAPSHOTS_PATH="/@r-2026.11.21-1/.snapshots"', text)
 
+    def test_migrate_legacy_names_missing_tool_is_a_noop(self):
+        w = World(self)
+        host = sr.Host(prefix=str(w.prefix))
+        sr.migrate_legacy_names(host, "promote")
+        sr.migrate_legacy_names(host, "boot", w.prefix)
+
+    def test_migrate_legacy_names_runs_the_image_tool(self):
+        w = World(self)
+        script = w.prefix / "usr/local/sbin/smartroom-legacy-paths"
+        script.parent.mkdir(parents=True, exist_ok=True)
+        script.write_text(
+            "#!/bin/sh\n"
+            "mode=\nroot=\n"
+            'while [ $# -gt 0 ]; do\n'
+            '  case "$1" in\n'
+            '    --root) root=$2; shift 2 ;;\n'
+            '    *) mode=$1; shift ;;\n'
+            "  esac\n"
+            "done\n"
+            'mkdir -p "$root/var/lib"\n'
+            'printf "%s\\n" "$mode" > "$root/var/lib/legacy-mode"\n'
+        )
+        script.chmod(0o755)
+        host = sr.Host(prefix=str(w.prefix))
+        sr.migrate_legacy_names(host, "promote")
+        self.assertEqual((w.prefix / "var/lib/legacy-mode").read_text().strip(), "promote")
+        new_root = w.prefix / "new-root"
+        new_root.mkdir()
+        sr.migrate_legacy_names(host, "boot", new_root)
+        self.assertEqual((new_root / "var/lib/legacy-mode").read_text().strip(), "boot")
+
 
 class MiniLine(unittest.TestCase):
     def test_detects_mini_layout(self):
@@ -1382,8 +1413,8 @@ class MiniLine(unittest.TestCase):
     def test_update_trial_promote_and_status_json(self):
         w = MiniWorld(self)
         w.host.conf  # force defaults
-        (w.prefix / "etc/smartroomos").mkdir(parents=True, exist_ok=True)
-        (w.prefix / "etc/smartroomos/release.conf").write_text("quiet_seconds=60\nlimit_seconds=120\nsample_seconds=5\n")
+        (w.prefix / "etc/smartroom").mkdir(parents=True, exist_ok=True)
+        (w.prefix / "etc/smartroom/release.conf").write_text("quiet_seconds=60\nlimit_seconds=120\nsample_seconds=5\n")
         w.host._conf = None
         code, _, err = w.run("update", str(w.release()), "--unsigned")
         self.assertEqual(code, 0, err)
@@ -1408,8 +1439,8 @@ class MiniLine(unittest.TestCase):
 
     def test_unhealthy_trial_falls_back(self):
         w = MiniWorld(self)
-        (w.prefix / "etc/smartroomos").mkdir(parents=True, exist_ok=True)
-        (w.prefix / "etc/smartroomos/release.conf").write_text("quiet_seconds=60\nlimit_seconds=90\nsample_seconds=5\n")
+        (w.prefix / "etc/smartroom").mkdir(parents=True, exist_ok=True)
+        (w.prefix / "etc/smartroom/release.conf").write_text("quiet_seconds=60\nlimit_seconds=90\nsample_seconds=5\n")
         w.host._conf = None
         w.run("update", str(w.release()), "--unsigned")
         w.trial_boot()
@@ -1423,8 +1454,8 @@ class MiniLine(unittest.TestCase):
 
     def test_keeps_five_good_release_roots(self):
         w = MiniWorld(self)
-        (w.prefix / "etc/smartroomos").mkdir(parents=True, exist_ok=True)
-        (w.prefix / "etc/smartroomos/release.conf").write_text("quiet_seconds=30\nlimit_seconds=60\nsample_seconds=5\n")
+        (w.prefix / "etc/smartroom").mkdir(parents=True, exist_ok=True)
+        (w.prefix / "etc/smartroom/release.conf").write_text("quiet_seconds=30\nlimit_seconds=60\nsample_seconds=5\n")
         w.host._conf = None
         for i in range(1, 7):
             name = f"2026.11.2{i}-mini"
@@ -1451,8 +1482,8 @@ class MiniLine(unittest.TestCase):
 
     def test_migrate_check_and_migrate_trial(self):
         w = MiniWorld(self)
-        (w.prefix / "etc/smartroomos").mkdir(parents=True, exist_ok=True)
-        (w.prefix / "etc/smartroomos/release.conf").write_text("quiet_seconds=30\nlimit_seconds=60\nsample_seconds=5\n")
+        (w.prefix / "etc/smartroom").mkdir(parents=True, exist_ok=True)
+        (w.prefix / "etc/smartroom/release.conf").write_text("quiet_seconds=30\nlimit_seconds=60\nsample_seconds=5\n")
         w.host._conf = None
         # fake free space via prefix disk_usage is real tmpfs/home; migrate-check uses shutil on top
         code, out, err = w.run("migrate-check", "--json")
@@ -1488,8 +1519,8 @@ class MiniLine(unittest.TestCase):
     def test_lost_before_userspace_when_mini_lands_on_wrong_root(self):
         """Bad UKI + reset can land on factory @ while configured is @r-…."""
         w = MiniWorld(self)
-        (w.prefix / "etc/smartroomos").mkdir(parents=True, exist_ok=True)
-        (w.prefix / "etc/smartroomos/release.conf").write_text(
+        (w.prefix / "etc/smartroom").mkdir(parents=True, exist_ok=True)
+        (w.prefix / "etc/smartroom/release.conf").write_text(
             "quiet_seconds=30\nlimit_seconds=60\nsample_seconds=5\n")
         w.host._conf = None
         name = "2026.11.21-mini"
@@ -1512,10 +1543,10 @@ class MiniLine(unittest.TestCase):
         os.environ["SMARTROOM_RELEASE_VM"] = "1"
         self.addCleanup(lambda: os.environ.pop("SMARTROOM_RELEASE_VM", None))
         self.assertFalse(host.agent_connected())
-        (w.prefix / "etc/smartroomos").mkdir(parents=True, exist_ok=True)
-        (w.prefix / "etc/smartroomos/release-vm-healthy").write_text("1\n")
+        (w.prefix / "etc/smartroom").mkdir(parents=True, exist_ok=True)
+        (w.prefix / "etc/smartroom/release-vm-healthy").write_text("1\n")
         self.assertTrue(host.agent_connected())
-        (w.prefix / "etc/smartroomos/release-vm-healthy").unlink()
+        (w.prefix / "etc/smartroom/release-vm-healthy").unlink()
         self.assertFalse(host.agent_connected())
 
 
@@ -1549,7 +1580,7 @@ class TestBuildAsideEphemeral(unittest.TestCase):
         td = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, td, ignore_errors=True)
         host = sr.Host(td)
-        arch = host.p("/var/lib/smartroomos/drift-archive")
+        arch = host.p("/var/lib/smartroom/drift-archive")
         arch.mkdir(parents=True)
         (arch / "old").mkdir()
         (arch / "old" / "f").write_text("x")
@@ -1573,7 +1604,7 @@ class TestBuildAsideEphemeral(unittest.TestCase):
         td = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, td, ignore_errors=True)
         host = sr.Host(td)
-        src = host.p("/var/lib/smartroomos")
+        src = host.p("/var/lib/smartroom")
         src.mkdir(parents=True)
         (src / "latch").write_text("1")
         aid = "old-20261123T120000Z"
@@ -1601,19 +1632,19 @@ class TestBuildAsideEphemeral(unittest.TestCase):
                 "new_release": "new",
             },
         }) + "\n")
-        cl = host.p("/usr/share/smartroomos/release-carry.list")
+        cl = host.p("/usr/share/smartroom/release-carry.list")
         cl.parent.mkdir(parents=True, exist_ok=True)
-        cl.write_text("/var/lib/smartroomos\n")
+        cl.write_text("/var/lib/smartroom\n")
         new_root = Path(td) / "new-root"
         new_root.mkdir()
         copied = sr.carry_into(host, new_root)
-        self.assertIn("/var/lib/smartroomos", copied)
-        self.assertTrue((new_root / "var/lib/smartroomos/latch").is_file())
-        carried = new_root / "var/lib/smartroomos/drift-archive" / aid
+        self.assertIn("/var/lib/smartroom", copied)
+        self.assertTrue((new_root / "var/lib/smartroom/latch").is_file())
+        carried = new_root / "var/lib/smartroom/drift-archive" / aid
         self.assertTrue((carried / "files" / "etc__hand.conf").is_file())
         self.assertTrue((carried / "manifest.json").is_file())
         new_pending = json.loads(
-            (new_root / "var/lib/smartroomos/integrity/hand-changes-pending.json").read_text()
+            (new_root / "var/lib/smartroom/integrity/hand-changes-pending.json").read_text()
         )
         self.assertFalse(new_pending["archives"][0].get("content_pruned"))
         self.assertEqual(new_pending["archives"][0]["id"], aid)
@@ -1623,7 +1654,7 @@ class TestBuildAsideEphemeral(unittest.TestCase):
         td = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, td, ignore_errors=True)
         host = sr.Host(td)
-        src = host.p("/var/lib/smartroomos")
+        src = host.p("/var/lib/smartroom")
         src.mkdir(parents=True)
         (src / "latch").write_text("1")
         arch_root = src / "drift-archive"
@@ -1654,9 +1685,9 @@ class TestBuildAsideEphemeral(unittest.TestCase):
             "schema": 2,
             "hand_changes_pending": {"archive_id": new.name, "count": 1},
         }) + "\n")
-        cl = host.p("/usr/share/smartroomos/release-carry.list")
+        cl = host.p("/usr/share/smartroom/release-carry.list")
         cl.parent.mkdir(parents=True, exist_ok=True)
-        cl.write_text("/var/lib/smartroomos\n")
+        cl.write_text("/var/lib/smartroom\n")
         new_root = Path(td) / "new-root"
         new_root.mkdir()
         # Patch the budget for the test so we do not need multi-hundred-MiB files.
@@ -1666,20 +1697,20 @@ class TestBuildAsideEphemeral(unittest.TestCase):
             sr.carry_into(host, new_root)
         finally:
             sr.DRIFT_ARCHIVE_CARRY_MAX = old_max
-        carried_old = new_root / "var/lib/smartroomos/drift-archive" / old.name
-        carried_new = new_root / "var/lib/smartroomos/drift-archive" / new.name
+        carried_old = new_root / "var/lib/smartroom/drift-archive" / old.name
+        carried_new = new_root / "var/lib/smartroom/drift-archive" / new.name
         self.assertTrue((carried_old / "manifest.json").is_file())
         self.assertFalse((carried_old / "files" / "big").exists())
         self.assertTrue((carried_new / "files" / "small").is_file())
         new_pending = json.loads(
-            (new_root / "var/lib/smartroomos/integrity/hand-changes-pending.json").read_text()
+            (new_root / "var/lib/smartroom/integrity/hand-changes-pending.json").read_text()
         )
         by_id = {a["id"]: a for a in new_pending["archives"]}
         self.assertTrue(by_id[old.name].get("content_pruned"))
         self.assertIn("carry_size_budget", by_id[old.name].get("content_pruned_reason") or "")
         self.assertFalse(by_id[new.name].get("content_pruned"))
         st = json.loads(
-            (new_root / "var/lib/smartroomos/integrity/status.json").read_text()
+            (new_root / "var/lib/smartroom/integrity/status.json").read_text()
         )
         self.assertTrue(any(
             p.get("id") == old.name and p.get("content_pruned")
@@ -1799,8 +1830,8 @@ class EspBudgetWS14(unittest.TestCase):
         return mock.patch.object(shutil, "disk_usage", lambda p: self._accounted_usage(w))
 
     def _quiet(self, w):
-        (w.prefix / "etc/smartroomos").mkdir(parents=True, exist_ok=True)
-        (w.prefix / "etc/smartroomos/release.conf").write_text(
+        (w.prefix / "etc/smartroom").mkdir(parents=True, exist_ok=True)
+        (w.prefix / "etc/smartroom/release.conf").write_text(
             "quiet_seconds=30\nlimit_seconds=60\nsample_seconds=5\n")
         w.host._conf = None
 
@@ -1834,7 +1865,7 @@ class EspBudgetWS14(unittest.TestCase):
                 legacy = list((w.esp / "smartroom-release/uki").glob("*.efi")) \
                     if (w.esp / "smartroom-release/uki").is_dir() else []
                 self.assertEqual(legacy, [], f"legacy ESP UKI store after {name}: {legacy}")
-                store = w.prefix / "var/lib/smartroomos/boot-store"
+                store = w.prefix / "var/lib/smartroom/boot-store"
                 self.assertTrue((store / name / "uki.efi").is_file(), name)
                 usage = self._accounted_usage(w)
                 self.assertLess(usage.used, self.ESP_TOTAL, f"ESP overflow after {name}")
@@ -1898,7 +1929,7 @@ class EspBudgetWS14(unittest.TestCase):
         (hold / "ws13-pre").mkdir()
         code, out, err = w.run("esp-migrate", "--esp-hold", str(hold))
         self.assertEqual(code, 0, err)
-        store = w.prefix / "var/lib/smartroomos/boot-store/2026.11.21-legacy"
+        store = w.prefix / "var/lib/smartroom/boot-store/2026.11.21-legacy"
         self.assertTrue((store / "uki.efi").is_file())
         self.assertEqual(sha((store / "uki.efi").read_bytes()), sha(uki))
         self.assertFalse((uki_dir / "2026.11.21-legacy.efi").exists())

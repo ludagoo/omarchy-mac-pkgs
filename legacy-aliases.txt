@@ -1,0 +1,24 @@
+# kind, pattern, reason. A hit is allowed when the path or the line matches.
+line	smartroomos_	UKI filename stem kept until reinstall
+line	smartroomos\.	kernel cmdline keys kept until reinstall
+line	smartroomos(/|"|'|\)|$)	ESP directory name kept until reinstall
+line	/(var/lib|etc|run)/smartroomos	previous state, config, and runtime paths
+line	SMARTROOMOS_	previous environment variable names
+line	smartroomos-snapshot	previous snapshot command for the Room Controller
+line	== smartroomos	filesystem label on a disk formatted before the rename
+line	"smartroomos"	snapper userdata key written before the rename
+line	'smartroomos'	previous platform value
+line	CUSTOM_UKI_NAME=	UKI stem kept until reinstall
+line	SmartRoomOS	legacy APFS volume name and platform value
+line	SmartRoom OS	negative test that the phrase is absent
+path	(^|/)legacy_names_lint\.py$	the scanner names the forbidden tokens
+path	(^|/)legacy-aliases\.txt$	this list
+path	(^|/)docs/rename-notes\.md$	inventory of names kept until reinstall
+path	(^|/)docs/legacy-names\.md$	site note of names kept until reinstall
+path	(^|/)smartroom-legacy-paths$	migration script names every previous path
+path	(^|/)test/unit/legacy-paths\.sh$	migration test names every previous path
+path	(^|/)test/unit/legacy-names\.sh$	reader tests name the previous label, key, and env
+root	smartroom	our package and room tree; upstream Omarchy stays out of this lint
+root	smartroom-boot-os	our boot tool
+root	smartroom-release	our release tool
+root	CARRY.md	our carry notes
