@@ -7,5 +7,13 @@ for t in "$here"/*-test.sh; do
   echo "== ${t##*/}"
   bash "$t" || { echo "FAIL ${t##*/}"; fail=1; }
 done
+release=$here/../../smartroom-release/test/all
+echo "== smartroom-release/test/all"
+if [[ ! -f $release ]]; then
+  echo "FAIL smartroom-release/test/all is missing"
+  fail=1
+else
+  bash "$release" || { echo "FAIL smartroom-release/test/all"; fail=1; }
+fi
 (( fail == 0 )) && echo "all SmartRoom recipe tests passed"
 exit $fail

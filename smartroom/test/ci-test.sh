@@ -15,6 +15,7 @@ grep -qE 'ARCH_IMAGE: archlinux:base-devel@sha256:[0-9a-f]{64}$' "$wf" || bad "t
 [[ $(sed -n 's/.*ARCH_IMAGE: //p' "$wf") == "$(sed -n 's/.*ARCH_IMAGE: //p' "$here/../../.github/workflows/tests.yml")" ]] ||
   bad "the container is upstream tests.yml's"
 grep -q '"$package/test/all"' "$wf" && grep -q 'bash smartroom/test/all' "$wf" || bad "the workflow runs every package suite and smartroom/test/all"
+grep -q 'smartroom-release/test/all' "$here/all" || bad "smartroom/test/all does not run the ownership gate (smartroom-release/test/all)"
 grep -q 'smartroom-omarchy-helpers/SOURCE' "$wf" && grep -q 'runtime=/work/runtime-helpers' "$wf" ||
   bad "smartroom-omarchy-helpers is compared with the runtime at its SOURCE commit"
 echo "ok - smartroom-ci.yml runs the fork's suites on the shipped branches without secrets"
