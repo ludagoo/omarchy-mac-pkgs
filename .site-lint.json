@@ -1,10 +1,10 @@
 {
   "ignoreCase": true,
-  "roots": ["smartroom"],
+  "roots": ["."],
+  "comment": "One install's strings that product files must not carry. Bracketed letters keep this file from matching itself. room-id also catches an id joined to a name by underscores.",
   "patterns": [
-    {"id": "room-id", "regex": "\\bsw[0-9]{3}\\b"},
-    {"id": "cr9-board-room", "regex": "\\bcr9-board-room\\b"},
-    {"id": "fi108", "regex": "\\bfi108\\b"},
+    {"id": "room-id", "regex": "(?<![a-z0-9])sw[0-9]{3}(?![0-9])"},
+    {"id": "room-name", "regex": "\\b(?:cr9[-]board[-]room|fi10[8])\\b"},
     {"id": "campus-ip", "regex": "172\\.31\\."},
     {"id": "goossen-dev", "regex": "goossen\\.dev"},
     {"id": "moody-edu", "regex": "moody\\.edu"}
