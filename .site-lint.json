@@ -1,0 +1,13 @@
+{
+  "ignoreCase": true,
+  "roots": ["smartroom"],
+  "patterns": [
+    {"id": "room-id", "regex": "\\bsw[0-9]{3}\\b"},
+    {"id": "cr9-board-room", "regex": "\\bcr9-board-room\\b"},
+    {"id": "fi108", "regex": "\\bfi108\\b"},
+    {"id": "campus-ip", "regex": "172\\.31\\."},
+    {"id": "goossen-dev", "regex": "goossen\\.dev"},
+    {"id": "moody-edu", "regex": "moody\\.edu"}
+  ],
+  "allow": []
+}
