@@ -3,7 +3,7 @@
 
 Patterns and path allow-globs live in .site-lint.json (one file per repo).
 The scan is report-only unless SITE_LINT_STRICT=1, which exits 1 on any hit.
-Other workers are removing existing hits; this check is what fails once
+Existing hits are being removed; this check is what fails once
 strict mode is turned on.
 """
 
