@@ -3990,7 +3990,7 @@ def migrate_preflight(host: Host, force: bool = False) -> dict:
         esp_free = 0
     check("esp-writable", esp_free >= ESP_MARGIN, f"{esp_free // 2**20} MiB ESP free")
 
-    # unknown boot entries: Limine conf should not contain non-SmartRoom OS entries at top level
+    # unknown boot entries: Limine conf should not contain non-SmartRoom Firmware entries at top level
     for start, end, title in _entry_blocks(text.splitlines() if text else []):
         if title in (TRIAL_ENTRY_NAME,):
             continue
