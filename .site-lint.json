@@ -1,13 +1,5 @@
 {
-  "ignoreCase": true,
+  "comment": "This repo's site-lint settings: roots to scan and allow-globs (each with a reason). The patterns are an install's own names and are not kept here: SITE_LINT_PATTERNS=<file> names them. Without it the lint says so and passes.",
   "roots": ["."],
-  "comment": "One install's strings that product files must not carry. Bracketed letters keep this file from matching itself. room-id also catches an id joined to a name by underscores.",
-  "patterns": [
-    {"id": "room-id", "regex": "(?<![a-z0-9])sw[0-9]{3}(?![0-9])"},
-    {"id": "room-name", "regex": "\\b(?:cr9[-]board[-]room|fi10[8])\\b"},
-    {"id": "campus-ip", "regex": "172\\.31\\."},
-    {"id": "goossen-dev", "regex": "goossen\\.dev"},
-    {"id": "moody-edu", "regex": "moody\\.edu"}
-  ],
   "allow": []
 }
