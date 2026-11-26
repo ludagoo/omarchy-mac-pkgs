@@ -729,7 +729,7 @@ class JournalBeforeReboot(unittest.TestCase):
 
 
 class RoomPages(unittest.TestCase):
-    """Waiting on Lucas: "room pages up when a display is connected" as a trial health
+    """Waiting on the operator: "room pages up when a display is connected" as a trial health
     condition. Written and tested, off by default (require_room_pages=no)."""
 
     def trial(self, world, conf=None):
@@ -820,7 +820,7 @@ class RoomPages(unittest.TestCase):
 
 
 class RollbackRefusal(unittest.TestCase):
-    """Waiting on Lucas: refuse a rollback/restore to a root that fails the invariant.
+    """Waiting on the operator: refuse a rollback/restore to a root that fails the invariant.
     Written and tested behind refuse_unsafe_rollback. Off (the default), a rollback is
     never refused on it, before arming or in its trial (as before WS17); the check is
     recorded for ops. Update trials refuse an unsafe root whatever the switch says."""
