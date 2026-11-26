@@ -10,6 +10,11 @@ Without SITE_LINT_PATTERNS the lint prints one line saying so and passes.
 scan and allow-globs, each with a reason. It never lists patterns.
 Strict by default: exits 1 on any hit and names each file and line.
 SITE_LINT_STRICT=0 reports without failing.
+
+--files PATH...: check only the named files and directories, tracked or not
+(a test's generated output, one shipped file). Roots and allow-globs do not
+apply, and it is always strict. Without SITE_LINT_PATTERNS it prints one line
+saying the check was skipped and passes. A named path that does not exist fails.
 """
 
 from __future__ import annotations
@@ -31,6 +36,7 @@ SKIP_SUFFIXES = {
 MAX_BYTES = 1_000_000
 PATTERNS_ENV = "SITE_LINT_PATTERNS"
 NOT_GIVEN = "site-lint: site patterns not given (SITE_LINT_PATTERNS is not set); nothing checked"
+FILES_NOT_GIVEN = "site-lint: site patterns not given (SITE_LINT_PATTERNS is not set); site-name check of the named files skipped"
 REPO_KEYS = {"comment", "roots", "allow"}
 PATTERN_KEYS = {"comment", "ignoreCase", "patterns"}
 
@@ -190,33 +196,41 @@ def file_text(path: Path) -> str | None:
     return raw.decode("utf-8", errors="replace")
 
 
-def scan(root: Path, config: dict) -> tuple:
-    """Return (lines_by_pattern, files_with_hits, line_hits, where).
+def scan_files(named: list, patterns: list) -> tuple:
+    """Scan (label, path) pairs. Return (lines_by_pattern, files_with_hits, line_hits, where).
 
-    where lists (path, line number, pattern ids) for every line with a hit.
+    where lists (label, line number, pattern ids) for every line with a hit.
     """
-    counts = {ident: 0 for ident, _rx in config["patterns"]}
+    counts = {ident: 0 for ident, _rx in patterns}
     files = 0
     lines = 0
     where = []
-    for rel in list_files(root):
-        if not in_roots(rel, config["roots"]) or allowed(rel, config["allow"]):
-            continue
-        text = file_text(root / rel)
+    for label, path in named:
+        text = file_text(path)
         if text is None:
             continue
         file_hit = False
         for number, line in enumerate(text.splitlines(), 1):
-            ids = [ident for ident, rx in config["patterns"] if rx.search(line)]
+            ids = [ident for ident, rx in patterns if rx.search(line)]
             for ident in ids:
                 counts[ident] += 1
             if ids:
                 lines += 1
                 file_hit = True
-                where.append((rel, number, ids))
+                where.append((label, number, ids))
         if file_hit:
             files += 1
     return counts, files, lines, where
+
+
+def scan(root: Path, config: dict) -> tuple:
+    """Scan the tracked files under root's roots that no allow-glob covers; see scan_files."""
+    named = [
+        (rel, root / rel)
+        for rel in list_files(root)
+        if in_roots(rel, config["roots"]) and not allowed(rel, config["allow"])
+    ]
+    return scan_files(named, config["patterns"])
 
 
 def strict_from_env(env) -> bool:
@@ -224,7 +238,8 @@ def strict_from_env(env) -> bool:
     return (env.get("SITE_LINT_STRICT") or "1").strip() != "0"
 
 
-def report(counts: dict, files: int, lines: int, strict: bool, where=()) -> int:
+def report(counts: dict, files: int, lines: int, strict: bool, where=(),
+           advice="fix them, or allow a path in .site-lint.json with a reason") -> int:
     flag = "1" if strict else "0"
     print(f"site-lint: files={files} lines={lines} strict={flag}")
     for ident in sorted(counts):
@@ -233,7 +248,7 @@ def report(counts: dict, files: int, lines: int, strict: bool, where=()) -> int:
     for rel, number, ids in where:
         print(f"  hit {rel}:{number}: {','.join(ids)}")
     if strict and lines:
-        print("site-lint: strict mode, hits remain (fix them, or allow a path in .site-lint.json with a reason)", file=sys.stderr)
+        print(f"site-lint: strict mode, hits remain ({advice})", file=sys.stderr)
         return 1
     return 0
 
@@ -250,6 +265,43 @@ def lint(root: Path, env) -> int:
     config = {"patterns": patterns, **repo}
     counts, files, lines, where = scan(root, config)
     return report(counts, files, lines, strict_from_env(env), where)
+
+
+def named_files(paths: list) -> list:
+    """(label, path) for each named file and every file under each named directory."""
+    found = []
+    for path in paths:
+        if path.is_dir():
+            for dirpath, dirnames, filenames in os.walk(path):
+                dirnames[:] = sorted(d for d in dirnames if d != ".git")
+                for filename in sorted(filenames):
+                    full = Path(dirpath) / filename
+                    found.append((str(full), full))
+        elif path.is_file():
+            found.append((str(path), path))
+        else:
+            raise SystemExit(f"site-lint: no such file {path}")
+    return found
+
+
+def check_files(paths: list, env) -> int:
+    """Check the named files and directories, tracked or not, against SITE_LINT_PATTERNS.
+
+    For a test that checks one shipped file or its own generated output: roots and
+    allow-globs do not apply, and any hit fails. Without SITE_LINT_PATTERNS: one
+    line saying the check was skipped, and pass. A missing path fails either way.
+    """
+    if not paths:
+        raise SystemExit("site-lint: --files needs at least one path")
+    named = named_files(paths)
+    source = patterns_from_env(env)
+    if source is None:
+        print(FILES_NOT_GIVEN)
+        return 0
+    patterns = load_patterns(source)
+    print(f"site-lint: patterns={len(patterns)} from SITE_LINT_PATTERNS")
+    counts, files, lines, where = scan_files(named, patterns)
+    return report(counts, files, lines, True, where, advice="the named files must not carry the install's names")
 
 
 def quietly(func, *args):
@@ -365,6 +417,32 @@ def self_test() -> int:
         if missing:
             return fail(f"patterns missed a sample: {missing}")
 
+        # --files: named files and directories outside any repo (a test's own output).
+        loose = base / "loose"
+        (loose / "sub").mkdir(parents=True)
+        clean = loose / "clean.txt"
+        clean.write_text("room-101 example.org 192.0.2.10\n", encoding="utf-8")
+        planted = loose / "sub" / "out.json"
+        planted.write_text('{"a": 1,\n "host": "' + samples["site-domain"][0] + '"}\n', encoding="utf-8")
+        result, out = captured(check_files, [planted], {})
+        if result != 0 or out.strip() != FILES_NOT_GIVEN:
+            return fail(f"--files without SITE_LINT_PATTERNS must skip with one line: {result} {out!r}")
+        result, out = captured(check_files, [clean], with_patterns)
+        if result != 0 or "site-lint: files=0 lines=0 strict=1" not in out:
+            return fail(f"--files failed a clean file: {result} {out!r}")
+        result, out = captured(check_files, [clean, loose], {**with_patterns, "SITE_LINT_STRICT": "0"})
+        if result != 1 or f"hit {planted}:2: site-domain" not in out:
+            return fail(f"--files must fail a hit in a named directory, strict always: {result} {out!r}")
+        if samples["site-domain"][0] in out:
+            return fail("--files hits must show file and line, not the text")
+        for env in ({}, with_patterns):
+            result, _out = captured(check_files, [loose / "missing.txt"], env)
+            if "no such file" not in str(result):
+                return fail(f"--files accepted a missing path: {result}")
+        result, _out = captured(check_files, [], with_patterns)
+        if "needs at least one path" not in str(result):
+            return fail("--files with no path was accepted")
+
         # Refusals: a repo-side pattern list, a named file that is missing, bad pattern files.
         cfg.write_text(json.dumps({**repo_doc, "patterns": pattern_doc["patterns"]}), encoding="utf-8")
         result, _out = captured(lint, root, {})
@@ -391,6 +469,8 @@ def self_test() -> int:
 def main(argv: list) -> int:
     if "--self-test" in argv:
         return self_test()
+    if argv[:1] == ["--files"]:
+        return check_files([Path(arg) for arg in argv[1:]], os.environ)
     try:
         root = repo_root(Path.cwd())
     except SystemExit:

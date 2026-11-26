@@ -23,17 +23,16 @@ from unittest import mock
 HERE = Path(__file__).resolve().parent
 TOOL = HERE.parent / "bin" / "smartroom-release"
 
-# Scratch ESP images are hundreds of MiB. Mini /tmp is tmpfs — never put them there.
-# Prefer TMPDIR when it is already off /tmp; otherwise use <job>/tmp or ./tmp beside pkgs.
+# Scratch ESP images are hundreds of MiB, and /tmp is often a small tmpfs.
+# Prefer TMPDIR when it is already off /tmp; otherwise /var/tmp, which is on disk.
+DISK_TMP_CANDIDATES = (Path("/var/tmp"),)
+
+
 def _prefer_disk_tmpdir() -> None:
     cur = Path(os.environ.get("TMPDIR") or tempfile.gettempdir()).resolve()
     if not (str(cur) == "/tmp" or str(cur).startswith("/tmp/")):
         return
-    for candidate in (
-        HERE.parents[3] / "tmp",                 # .../smartroom-fw-ws14/tmp
-        HERE.parents[2] / "tmp",                 # .../pkgs/tmp
-        Path.home() / "smartroom-fw-ws14" / "tmp",
-    ):
+    for candidate in DISK_TMP_CANDIDATES:
         try:
             candidate.mkdir(parents=True, exist_ok=True)
             probe = candidate / f".srel-tmpdir-{os.getpid()}"
@@ -275,6 +274,31 @@ class World:
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             code = sr.main(["--prefix", str(self.prefix), *argv], host=self.host)
         return code, out.getvalue(), err.getvalue()
+
+
+class ScratchDir(unittest.TestCase):
+    """Big scratch files leave a /tmp TMPDIR for /var/tmp; a TMPDIR off /tmp is kept."""
+
+    def setUp(self):
+        saved = tempfile.tempdir
+        self.addCleanup(setattr, tempfile, "tempdir", saved)
+
+    def test_candidates_are_system_paths(self):
+        self.assertEqual(DISK_TMP_CANDIDATES, (Path("/var/tmp"),))
+
+    @unittest.skipUnless(os.access("/var/tmp", os.W_OK), "/var/tmp is not writable here")
+    def test_tmp_moves_to_var_tmp(self):
+        with mock.patch.dict(os.environ, {"TMPDIR": "/tmp"}):
+            _prefer_disk_tmpdir()
+            self.assertEqual(os.environ["TMPDIR"], "/var/tmp")
+
+    def test_off_tmp_is_kept(self):
+        with tempfile.TemporaryDirectory(dir="/var/tmp" if os.access("/var/tmp", os.W_OK) else None) as off:
+            if off.startswith("/tmp"):
+                self.skipTest("no directory off /tmp to try")
+            with mock.patch.dict(os.environ, {"TMPDIR": off}):
+                _prefer_disk_tmpdir()
+                self.assertEqual(os.environ["TMPDIR"], off)
 
 
 class LimineText(unittest.TestCase):
