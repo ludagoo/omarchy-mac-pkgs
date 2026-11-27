@@ -473,6 +473,7 @@ chmod +x "$stub_bin/omarchy-mac-initramfs-hooks" "$stub_bin/omarchy-mac-boot-upd
 printf '#!/bin/bash\nprintf "linux-asahi\\n"\n' >"$stub_bin/omarchy-mac-kernel"
 PATH="$stub_bin:$PATH" TEST_CALLS="$calls" OMARCHY_GRUB_DEFAULT="$etc/grub" \
   OMARCHY_GRUB_CONSOLE_PENDING="$test_tmp/no-such-pending" \
+  OMARCHY_MAC_HEADLESS_MARKER="$test_tmp/not-headless" \
   bash -c 'source "$1"' _ "$ROOT/setup/grub-console.sh" || fail "the console leaf fails on the built configuration"
 printf '#!/bin/bash\necho linux-aurora\n' >"$stub_bin/omarchy-mac-kernel"
 ! grep -qx 'omarchy-mac-boot-update' "$calls" || fail "the console leaf regenerated boot files that were already right" "$(cat "$calls")"

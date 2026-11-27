@@ -15,6 +15,11 @@ printf '#!/bin/bash\nexit 1\n' >"$test_tmp/bin/omarchy-mac-limine-active"
 for name in grub-probe grub-mkconfig update-grub omarchy-mac-boot-update; do
   printf '#!/bin/bash\nexit 0\n' >"$test_tmp/bin/$name"
 done
+# The builder may be an Aurora room. user4k is covered in apple-grub-console-test.
+cat >"$test_tmp/bin/omarchy-mac-kernel" <<'STUB'
+#!/bin/bash
+printf '%s\n' linux-asahi
+STUB
 chmod +x "$test_tmp/bin"/*
 export PATH="$test_tmp/bin:$ROOT/bin:$PATH"
 export OMARCHY_GRUB_DEFAULT="$test_tmp/grub" OMARCHY_GRUB_CONSOLE_PENDING="$test_tmp/state/pending"

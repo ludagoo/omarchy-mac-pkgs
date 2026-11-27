@@ -24,6 +24,8 @@ done
 chmod +x "$test_tmp/bin"/*
 export PATH="$test_tmp/bin:$ROOT/bin:$PATH" TEST_CALLS="$test_tmp/calls"
 export OMARCHY_GRUB_DEFAULT="$test_tmp/grub" OMARCHY_GRUB_CONSOLE_PENDING="$test_tmp/state/pending"
+# A build runner can be a headless room. These cases are the non-headless path.
+export OMARCHY_MAC_HEADLESS_MARKER="$test_tmp/headless"
 export OMARCHY_MKINITCPIO_CONF_DIR="$test_tmp/mkinitcpio.conf.d" OMARCHY_MKINITCPIO_PRESET_DIR="$test_tmp/presets"
 export OMARCHY_MKINITCPIO_KERNEL=linux-asahi
 # No host device tree, systemd or kernel parameters: the M4 cases write their own.
