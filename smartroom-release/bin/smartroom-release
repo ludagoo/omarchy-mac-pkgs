@@ -32,6 +32,11 @@ boot chain boots the previous release by itself.
   smartroom-release esp-migrate [--esp-hold DIR]    move ESP UKI store + ws13d hold into boot-store
   smartroom-release check-root [ROOT] [--json]      the root invariant (owners, system dirs, sudoers)
                                                     on a directory, a root.btrfs.zst, or /
+  smartroom-release channel status                  the room's channel and its home release
+  smartroom-release channel dev [--mark-home]       trust dev-signed releases too; pin the home root
+  smartroom-release channel production              trust the production key only, at once
+  smartroom-release channel return RELEASE [--reboot]
+                                                    production again: trial the kept home root
 
 RELEASE is a directory holding manifest.json (see README.md), or an https URL
 of one. Nothing here asks a question. Exit status is non-zero on error; with
@@ -48,6 +53,11 @@ How a trial is one-shot at every layer:
 Everything the trial changes is beside what is configured. Mark-good is a
 fixed list of steps whose only switch is one rename of limine.conf.
 The last KEEP_GOOD (5) good releases stay on disk for manual restore.
+
+Channels: <ESP>/smartroom-release/channel.json (outside every root) says dev
+or production; no file is production. Production trusts release-keyring.gpg
+only; dev adds release-keyring-dev.gpg and pins the marked home root so keep-5
+never prunes it. The mark clears when a root promotes on production.
 """
 from __future__ import annotations
 
@@ -81,6 +91,8 @@ STATE_DIR = "smartroom-release"
 RUN_DIR = "/run/smartroom-release"
 TOP_LOCK_WAIT = 30 * 60
 STATE_FILE = "state.json"
+CHANNEL_FILE = "channel.json"
+CHANNELS = ("dev", "production")
 MARKER = "aura-try"
 TRIAL_BOOT = "m1n1/boot-trial.bin"
 CONFIGURED_BOOT = "m1n1/boot.bin"
@@ -169,6 +181,7 @@ DEFAULTS = {
     "min_displays": "",
     "reboot_hook": "",
     "keyring": "/usr/share/smartroom/release-keyring.gpg",
+    "keyring_dev": "/usr/share/smartroom/release-keyring-dev.gpg",
     "watchdog_device": "/dev/watchdog",
 }
 
@@ -407,8 +420,8 @@ def resolve_boot_files(host: Host, entry: dict,
     return uki_src, boot_src
 
 
-def keep_release_ids(state: dict) -> set[str]:
-    ids = {(state.get("configured") or {}).get("release")}
+def keep_release_ids(state: dict, home: Optional[dict] = None) -> set[str]:
+    ids = {(state.get("configured") or {}).get("release"), (home or {}).get("release")}
     for entry in [state.get("previous")] + list(state.get("history") or []):
         if entry and entry.get("release"):
             ids.add(entry["release"])
@@ -1402,20 +1415,70 @@ def subvol_name(release: str) -> str:
     return f"@r-{release}"
 
 
-def verify_signature(host: Host, directory: Path, unsigned: bool) -> bool:
+def verify_signature(host: Host, directory: Path, unsigned: bool) -> Optional[str]:
+    """The key that signed the manifest: "production", "dev" (only while the
+    channel file says dev), or None for --unsigned. Anything else fails."""
     sig = directory / (MANIFEST + ".sig")
     if unsigned:
-        return False
+        return None
     keyring = host.p(host.conf["keyring"])
     if not keyring.is_file():
         raise Fail(f"no release keyring at {keyring}; a signed release cannot be checked "
                    "(--unsigned is for development only)", "unsigned")
     if not sig.is_file():
         raise Fail("the release has no manifest.json.sig", "unsigned")
-    done = host.run(["gpgv", "--keyring", str(keyring), str(sig), str(directory / MANIFEST)], check=False)
-    if done.returncode != 0:
-        raise Fail("the manifest signature does not verify", "bad-signature")
-    return True
+    keyrings = [("production", keyring)]
+    dev = host.p(host.conf["keyring_dev"])
+    if load_channel(host)["channel"] == "dev" and dev.is_file():
+        keyrings.append(("dev", dev))
+    for name, ring in keyrings:
+        done = host.run(["gpgv", "--keyring", str(ring), str(sig), str(directory / MANIFEST)], check=False)
+        if done.returncode == 0:
+            manifest_channel = load_manifest(directory).get("channel")
+            if manifest_channel == "production" and name != "production":
+                raise Fail("a production release must carry the production key's signature", "bad-signature")
+            return name
+    raise Fail("the manifest signature does not verify with a key this room's channel trusts", "bad-signature")
+
+
+# --------------------------------------------------------------------------
+# channel: dev or production, and the home release a dev room returns to
+
+
+def channel_path(host: Host) -> Path:
+    return host.esp() / STATE_DIR / CHANNEL_FILE
+
+
+def load_channel(host: Host) -> dict:
+    """No file, or one that does not read, is production: dev trust is only ever opt-in."""
+    doc: dict = {}
+    with contextlib.suppress(OSError, ValueError):
+        doc = json.loads(channel_path(host).read_text())
+    if not isinstance(doc, dict):
+        doc = {}
+    home = doc.get("home")
+    if not (isinstance(home, dict) and isinstance(home.get("release"), str) and home.get("release")):
+        home = None
+    channel = doc.get("channel") if doc.get("channel") in CHANNELS else "production"
+    return {"channel": channel, "home": home, "since": doc.get("since")}
+
+
+def save_channel(host: Host, doc: dict) -> None:
+    write_atomic(channel_path(host), (json.dumps(doc, indent=2, sort_keys=True) + "\n").encode(), 0o644)
+
+
+def pinned_home(host: Host) -> Optional[dict]:
+    """The marked home release, kept on disk while the mark stands (dev, or
+    production until a root promotes there)."""
+    home = load_channel(host)["home"]
+    return home if home and home.get("root") else None
+
+
+def clear_home_on_production_promote(host: Host, state: dict) -> None:
+    doc = load_channel(host)
+    if doc["channel"] == "production" and doc["home"]:
+        event(host, state, "channel-home-cleared", release=doc["home"].get("release"))
+        save_channel(host, {"channel": "production", "home": None, "since": doc.get("since")})
 
 
 def load_manifest(directory: Path) -> dict:
@@ -1432,6 +1495,8 @@ def load_manifest(directory: Path) -> dict:
     roles = {item.get("role"): item for item in manifest["boot"]}
     if "uki" not in roles:
         raise Fail("manifest boot list has no uki")
+    if manifest.get("channel") not in (None,) + CHANNELS:
+        raise Fail(f"manifest channel {manifest.get('channel')!r} is not dev or production")
     line = manifest.get("line")  # optional: "studio" | "mini"
     if line not in (None, "studio", "mini"):
         raise Fail(f"manifest line {line!r} is not studio or mini")
@@ -2443,6 +2508,8 @@ def status_doc(host: Host, state: dict) -> dict:
         "events": state.get("events", [])[-20:],
     }
     doc["release"]["root_check"] = state.get("root_check")
+    chan = load_channel(host)
+    doc["channel"] = {"channel": chan["channel"], "home": _home_brief(chan["home"])}
     kept = load_kept_check(host)
     if kept is not None:
         by_root = {r.get("root"): r for r in kept.get("roots", [])}
@@ -2600,6 +2667,9 @@ def stage_release(host: Host, state: dict, directory: Path, unsigned: bool, kind
     known |= {h.get("release") for h in (state.get("history") or []) if h}
     if (state.get("previous") or {}).get("release"):
         known.add(state["previous"]["release"])
+    home = pinned_home(host)
+    if home:
+        known.add(home["release"])      # its root is pinned: `channel return` restores it
     if release in known and kind != "migrate":
         raise Fail(f"release {release} is already on this room", "not-found")
     esp = host.esp()
@@ -2700,11 +2770,12 @@ def _stage_after_offload(host: Host, state: dict, directory: Path, manifest: dic
     state["trial"] = {
         "kind": kind, "release": release, "number": state["counter"], "root": subvol,
         "boot": trial_boot, "uki": trial_uki, "cmdline": with_subvol(cmdline, subvol, release),
-        "phase": "staged", "staged_at": host.stamp(), "baseline": baseline, "signed": signed,
-        "carried": len(carried), "reached": False, "line": layout.line,
+        "phase": "staged", "staged_at": host.stamp(), "baseline": baseline, "signed": bool(signed),
+        "signedBy": signed, "carried": len(carried), "reached": False, "line": layout.line,
     }
     event(host, state, "started", release=release, previous=state["configured"].get("release"), line=layout.line)
-    event(host, state, "files-checked", result="ok", release=release, signed=signed)
+    event(host, state, "files-checked", result="ok", release=release, signed=bool(signed),
+          **({"key": signed} if signed else {}))
     save_state(host, state)
     return state
 
@@ -2929,7 +3000,7 @@ def cmd_discard(host: Host, args) -> int:
     with host.top() as top:
         for child in sorted(top.glob("@r-*")):
             keep = {(state.get("configured") or {}).get("root"), (state.get("previous") or {}).get("root"),
-                    running_root(host)}
+                    running_root(host), (pinned_home(host) or {}).get("root")}
             if child.name not in keep:
                 delete_subvolume(host, top, child.name)
     print("discarded")
@@ -2951,6 +3022,123 @@ def cmd_restore(host: Host, args) -> int:
            "rebootAt": host.stamp()}
     print(json.dumps(out))
     if not args.no_reboot:
+        host.reboot()
+    return 0
+
+
+# --------------------------------------------------------------------------
+# channel: the Room Controller's root helper for a move between dev and production
+
+
+def _home_brief(home: Optional[dict]) -> Optional[dict]:
+    return {"release": home.get("release"), "number": home.get("number", 0)} if home else None
+
+
+def channel_doc(host: Host, state: dict) -> dict:
+    doc = load_channel(host)
+    conf = state.get("configured") or {}
+    return {"channel": doc["channel"], "home": _home_brief(doc["home"]),
+            "devKey": host.p(host.conf["keyring_dev"]).is_file(),
+            "configured": {"release": conf.get("release"), "number": conf.get("number", 0)}}
+
+
+def trial_pending(state: dict) -> bool:
+    trial = state.get("trial") or {}
+    return bool(state.get("promoting")) or trial.get("phase") in ("staged", "armed", "booting", "promoting")
+
+
+def channel_dev(host: Host, state: dict, mark_home: bool) -> dict:
+    if trial_pending(state):
+        raise Fail("a trial boot is pending; move the channel after it ends", "trial-pending")
+    if not host.p(host.conf["keyring_dev"]).is_file():
+        raise Fail("this root has no dev release keyring; it cannot follow the dev channel", "no-dev-key")
+    doc = load_channel(host)
+    home = doc["home"]
+    # Marking again on a dev room keeps the first mark: the configured release may be a dev one by now.
+    if mark_home and not (doc["channel"] == "dev" and home):
+        conf = state.get("configured") or {}
+        home = {"release": conf.get("release"), "number": conf.get("number", 0), "root": conf.get("root")}
+        with contextlib.suppress(Fail):
+            ensure_entry_in_boot_store(host, conf, state=state)
+    changed = doc["channel"] != "dev" or home != doc["home"]
+    if changed:
+        since = doc.get("since") if doc["channel"] == "dev" else host.stamp()
+        save_channel(host, {"channel": "dev", "home": home, "since": since})
+        event(host, state, "channel", to="dev", home=(home or {}).get("release"))
+        save_state(host, state)
+    return {"channel": "dev", "home": _home_brief(home), "changed": changed}
+
+
+def channel_production(host: Host, state: dict) -> dict:
+    doc = load_channel(host)
+    changed = doc["channel"] != "production" or not channel_path(host).is_file()
+    if changed:
+        # Dev trust ends here. The home mark stays until a root promotes on production.
+        save_channel(host, {"channel": "production", "home": doc["home"], "since": host.stamp()})
+        event(host, state, "channel", to="production", home=(doc["home"] or {}).get("release"))
+        save_state(host, state)
+    return {"channel": "production", "home": _home_brief(doc["home"]), "changed": changed}
+
+
+def channel_return(host: Host, state: dict, release: str) -> dict:
+    """Trial the kept root of RELEASE (the home mark) by the same path as restore N."""
+    safe_id(release)
+    doc = load_channel(host)
+    if doc["channel"] != "production":
+        raise Fail("return needs the production channel first (channel production)", "wrong-channel")
+    if trial_pending(state) or state.get("trial"):
+        raise Fail("a trial boot is already pending", "trial-pending")
+    conf = state.get("configured") or {}
+    if conf.get("release") == release:
+        if doc["home"] and doc["home"].get("release") == release:
+            event(host, state, "channel-home-cleared", release=release)
+            save_channel(host, {"channel": "production", "home": None, "since": doc.get("since")})
+            save_state(host, state)
+        return {"accepted": False, "configured": True, "release": release}
+    try:
+        entry = find_release_entry(state, release=release)
+    except Fail:
+        home = doc["home"]
+        if not (home and home.get("release") == release and home.get("root")):
+            raise Fail(f"release {release} is not kept on this room", "not-kept")
+        entry = {"release": release, "number": home.get("number", 0), "root": home["root"]}
+    with host.top() as top:
+        if not entry.get("root") or not subvol_exists(top, entry["root"]):
+            raise Fail(f"the root of release {release} is not kept on this room", "not-kept")
+    try:
+        resolve_boot_files(host, entry, state=state)
+    except Fail as exc:
+        raise Fail(f"release {release} is not kept whole: {exc.message}", "not-kept")
+    promote_previous_as_trial(host, state, entry=entry)
+    try:
+        arm_trial(host, state)
+    except Fail:
+        clear_trial_files(host, state)
+        state["trial"] = None
+        save_state(host, state)
+        raise
+    return {"accepted": True, "release": release, "trialId": state["trial"]["armed_at"],
+            "fallbackSnapshot": state["configured"].get("number"), "rebootAt": host.stamp()}
+
+
+def cmd_channel(host: Host, args) -> int:
+    state = load_state(host)
+    if args.action == "status":
+        out = channel_doc(host, state)
+    else:
+        require_root(host)
+        if args.action == "dev":
+            out = channel_dev(host, state, args.mark_home)
+        elif args.action == "production":
+            out = channel_production(host, state)
+        else:
+            out = channel_return(host, state, args.release)
+    if args.json:
+        print(json.dumps(out, sort_keys=True))
+    else:
+        for key, value in out.items():
+            print(f"{key:<17} {json.dumps(value, sort_keys=True) if isinstance(value, dict) else value}")
+    if args.action == "return" and out.get("accepted") and args.reboot:
         host.reboot()
     return 0
 
@@ -3106,6 +3294,8 @@ def cmd_build_release(host: Host, args) -> int:
     }
     if source_info:
         manifest["source"] = source_info
+    if args.channel:
+        manifest["channel"] = args.channel
     write_atomic(out / MANIFEST, (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode(), 0o644)
     if args.sign_key:
         host.run(["gpg", "--batch", "--yes", "--detach-sign", "--local-user", args.sign_key,
@@ -3804,6 +3994,7 @@ def _promote_steps(host: Host, state: dict) -> None:
     record_result(host, state, "committed")
     state["trial"] = None
     state["promoting"] = None
+    clear_home_on_production_promote(host, state)
     save_state(host, state)
     clear_trial_files(host, state)
     prune(host, state)
@@ -3937,7 +4128,8 @@ def promote(host: Host, state: dict) -> None:
 
 
 def prune(host: Host, state: dict) -> None:
-    keep = {(state.get("configured") or {}).get("root"), running_root(host)}
+    home = pinned_home(host)
+    keep = {(state.get("configured") or {}).get("root"), running_root(host), (home or {}).get("root")}
     if state.get("previous"):
         keep.add(state["previous"].get("root"))
     for entry in state.get("history") or []:
@@ -3958,7 +4150,7 @@ def prune(host: Host, state: dict) -> None:
                     delete_subvolume(host, top, child.name)
             # Also allow pruning of unnamed failed receive leftovers only; never delete @ itself here.
     # Boot files: drop btrfs boot-store and any legacy ESP UKI store copies not kept.
-    keep_ids = keep_release_ids(state)
+    keep_ids = keep_release_ids(state, home)
     keep_ids.add(INSTALLED)
     root = boot_store_root(host)
     if root.is_dir():
@@ -4359,7 +4551,7 @@ def cmd_confirm_migration(host: Host, args) -> int:
     if old and old != "@" and old != running_root(host):
         with host.top() as top:
             if subvol_exists(top, old) and old not in {
-                (state.get("configured") or {}).get("root"),
+                (state.get("configured") or {}).get("root"), (pinned_home(host) or {}).get("root"),
                 *((h or {}).get("root") for h in (state.get("history") or [])),
             }:
                 delete_subvolume(host, top, old)
@@ -4407,6 +4599,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--source-path", help="a btrfs subvolume to release instead of this room's root "
                    "(a build host: the @ of a mounted image root.img)")
     p.add_argument("--line", choices=("studio", "mini"), help="the release's line (default: this room's)")
+    p.add_argument("--channel", choices=CHANNELS, help="recorded in the manifest: the channel this release is for")
     p.add_argument("--source-info", action="append", default=[], metavar="KEY=VALUE",
                    help="recorded in manifest source (firmware=COMMIT, pkgs=COMMIT, ...)")
     p = sub.add_parser("check-root", help="the root invariant on a root directory or a root.btrfs.zst "
@@ -4425,6 +4618,17 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("confirm-migration")
     p = sub.add_parser("esp-migrate")
     p.add_argument("--esp-hold", help=f"parked ESP files directory (default {ESP_HOLD_DEFAULT})")
+    p = sub.add_parser("channel", help="dev or production: which release key this room trusts")
+    actions = p.add_subparsers(dest="action", required=True)
+    for name in ("status", "dev", "production", "return"):
+        a = actions.add_parser(name)
+        a.add_argument("--json", action="store_true", dest="json_action", help=argparse.SUPPRESS)
+        if name == "dev":
+            a.add_argument("--mark-home", action="store_true",
+                           help="pin the configured release as home (kept until a production promote)")
+        if name == "return":
+            a.add_argument("release")
+            a.add_argument("--reboot", action="store_true")
     return parser
 
 
@@ -4433,14 +4637,14 @@ COMMANDS = {
     "rollback": cmd_rollback, "discard": cmd_discard, "health-run": cmd_health_run, "restore": cmd_restore,
     "build-release": cmd_build_release, "migrate": cmd_migrate, "migrate-check": cmd_migrate_check,
     "confirm-migration": cmd_confirm_migration, "esp-migrate": cmd_esp_migrate,
-    "check-root": cmd_check_root, "check-kept": cmd_check_kept,
+    "check-root": cmd_check_root, "check-kept": cmd_check_kept, "channel": cmd_channel,
 }
 
 
 def main(argv: Optional[list[str]] = None, host: Optional[Host] = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     args = build_parser().parse_args(argv)
-    args.json = bool(args.json or getattr(args, "json_sub", False))
+    args.json = bool(args.json or getattr(args, "json_sub", False) or getattr(args, "json_action", False))
     host = host or Host(args.prefix)
     try:
         return COMMANDS[args.command](host, args)

@@ -1160,6 +1160,201 @@ class MiniWorld(World):
 
 
 
+def make_key(home: Path, name: str) -> str:
+    """A throwaway Ed25519 signing key in HOME (a temp dir). Returns its fingerprint."""
+    home.mkdir(mode=0o700, parents=True, exist_ok=True)
+    env = dict(os.environ, GNUPGHOME=str(home))
+    subprocess.run(["gpg", "--batch", "--pinentry-mode", "loopback", "--passphrase", "", "--quick-generate-key",
+                    f"{name} <{name}@example>", "ed25519", "sign", "1d"], env=env, check=True, capture_output=True)
+    out = subprocess.run(["gpg", "--list-keys", "--with-colons", name], env=env, capture_output=True, text=True,
+                         check=True).stdout
+    return [line.split(":")[9] for line in out.splitlines() if line.startswith("fpr")][0]
+
+
+class Channel(unittest.TestCase):
+    """dev/production: which key a room trusts, the pinned home root, and the way back."""
+
+    def setUp(self):
+        self.w = MiniWorld(self)
+        (self.w.prefix / "etc/smartroom").mkdir(parents=True, exist_ok=True)
+        (self.w.prefix / "etc/smartroom/release.conf").write_text("quiet_seconds=30\nlimit_seconds=60\nsample_seconds=5\n")
+        self.w.host._conf = None
+        self.gnupg = self.w.tmp / "gnupg"
+        self.prod = make_key(self.gnupg, "prod")
+        self.dev = make_key(self.gnupg, "dev")
+        share = self.w.prefix / "usr/share/smartroom"
+        share.mkdir(parents=True, exist_ok=True)
+        (share / "release-keyring.gpg").write_bytes(self.export(self.prod))
+        self.dev_ring = share / "release-keyring-dev.gpg"
+        self.dev_ring.write_bytes(self.export(self.dev))
+
+    def export(self, fpr):
+        env = dict(os.environ, GNUPGHOME=str(self.gnupg))
+        return subprocess.run(["gpg", "--export", fpr], env=env, check=True, capture_output=True).stdout
+
+    def signed(self, name, fpr, channel=None, uki=None):
+        d = self.w.release(name=name, uki=uki or f"uki-{name}".encode())
+        if channel:
+            m = json.loads((d / "manifest.json").read_text())
+            m["channel"] = channel
+            (d / "manifest.json").write_text(json.dumps(m))
+        env = dict(os.environ, GNUPGHOME=str(self.gnupg))
+        subprocess.run(["gpg", "--batch", "--yes", "--detach-sign", "--local-user", fpr, "--output",
+                        str(d / "manifest.json.sig"), str(d / "manifest.json")], env=env, check=True, capture_output=True)
+        return d
+
+    def json_run(self, *argv):
+        code, out, err = self.w.run(*argv, "--json")
+        return code, json.loads(out.strip().splitlines()[-1]) if out.strip() else None, err
+
+    def install(self, name, fpr=None):
+        """update + trial boot + health: NAME becomes the configured release."""
+        d = self.signed(name, fpr or self.prod)
+        code, _, err = self.w.run("update", str(d))
+        self.assertEqual(code, 0, err)
+        self.w.trial_boot(name)
+        self.boots = getattr(self, "boots", 1) + 1
+        (self.w.prefix / "proc/sys/kernel/random/boot_id").write_text(f"boot-{self.boots}\n")
+        self.assertEqual(self.w.run("health-run")[0], 0)
+        self.assertEqual(self.w.state()["configured"]["release"], name)
+        (self.w.prefix / "proc/cmdline").write_text(sr.with_subvol(MINI_CMDLINE, f"@r-{name}", name) + "\n")
+        with contextlib.suppress(FileNotFoundError):
+            (self.w.esp / "smartroom-release/trial.marker").unlink()
+
+    def channel_file(self):
+        return json.loads((self.w.esp / "smartroom-release/channel.json").read_text())
+
+    def test_no_channel_file_is_production_and_a_dev_signed_release_is_refused(self):
+        code, doc, _ = self.json_run("channel", "status")
+        self.assertEqual(code, 0)
+        self.assertEqual(doc, {"channel": "production", "home": None, "devKey": True,
+                               "configured": {"release": "installed", "number": 0}})
+        code, err, _ = self.json_run("stage", str(self.signed("2026.11.27-mini-dev", self.dev)))
+        self.assertEqual(code, 1)
+        self.assertEqual(err["error"]["code"], "bad-signature")
+        code, _, err = self.w.run("stage", str(self.signed("2026.11.27-mini-production", self.prod)))
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.w.state()["trial"]["signedBy"], "production")
+
+    def test_dev_trusts_the_dev_key_until_production_drops_it(self):
+        code, doc, err = self.json_run("channel", "dev", "--mark-home")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(doc, {"channel": "dev", "home": {"release": "installed", "number": 0}, "changed": True})
+        written = self.channel_file()
+        self.assertEqual(written["channel"], "dev")
+        self.assertEqual(written["home"]["root"], "@")
+        self.assertIn("since", written)
+        self.assertEqual(self.w.state()["events"][-1]["event"], "channel")
+        d = self.signed("2026.11.27-mini-dev", self.dev)
+        code, _, err = self.w.run("stage", str(d))
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.w.state()["trial"]["signedBy"], "dev")
+        # a staged trial is pending: the channel stays where it is
+        code, err_doc, _ = self.json_run("channel", "dev", "--mark-home")
+        self.assertEqual(err_doc["error"]["code"], "trial-pending")
+        self.w.run("discard")
+        code, doc, _ = self.json_run("channel", "production")
+        self.assertEqual(code, 0)
+        self.assertEqual(doc["home"], {"release": "installed", "number": 0})
+        code, err_doc, _ = self.json_run("stage", str(d))
+        self.assertEqual(code, 1)
+        self.assertEqual(err_doc["error"]["code"], "bad-signature")
+
+    def test_a_production_manifest_needs_the_production_key_even_on_dev(self):
+        self.json_run("channel", "dev", "--mark-home")
+        code, err_doc, _ = self.json_run("stage", str(self.signed("2026.11.27-mini-production", self.dev, "production")))
+        self.assertEqual(code, 1)
+        self.assertEqual(err_doc["error"]["code"], "bad-signature")
+
+    def test_dev_is_refused_without_a_dev_keyring(self):
+        self.dev_ring.unlink()
+        code, err_doc, _ = self.json_run("channel", "dev", "--mark-home")
+        self.assertEqual(code, 1)
+        self.assertEqual(err_doc["error"]["code"], "no-dev-key")
+        self.assertFalse((self.w.esp / "smartroom-release/channel.json").exists())
+        self.assertFalse(self.json_run("channel", "status")[1]["devKey"])
+
+    def test_home_is_pinned_through_prune_and_return_restores_it(self):
+        home = "2026.11.20-mini-production"
+        self.install(home)
+        code, doc, err = self.json_run("channel", "dev", "--mark-home")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(doc["home"]["release"], home)
+        for i in range(1, 7):
+            self.install(f"2026.11.2{i}-mini-dev", self.dev)
+        # marking again on dev keeps the first home, not today's dev release
+        self.assertEqual(self.json_run("channel", "dev", "--mark-home")[1]["home"]["release"], home)
+        st = self.w.state()
+        self.assertEqual(st["configured"]["release"], "2026.11.26-mini-dev")
+        self.assertNotIn(home, [h["release"] for h in st["history"]])
+        self.assertTrue((self.w.prefix / "top" / f"@r-{home}").is_dir())
+        self.assertTrue(sr.boot_store_has(self.w.host, home))
+        self.assertFalse((self.w.prefix / "top/@r-2026.11.21-mini-dev").exists())   # keep-5 still prunes
+        # an update to the home id would overwrite the pinned root: refused
+        code, err_doc, _ = self.json_run("stage", str(self.w.tmp / f"release-{home}"))
+        self.assertEqual(code, 1)
+        self.assertIn("already on this room", err_doc["error"]["message"])
+        code, err_doc, _ = self.json_run("channel", "return", home, "--reboot")
+        self.assertEqual(err_doc["error"]["code"], "wrong-channel")
+        self.json_run("channel", "production")
+        code, doc, err = self.json_run("channel", "return", home, "--reboot")
+        self.assertEqual(code, 0, err)
+        self.assertTrue(doc["accepted"])
+        self.assertEqual(self.w.host.reboots, 1)
+        trial = self.w.state()["trial"]
+        self.assertEqual((trial["kind"], trial["release"], trial["root"]), ("rollback", home, f"@r-{home}"))
+        self.w.trial_boot(home)
+        (self.w.prefix / "proc/sys/kernel/random/boot_id").write_text("boot-return\n")
+        self.assertEqual(self.w.run("health-run")[0], 0)
+        self.assertEqual(self.w.state()["configured"]["release"], home)
+        self.assertIsNone(self.channel_file()["home"])               # promoted on production: mark cleared
+        self.assertEqual(self.channel_file()["channel"], "production")
+
+    def test_return_needs_a_kept_root(self):
+        self.json_run("channel", "production")
+        code, err_doc, _ = self.json_run("channel", "return", "2026.01.01-mini-production", "--reboot")
+        self.assertEqual(code, 1)
+        self.assertEqual(err_doc["error"]["code"], "not-kept")
+        self.install("2026.11.20-mini-production")
+        self.json_run("channel", "dev", "--mark-home")
+        self.install("2026.11.21-mini-dev", self.dev)
+        self.json_run("channel", "production")
+        shutil.rmtree(self.w.prefix / "top/@r-2026.11.20-mini-production")
+        code, err_doc, _ = self.json_run("channel", "return", "2026.11.20-mini-production", "--reboot")
+        self.assertEqual(err_doc["error"]["code"], "not-kept")
+        self.assertEqual(self.w.host.reboots, 0)
+
+    def test_return_to_the_configured_release_only_clears_the_mark(self):
+        self.install("2026.11.20-mini-production")
+        self.json_run("channel", "dev", "--mark-home")
+        self.json_run("channel", "production")
+        code, doc, _ = self.json_run("channel", "return", "2026.11.20-mini-production", "--reboot")
+        self.assertEqual(code, 0)
+        self.assertEqual(doc, {"accepted": False, "configured": True, "release": "2026.11.20-mini-production"})
+        self.assertIsNone(self.channel_file()["home"])
+        self.assertEqual(self.w.host.reboots, 0)
+
+    def test_status_json_names_the_channel(self):
+        self.json_run("channel", "dev", "--mark-home")
+        doc = json.loads(self.w.run("status", "--json")[1])
+        self.assertEqual(doc["channel"], {"channel": "dev", "home": {"release": "installed", "number": 0}})
+
+    def test_build_release_records_the_channel(self):
+        self.assertIn("channel", {a.dest for a in self._build_release_parser()._actions})
+
+    def _build_release_parser(self):
+        parser = sr.build_parser()
+        sub = next(a for a in parser._actions if isinstance(a, sr.argparse._SubParsersAction))
+        return sub.choices["build-release"]
+
+    def test_the_firmware_copy_is_the_same_file(self):
+        fw = os.environ.get("SMARTROOM_FW_DIR")
+        if not fw:
+            self.skipTest("set SMARTROOM_FW_DIR to a ludagoo/smartroomcontrollerfirmware checkout")
+        copy = Path(fw) / "overlay/usr/bin/smartroom-release"
+        self.assertEqual(copy.read_bytes(), TOOL.read_bytes(), f"{copy} differs from {TOOL}")
+
+
 class Ws13SnapperAndKey(unittest.TestCase):
     """WS13: nested .snapshots, as-installed on promote, release key stamp."""
 
