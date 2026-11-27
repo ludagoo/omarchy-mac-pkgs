@@ -1,7 +1,7 @@
 # Maintained process for SmartRoom carried packages
 
 SmartRoom maintains its own edge-line packages (`linux-aurora`, `aura`,
-`mesa-aurora`, and the prebuilt room browser `chromium-smartroom`, alongside the
+`mesa-aurora`, the network camera module `v4l2loopback-aurora`, and the prebuilt room browser `chromium-smartroom`, alongside the
 boot packages listed in `CARRY.md`) for as long as rooms require patches not yet
 landed in Omarchy's published channel packages. Switching to an upstream Omarchy
 package happens only once that channel package carries every required fix and
@@ -16,6 +16,7 @@ passes Studio qualification.
 | `mesa-aurora` (`vulkan-aurora`) | `omacom/mesa` (`carry/edgeB-7.3`) | Unchanged copy of the `omacom/omarchy-pkgs#3025` (`edgeB2`) recipe at `23791c134af`. The 7.3 kernel names the GPU DRM driver `"aurora"`, whereas the older published edge Mesa opened only `"asahi"` and broke EGL/Hyprland. | Channel pin: [omacom/omarchy-pkgs#3025](https://github.com/omacom/omarchy-pkgs/pull/3025); M3 carries noted in `smartroom/pkgbuilds/mesa-aurora/PKGBUILD` (`aurora-silicon/mesa` PRs `#415`, `#416`). Drop when Omarchy's edge channel ships this Mesa or newer. |
 | `omarchy-mac-boot`, `smartroom-omarchy-helpers`, `smartroom-boot-os` | `ludagoo/omarchy-mac-pkgs` (`smartroom/edge`) | Headless boot flow (`TARGET_OS_NAME` preserved across first boot, no owner provisioning/TTY1 hang), extracted unchanged runtime helpers without desktop `omarchy`, and `aurora-bless` wrapper. | See `CARRY.md` table (`smartroom/upstream-drafts/`). |
 | `chromium-smartroom` | Built on the aarch64 build host | Arch Linux ARM Chromium 158 with direct V4L2 hardware decode and encode (`omarchy-chromium-bin` replacement). Pinned by SHA-256 in `omarchy-mac-installer` (`smartroom/room/prebuilt.sha256`). | Maintained separately until upstream Chromium/Omarchy builds include V4L2 encode/decode parity. |
+| `v4l2loopback-aurora` | Upstream [v4l2loopback](https://github.com/v4l2loopback/v4l2loopback) tag `v0.15.4` (sha256 pinned in `smartroom/pkgbuilds/v4l2loopback-aurora/PKGBUILD`), built against our `linux-aurora-headers` | The room's network camera: one loopback device (`/dev/video30`, "Network camera") that the Room Controller feeds from an RTSP camera with ffmpeg and Chromium lists as a webcam. A prebuilt module for exactly one `linux-aurora` build (no dkms on a room); its `depends` pins that kernel. | Not a patch: kept for as long as rooms have a network camera. Drop the per-kernel rebuild if the channel ever ships the module for our kernel. |
 
 ## 2. Reproducible builds
 
@@ -33,7 +34,7 @@ All aarch64 package builds run on a native aarch64 build host (never on an Intel
        makepkg --force --cleanbuild --syncdeps --noconfirm --sign --key "$SMARTROOM_PKG_KEY"
      ```
    - `prepare()` verifies `HEAD == $_commit`, pins Rust 1.85.0 + LLVM 18, builds `aurora-bindgen`, enforces `-ARCH` kernelrelease, and records `/usr/share/doc/linux-aurora/smartroom-kernel-commit`.
-   - Note for the Studio QA test rig: whenever `uname -r` changes, rebuild `v4l2loopback-aurora` against the new `linux-aurora-headers` (`LLVM=/usr/lib/llvm18/bin/`) and verify `modinfo -F vermagic`.
+   - Whenever `uname -r` changes (a new `_commit`, `_aurorarel` or `pkgrel`), rebuild `v4l2loopback-aurora`: copy linux-aurora's `_auroraver`, `_aurorarel` and `pkgrel` into `_auroraver`, `_aurorarel` and `_aurorapkgrel` in `smartroom/pkgbuilds/v4l2loopback-aurora/PKGBUILD` (`smartroom/test/v4l2loopback-aurora-recipe-test.sh` fails until they match). `smartroom/build-packages` in the installer builds it right after the kernel, against the `linux-aurora-headers` it just built (`AURORA_KERNEL_BUILD_DIR`, `LLVM=/usr/lib/llvm18/bin/`); its `check()` refuses a module whose `modinfo -F vermagic` is not the new release. A release image without it fails `desk-check` (network camera).
 2. **Full local `smartroom` repository**:
    - In `ludagoo/omarchy-mac-installer` (`smartroom/edge`):
      ```sh
@@ -42,7 +43,7 @@ All aarch64 package builds run on a native aarch64 build host (never on an Intel
      SMARTROOM_ROOM_PACKAGES=/path/to/chromium-pkg \
        smartroom/build-packages OUT_PKGS <omarchy-mac-pkgs-commit>
      ```
-   - Without `SMARTROOM_EDGE_BOOT_PACKAGES`, `smartroom/build-packages` compiles `aura`, `linux-aurora`, and `mesa-aurora` directly from their pinned PKGBUILDs into `OUT_PKGS/repo/smartroom.db` and records `omarchy_mac_pkgs_commit` in `OUT_PKGS/SOURCE`.
+   - Without `SMARTROOM_EDGE_BOOT_PACKAGES`, `smartroom/build-packages` compiles `aura`, `linux-aurora`, `v4l2loopback-aurora` (against the headers it just built), and `mesa-aurora` directly from their pinned PKGBUILDs; with it, that directory must also hold `v4l2loopback-aurora` for the same kernel into `OUT_PKGS/repo/smartroom.db` and records `omarchy_mac_pkgs_commit` in `OUT_PKGS/SOURCE`.
 
 ## 3. Re-syncing with upstream
 
