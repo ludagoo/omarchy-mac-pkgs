@@ -6,7 +6,15 @@ here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 wf=$here/../../.github/workflows/smartroom-ci.yml
 bad() { echo "FAIL ci: $*" >&2; exit 1; }
 [[ -f $wf ]] || bad "no .github/workflows/smartroom-ci.yml"
-grep -qx "    branches: \[smartroom/main, smartroom/edge, 'fix/\*\*'\]" "$wf" || bad "pushes to smartroom/main, smartroom/edge and fix/** run the checks"
+python3 - "$wf" <<'PY' || bad "the workflow is not workflow_dispatch only"
+import re, sys
+text = open(sys.argv[1]).read()
+on = re.search(r"^on:\n((?:[ \t].*\n|\n)*)", text, re.M)
+keys = re.findall(r"^  ([a-z_]+):", on.group(1), re.M) if on else []
+assert keys == ["workflow_dispatch"], keys
+for word in ("push", "pull_request", "pull_request_target", "schedule", "workflow_run"):
+    assert word not in keys, word
+PY
 grep -qx '  contents: read' "$wf" || bad "the workflow reads only"
 ! grep -qE 'secrets\.|pull_request_target|contents: write|id-token' "$wf" || bad "the workflow uses no secrets and no write token"
 [[ $(grep -c 'persist-credentials: false' "$wf") == "$(grep -c 'actions/checkout@' "$wf")" ]] || bad "no checkout keeps credentials"
@@ -18,4 +26,4 @@ grep -q '"$package/test/all"' "$wf" && grep -q 'bash smartroom/test/all' "$wf" |
 grep -q 'smartroom-release/test/all' "$here/all" || bad "smartroom/test/all does not run the ownership gate (smartroom-release/test/all)"
 grep -q 'smartroom-omarchy-helpers/SOURCE' "$wf" && grep -q 'runtime=/work/runtime-helpers' "$wf" ||
   bad "smartroom-omarchy-helpers is compared with the runtime at its SOURCE commit"
-echo "ok - smartroom-ci.yml runs the fork's suites on the shipped branches without secrets"
+echo "ok - smartroom-ci.yml runs the fork's suites on workflow_dispatch without secrets"
