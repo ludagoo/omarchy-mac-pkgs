@@ -49,6 +49,7 @@ PKGBUILD.
 | `aura` | ludagoo/aura `13fb8688` (`smartroom/pkgbuilds/aura`) | The channel ships m1n1-aurora, not aura, and not the t6021 encoder firmware hand-off | Omarchy publishes aura as the Mac boot loader with the t6021 hand-off |
 | `mesa-aurora`, `vulkan-aurora` | omacom/mesa `carry/edgeB-7.3` `23791c134af` (`smartroom/pkgbuilds/mesa-aurora`, the omarchy-pkgs#3025 recipe unchanged) | The published edge Mesa opens only `asahi`; the 7.3 kernel's GPU is `aurora`, so Hyprland cannot start | The edge channel publishes that Mesa or a newer one |
 | `chromium-smartroom` 158 | Arch Linux ARM's chromium PKGBUILD plus `sr-0001`..`sr-0016` (`smartroom/pkgbuilds/chromium-smartroom`; `BUILT` names the package the image pins) | Omarchy's Chromium has no direct V4L2 decode and encode for AVD and AVE | Omarchy's Chromium carries V4L2 decode and encode for AVD/AVE (the `sr-0001`..`sr-0007` changes are prepared for Chromium main) |
+| `v4l2loopback-aurora` | Upstream v4l2loopback `v0.15.4` against our `linux-aurora-headers` (`smartroom/pkgbuilds/v4l2loopback-aurora`) | A prebuilt module for exactly our kernel (the room's network camera, `/dev/video30`); the channel has none for it | Never as a patch; rebuilt with every `linux-aurora` build |
 
 `chromium-smartroom` is a long compile (hours on a Studio), so the installer's
 `smartroom/build-packages` copies the built file (`room/prebuilt.sha256`)

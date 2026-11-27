@@ -1,0 +1,61 @@
+# The room's network camera: one v4l2loopback device (firmware overlay
+# etc/modprobe.d/smartroom-network-camera.conf) for exactly one linux-aurora build.
+# The kernel values are linux-aurora's _auroraver, _aurorarel and pkgrel: rebuild per kernel.
+_auroraver=7.3.0
+_aurorarel=0sredge4
+_aurorapkgrel=1
+_kernver="${_auroraver}-${_aurorarel}-${_aurorapkgrel}-ARCH"
+_aurorapkg="${_auroraver}.aurora${_aurorarel}-${_aurorapkgrel}"
+
+_v4l2ver=0.15.4
+pkgname=v4l2loopback-aurora
+pkgver="${_v4l2ver}_${_auroraver}.aurora${_aurorarel}.${_aurorapkgrel}"
+pkgrel=1
+pkgdesc="v4l2loopback video loopback module for linux-aurora ${_kernver}"
+arch=('aarch64')
+url='https://github.com/v4l2loopback/v4l2loopback'
+license=('GPL-2.0-only')
+depends=("linux-aurora=${_aurorapkg}")
+# linux-aurora is built with LLVM 18 (its PKGBUILD); a module must use the same.
+makedepends=(clang18 llvm18 lld18 make)
+# AURORA_KERNEL_BUILD_DIR: an unpacked linux-aurora-headers build tree, such as the
+# one build-packages just built. Without it the installed headers are used.
+[[ -n ${AURORA_KERNEL_BUILD_DIR:-} ]] || makedepends+=("linux-aurora-headers=${_aurorapkg}")
+provides=('V4L2LOOPBACK-MODULE')
+conflicts=('v4l2loopback-dkms')
+options=('!strip' '!debug')
+source=("v4l2loopback-${_v4l2ver}.tar.gz::https://github.com/v4l2loopback/v4l2loopback/archive/refs/tags/v${_v4l2ver}.tar.gz")
+sha256sums=('21a17702648aa6a937b88a93bd71ef9f547815ead28719cafcfcc247396643dc')
+
+_kdir() {
+  printf '%s\n' "${AURORA_KERNEL_BUILD_DIR:-/usr/lib/modules/${_kernver}/build}"
+}
+
+build() {
+  local kdir
+  kdir=$(_kdir)
+  [[ $(<"$kdir/version") == "$_kernver" ]] || {
+    echo "$kdir is not the headers of $_kernver" >&2
+    return 1
+  }
+  cd "v4l2loopback-${_v4l2ver}"
+  make -C "$kdir" M="$PWD" ARCH=arm64 LLVM="${AURORA_LLVM:-/usr/lib/llvm18/bin/}" modules
+}
+
+check() {
+  # The kernel loads only a module whose vermagic starts with its own release.
+  local magic
+  magic=$(modinfo -F vermagic "v4l2loopback-${_v4l2ver}/v4l2loopback.ko")
+  [[ $magic == "${_kernver} "* ]] || {
+    echo "vermagic '$magic' is not for ${_kernver}" >&2
+    return 1
+  }
+  [[ $(modinfo -F version "v4l2loopback-${_v4l2ver}/v4l2loopback.ko") == "$_v4l2ver" ]]
+}
+
+package() {
+  # kmod's depmod hook runs for any package that installs under usr/lib/modules/*/.
+  install -Dm0644 "v4l2loopback-${_v4l2ver}/v4l2loopback.ko" \
+    "$pkgdir/usr/lib/modules/${_kernver}/extra/v4l2loopback.ko"
+  install -Dm0644 "v4l2loopback-${_v4l2ver}/COPYING" "$pkgdir/usr/share/licenses/$pkgname/COPYING"
+}
