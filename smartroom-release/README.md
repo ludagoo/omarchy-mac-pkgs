@@ -45,6 +45,8 @@ Paths in a manifest must be relative and stay inside the release. The signature
 is required (key: `/usr/share/smartroom/release-keyring.gpg`); `--unsigned`
 exists for development and is recorded in the state. A URL must be https.
 
+The room's channel is `<ESP>/smartroom-release/channel.json` (beside `state.json`, outside every root). No file means production, which trusts only the production keyring. `"channel": "dev"` also trusts `/usr/share/smartroom/release-keyring-dev.gpg` (a different key) and pins the marked home root so keep-5 does not prune it. `channel production` drops that trust at once. `channel return <id> --reboot` restores the kept home root.
+
 A release is made only by `smartroom-release build-release`, and only from a root that passes the root invariant (below). It writes nothing and signs nothing when the root fails, and it removes an older `manifest.json` and `.sig` from `--out` first.
 
 - From an image (the Studio release build, installer `smartroom/release-pack`): `smartroom-release build-release --id ID --out DIR --source-path MOUNTED_IMAGE/@ --line studio --uki-from UKI --boot-from BOOT_BIN [--source-info firmware=COMMIT ...] [--sign-key FPR]`, as root on the build host.
@@ -98,6 +100,10 @@ A rollback or restore is not checked for ownership on the room. `build-release` 
 
 ```
 smartroom-release status [--json]       what runs, what is configured, the trial, the last result
+smartroom-release channel status [--json]
+smartroom-release channel dev --mark-home [--json]
+smartroom-release channel production [--json]
+smartroom-release channel return ID --reboot [--json]
 smartroom-release list [--json]
 smartroom-release update RELEASE [--reboot] [--unsigned]   stage + arm   (RELEASE: directory or https URL)
 smartroom-release stage RELEASE         write the release beside the running one; arm nothing
