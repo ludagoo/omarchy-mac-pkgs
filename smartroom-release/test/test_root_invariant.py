@@ -749,7 +749,7 @@ class RoomPages(unittest.TestCase):
         (tmp / "proc").mkdir()
         self.assertEqual(host.room_pages_up(), 0)
         proc(10, "chromium", 1000, "/usr/lib/chromium/chromium", "--type=renderer",
-             "https://s.example/test-full?role=presentationDisplay")                      # a renderer
+             "https://s.example/room-101?role=presentationDisplay")                      # a renderer
         proc(11, "chromium", 0, "/usr/lib/chromium/chromium", "https://s.example/r?role=x")   # not the kiosk user
         proc(12, "chromium", 1000, "/usr/lib/chromium/chromium", "about:blank")               # no room page
         proc(13, "bash", 1000, "bash", "https://s.example/r?role=x")
@@ -758,10 +758,10 @@ class RoomPages(unittest.TestCase):
         proc(15, "chromium", 1000, "/usr/lib/chromium/chromium --type=zygote --no-zygote-sandbox")
         self.assertEqual(host.room_pages_up(), 0)
         proc(14, "chromium", 1000, "/usr/lib/chromium/chromium --user-data-dir=/opt/smartroom/chrome-profiles/x "
-             "--kiosk --app=https://dev.example/test-full?role=presentationDisplay")
+             "--kiosk --app=https://dev.example/room-101?role=presentationDisplay")
         self.assertEqual(host.room_pages_up(), 1)
         proc(16, "chromium", 1000, "/usr/lib/chromium/chromium", "--kiosk",
-             "https://dev.example/test-full?role=extraDisplay1")                   # NUL-separated
+             "https://dev.example/room-101?role=extraDisplay1")                   # NUL-separated
         self.assertEqual(host.room_pages_up(), 2)
 
 
