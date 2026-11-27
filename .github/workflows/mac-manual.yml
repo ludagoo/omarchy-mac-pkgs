@@ -1,15 +1,6 @@
 name: Mac manual
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - "mac-manual/**"
-      - ".github/workflows/mac-manual.yml"
-  pull_request:
-    paths:
-      - "mac-manual/**"
-      - ".github/workflows/mac-manual.yml"
   workflow_dispatch:
 
 permissions:

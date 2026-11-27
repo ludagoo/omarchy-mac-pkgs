@@ -5,11 +5,7 @@ name: Package resolution
 # only reads databases inside a disposable pacman root, so an x86 Arch Linux
 # container with Architecture = aarch64 answers the same as an aarch64 host.
 on:
-  push:
-  pull_request:
   workflow_dispatch:
-  schedule:
-    - cron: "41 19 * * *"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}

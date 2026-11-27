@@ -1,13 +1,10 @@
 name: SmartRoom checks
 
-# The fork's shipped branches (smartroom/main stable, smartroom/edge edge) and
-# their fix branches run the suites they carry: every package's test/all and
-# smartroom/test/all, in the pinned Arch container upstream's tests.yml uses.
-# No secrets: read-only checkouts of public repositories only.
+# Manual only. Every package's test/all and smartroom/test/all, in the pinned
+# Arch container upstream's tests.yml uses. No secrets: read-only checkouts
+# of public repositories only.
 
 on:
-  push:
-    branches: [smartroom/main, smartroom/edge, 'fix/**']
   workflow_dispatch:
 
 permissions:
