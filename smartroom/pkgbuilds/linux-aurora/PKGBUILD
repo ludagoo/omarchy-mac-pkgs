@@ -28,8 +28,8 @@ _commit=7149d1ac27bf522f1996e9bac69d9daaac04b5ae
 # fragment and configure helpers are still the edgeB2 ones. The release
 # number 0sredge<N> sorts below a real 7.3.0.aurora<N> and does not collide
 # with the draft's 0testedgeB2. The kernel release is
-# 7.3.0-${_aurorarel}-${pkgrel}-ARCH. studio-build has 15 GiB of RAM: the
-# default job count is 3.
+# 7.3.0-${_aurorarel}-${pkgrel}-ARCH. The default job count is 3, for a
+# 15 GiB build host.
 _auroraver=7.3.0
 _aurorarel=0sredge4
 pkgrel=1

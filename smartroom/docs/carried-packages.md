@@ -48,7 +48,7 @@ All aarch64 package builds run on a native aarch64 build host (never on an Intel
 ## 3. Re-syncing with upstream
 
 1. **Packaging repo (`omarchy-mac-pkgs`)**:
-   - Run `smartroom/sync-upstream.sh` to fast-forward `main` to `omacom/omarchy-mac-pkgs` and inspect drift on `smartroom/main`, then rebase `smartroom/main` (`--rebase` / `--push`) and port edge changes onto `smartroom/edge`.
+   - Run `smartroom/sync-upstream.sh` to fast-forward the `main` mirror to `omacom/omarchy-mac-pkgs` and see what `smartroom/edge` lacks; `--merge` merges it into a local `sync/upstream-<date>` branch to test and review.
    - Diff upstream `omacom/omarchy-pkgs` PKGBUILDs (`linux-aurora`, `aura`, `mesa-aurora`, e.g., from PR `#3025`) against `smartroom/pkgbuilds/*` (`config`, `configure.sh`, `validate-config.py`, `bindgen-kernel.py`, `validate-qualification.py`).
 2. **Kernel (`ludagoo/linux`)**:
    - Fetch the new `aurora-silicon/linux` `integration/aurora` (or `omacom/linux-aurora`) base, replay our carried series (`ave/t6021-j475c`, `smc/j475c-sensors`, `ave/usage-counter`, and `t6021-j475c` `dcpext2`/`dcpext3` DT wiring), dropping any commit whose upstream PR has merged.

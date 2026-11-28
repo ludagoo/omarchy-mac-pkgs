@@ -7,14 +7,17 @@
 #   metadata from /boot/smartroomos/ when bless overwrote Boot0080), and syncs
 #   Apple efi-boot-device / efi-boot-next variables in efivarfs when present.
 #
-#   smartroom-boot-os macos [--once] [--reboot]      start macOS (Zoom Rooms)
-#   smartroom-boot-os firmware [--once] [--reboot]   start SmartRoom Firmware
-#   smartroom-boot-os status                         default and next start
+#   smartroom-boot-os macos [--once] [--reboot]              start macOS (Zoom Rooms)
+#   smartroom-boot-os firmware [--once] [--reboot] [--force] start SmartRoom Firmware
+#   smartroom-boot-os status                                 default and next start
 #
 # --once sets the next start only (the Mac returns to its default after it).
 # Without --once the choice becomes the default and any pending next-start
 # choice is cleared, so the very next start already follows it.
 # --reboot restarts right after a verified change.
+# A test unit (/etc/smartroom/unit-role says test) keeps macOS as its default
+# start, so a hang or a bad test build lands where it can be repaired: there
+# `firmware` needs --once, or --force for a test unit that must run the firmware.
 # The firmware volume is named by TARGET_OS_NAME in /etc/default/limine
 # ("SmartRoom Firmware"); macOS is the one other startup volume (or name it
 # with SMARTROOM_BOOT_OS_MACOS="Macintosh HD"). Root only.
@@ -29,12 +32,14 @@ efivars_dir=${SMARTROOM_BOOT_OS_EFIVARS:-/sys/firmware/efi/efivars}
 die() { echo "smartroom-boot-os: $*" >&2; exit 1; }
 usage() { sed -n '/^#   smartroom-boot-os/s/^#   //p' "$0" >&2; exit 64; }
 
-target="" once=0 reboot=0
+unit_role_file=${SMARTROOM_BOOT_OS_UNIT_ROLE:-/etc/smartroom/unit-role}
+target="" once=0 reboot=0 force=0
 for arg in "$@"; do
   case $arg in
     macos|firmware|status) [[ -z $target ]] || usage; target=$arg ;;
     --once) once=1 ;;
     --reboot) reboot=1 ;;
+    --force) force=1 ;;
     -h|--help) usage ;;
     *) usage ;;
   esac
@@ -42,6 +47,10 @@ done
 [[ -n $target ]] || usage
 [[ $target != status || ($once == 0 && $reboot == 0) ]] || usage
 (( EUID == 0 )) || die "run as root"
+unit_role=$(awk '!/^[[:space:]]*(#|$)/ { print $1; exit }' "$unit_role_file" 2>/dev/null || true)
+if [[ $target == firmware && $once == 0 && $force == 0 && $unit_role == test ]]; then
+  die "this is a test unit: its default start stays macOS. Use --once (or --force for a test unit that must run the firmware)"
+fi
 
 backend=${SMARTROOM_BOOT_OS_BACKEND:-}
 if [[ -z $backend ]]; then

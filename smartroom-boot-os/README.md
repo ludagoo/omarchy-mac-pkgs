@@ -13,6 +13,8 @@ sudo smartroom-boot-os firmware                 # SmartRoom Firmware from now on
 sudo smartroom-boot-os status
 ```
 
+A test unit (`/etc/smartroom/unit-role` says `test`) keeps macOS as its default start, so a hang or a bad test build lands where it can be repaired. There `firmware` needs `--once`, or `--force` for a test unit that must run the firmware (a server). A room's default is the firmware.
+
 - **Apple Silicon** (`aarch64`): thin wrapper around `aurora-bless` (`boot-volume`
   / `alt-boot-volume` NVRAM variables).
 - **Intel T2 (`Macmini8,1`)** (`x86_64`): uses `efibootmgr` (`BootOrder` /

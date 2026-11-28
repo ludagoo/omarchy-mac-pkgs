@@ -42,6 +42,8 @@ chmod +x "$t/systemctl"
 sed -e 's/^(( EUID == 0 )) || die "run as root"$/:/' -e "s|^PATH=/usr/bin:/usr/sbin:/bin|PATH=$t:/usr/bin:/usr/sbin:/bin|" \
   "$here/../smartroom-boot-os" >"$t/sbo"; chmod +x "$t/sbo"
 export STATE=$t/s SMARTROOM_BOOT_OS_BLESS=$t/bless SMARTROOM_BOOT_OS_LIMINE_DEFAULTS=$t/limine
+# Never the host's own unit role: a test unit is written below when wanted.
+export SMARTROOM_BOOT_OS_UNIT_ROLE=$t/unit-role
 mkdir -p "$STATE"
 printf 'TARGET_OS_NAME="SmartRoom Firmware"\n' >"$t/limine"
 reset() { printf '%s\n' "$@" >"$STATE/volumes"; rm -f "$STATE/boot-volume" "$STATE/alt-boot-volume"; }
@@ -55,6 +57,20 @@ echo "ok - macos --once sets only the next start"
 out=$("$t/sbo" firmware) || fail "firmware: $out"
 [[ ! -e $STATE/alt-boot-volume && $(cat "$STATE/boot-volume") == "SmartRoom Firmware" ]] || fail "firmware did not clear the pending next start"
 echo "ok - firmware as default clears a pending next start"
+
+# A test unit keeps macOS as its default: firmware only once, or with --force.
+printf '# role\ntest\n' >"$t/unit-role"
+reset "Macintosh HD" "SmartRoom Firmware"; echo "Macintosh HD" >"$STATE/boot-volume"
+if "$t/sbo" firmware 2>"$t/err"; then fail "a test unit took the firmware as its default"; fi
+grep -q 'test unit' "$t/err" && [[ $(cat "$STATE/boot-volume") == "Macintosh HD" ]] || fail "test unit refusal: $(cat "$t/err")"
+"$t/sbo" firmware --once >/dev/null || fail "a test unit refused a one-shot firmware start"
+[[ $(cat "$STATE/alt-boot-volume") == "SmartRoom Firmware" && $(cat "$STATE/boot-volume") == "Macintosh HD" ]] || fail "test unit --once state"
+"$t/sbo" firmware --force >/dev/null || fail "--force on a test unit"
+[[ $(cat "$STATE/boot-volume") == "SmartRoom Firmware" ]] || fail "--force did not set the default"
+printf 'room\n' >"$t/unit-role"; echo "Macintosh HD" >"$STATE/boot-volume"
+"$t/sbo" firmware >/dev/null && [[ $(cat "$STATE/boot-volume") == "SmartRoom Firmware" ]] || fail "a room must take the firmware as its default"
+rm -f "$t/unit-role"
+echo "ok - a test unit keeps macOS as its default (firmware --once, or --force)"
 
 out=$("$t/sbo" macos --reboot) || fail "macos: $out"
 [[ $(cat "$STATE/boot-volume") == "Macintosh HD" && $(cat "$t/systemctl.log") == reboot ]] || fail "macos default + reboot"

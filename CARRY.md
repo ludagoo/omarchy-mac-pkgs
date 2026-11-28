@@ -56,8 +56,7 @@ PKGBUILD.
 instead of building it. `smartroom/test/chromium-smartroom-recipe-test.sh`
 fails when the recipe here is not the one that built that file
 (`.BUILDINFO`'s `pkgbuild_sha256sum`), unless `BUILT` names the change as
-`recipe_after_build` (a recipe change waiting for its build). `smartroom/chromium-148-v4l2/` records
-the earlier 148 attempt, which never shipped.
+`recipe_after_build` (a recipe change waiting for its build).
 
 The recipe declares the shared libraries the package links (`_soname_depends`,
 2026-11-24). They are not a hand list: `soname-depends PACKAGE` reads the built
@@ -81,19 +80,12 @@ serves it from the release's signed `[smartroom-release]` repository. A room
 takes a new build only when it switches to the release that contains it
 (`smartroom-release-repo switch`); nothing pulls it from a live repository.
 
-`smartroom/aura-try/` is the first rollback prototype from the design in
-`~/smartroom-rollback/DESIGN.md`. It arms a marker, checks health on a fake
-clock, marks good by write-beside, and rolls back by leaving the configured
-file alone. `smartroom/aura-try/test-all.sh` runs offline. It does not touch
-a real EFI partition and it does not reboot.
-
 `smartroom-release/` (recipe `smartroom/pkgbuilds/smartroom-release`) is the Studio and Mini update
 and rollback tool built on aura's trial boot (`aura-try`); see its README. It installs a
 release's root and boot set beside the running one, boots it once under aura's 178 s
 hardware watchdog, and keeps it only when the room proves healthy (Room Controller
 connected, network up, no screen lost, five quiet minutes inside fifteen); otherwise aura
-boots the previous set by itself. It is the production form of the offline prototype
-in `smartroom/aura-try/` (which stays as the design reference and its own test).
+boots the previous set by itself.
 `smartroom-release/test/all` runs the whole path offline with a fake `btrfs` and a fake clock.
 It also holds the root invariant, `smartroom-release check-root` (2026-11-24): the one rule for every root a room can boot (no system path a login id or the Room Controller user owns, root-owned system dirs and sudoers, `visudo -c`). `build-release` refuses to send or sign a root that fails it, `stage` refuses to arm one, and the trial's `health-run` rolls back a trial that fails it (`unsafe-root`). The firmware's image checks and integrity report and the installer's `desk-check` call this command; the firmware's `overlay/usr/bin/smartroom-release` stays a byte copy. `build-release --source-path` makes the Studio release from a built image (installer `smartroom/release-pack`).
 
